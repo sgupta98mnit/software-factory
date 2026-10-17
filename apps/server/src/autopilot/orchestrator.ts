@@ -1,5 +1,7 @@
 // Autopilot's state machine and scheduler. A run goes goal -> spec agent ->
-// strict validation -> commit -> critic -> approval (by autonomy) -> building.
+// strict validation -> commit -> critic -> plan (work orders in waves) ->
+// approval (by autonomy) -> building: one builder per work order, each in its
+// own worktree and branch from the integration tip, a few at a time.
 // Every step reads its state from the ledger, does one side effect (an agent
 // call, git, openspec) and writes the new state, so the factory can stop at
 // any point and carry on after a restart.
@@ -12,11 +14,36 @@ import path from "node:path";
 import { audit, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
-import { addWorktree, commitAll, currentBranch, discardChanges, ensureRepo, isClean, isRepoRoot, removeWorktree } from "./git.js";
-import type { Attempt, AttemptRole, Autonomy, InboxItem, InboxKind, InboxOption, Ledger, Run, RunState } from "./ledger.js";
+import {
+  addWorktree,
+  commitAll,
+  currentBranch,
+  deleteBranch,
+  discardChanges,
+  ensureRepo,
+  headSha,
+  isClean,
+  isRepoRoot,
+  removeWorktree,
+} from "./git.js";
+import type {
+  Attempt,
+  AttemptRole,
+  Autonomy,
+  Finding,
+  InboxItem,
+  InboxKind,
+  InboxOption,
+  Ledger,
+  Run,
+  RunState,
+  WorkOrder,
+  WorkOrderState,
+} from "./ledger.js";
 import { classify, OpenHandsError, type OpenHandsClient } from "./openhands.js";
 import {
   answerFollowUp,
+  builderBrief,
   criticBrief,
   criticFollowUp,
   findingList,
@@ -36,6 +63,7 @@ import {
   takenChangeNames,
   type CriticVerdict,
 } from "./spec.js";
+import { planWorkOrders } from "./waves.js";
 
 export interface OrchestratorDeps {
   ledger: Ledger;
@@ -49,11 +77,15 @@ export interface OrchestratorDeps {
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
 const TERMINAL = new Set<RunState>(["done", "failed", "cancelled"]);
 const ACTIVE = new Set<string>(["starting", "running"]); // attempts the scheduler starts or polls
+const BUSY_WO = new Set<WorkOrderState>(["building", "verifying", "reviewing"]); // count against PARALLEL
+const DONE_WO = new Set<WorkOrderState>(["merged", "skipped"]); // what dependents wait for
 const SYSTEM = "autopilot";
 // Defaults until .factory/policy.yml is read (policy.ts).
 const POLICY_ACTOR = "policy@default";
 const SPEC_VALIDATE_TRIES = 3;
 const CRITIC_ROUNDS = 2;
+/** Work orders of one run in building, verifying or reviewing at once. */
+export const PARALLEL = 3;
 
 const APPROVAL: InboxOption[] = [
   { id: "approve", label: "Approve", tone: "primary" },
@@ -67,6 +99,11 @@ const QUESTIONS: InboxOption[] = [
 ];
 const RETRY: InboxOption[] = [
   { id: "retry", label: "Retry", tone: "primary" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const WO_FAILED: InboxOption[] = [
+  { id: "retry", label: "Retry with a fresh agent", tone: "primary" },
+  { id: "skip", label: "Skip this work order" },
   { id: "cancel", label: "Cancel run", tone: "danger" },
 ];
 
@@ -132,9 +169,21 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return next;
   }
 
-  function openItem(run: Run, kind: InboxKind, title: string, body: string, options: InboxOption[]): InboxItem {
-    const item = ledger.openInbox({ runId: run.id, kind, title, body, options });
-    record(SYSTEM, "autopilot.inbox_opened", run.id, { item: item.id, kind });
+  /** The one way a work order changes state. Audited under its run, like everything Autopilot does. */
+  function moveWorkOrder(
+    wo: WorkOrder,
+    to: WorkOrderState,
+    opts: { patch?: Partial<Omit<WorkOrder, "id" | "runId" | "seq" | "state" | "updatedAt">>; actor?: string; action?: string; data?: Record<string, unknown> } = {},
+  ): WorkOrder {
+    const next = ledger.updateWorkOrder(wo.id, { ...opts.patch, state: to });
+    record(opts.actor ?? SYSTEM, opts.action ?? "autopilot.work_order_state_changed", wo.runId, { workOrder: `WO-${wo.seq}`, from: wo.state, to, ...opts.data });
+    changed(wo.runId);
+    return next;
+  }
+
+  function openItem(run: Run, kind: InboxKind, title: string, body: string, options: InboxOption[], workOrderId?: string): InboxItem {
+    const item = ledger.openInbox({ runId: run.id, workOrderId, kind, title, body, options });
+    record(SYSTEM, "autopilot.inbox_opened", run.id, { item: item.id, kind, ...(workOrderId ? { workOrder: workOrderId } : {}) });
     return item;
   }
 
@@ -195,22 +244,31 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     await startConversation(attempt);
   }
 
+  /** The first message of an attempt, rebuilt from the ledger so a restart sends the same one. */
+  function briefFor(run: Run, a: Attempt, wo: WorkOrder | undefined): string {
+    if (wo) return builderBrief({ change: run.change, wo });
+    if (a.role === "critic") return criticBrief({ change: run.change });
+    // A spec agent started after one that failed (or whose tasks.md couldn't be planned) hears why.
+    const before = ledger.listAttempts({ runId: run.id, role: "spec" }).filter((x) => x.id < a.id).at(-1);
+    const problem = (before?.result as { reason?: string } | null)?.reason ?? null;
+    return specBrief({ goal: run.goal, change: run.change, autonomy: run.autonomy, openspecVersion: tools.openspec.version, problem });
+  }
+
   /** Safe to repeat after a restart: the conversation id is fixed, so the agent server returns the existing one. */
   async function startConversation(a: Attempt) {
     const run = ledger.getRun(a.runId);
-    if (!run?.integrationDir || !a.agentProfile) throw new Error(`Attempt ${a.id} has no worktree or agent profile to start with`);
-    const text =
-      a.role === "spec"
-        ? specBrief({ goal: run.goal, change: run.change, autonomy: run.autonomy, openspecVersion: tools.openspec.version })
-        : criticBrief({ change: run.change });
+    const wo = a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined;
+    const dir = wo ? wo.worktree : run?.integrationDir; // builders work in their work order's worktree
+    if (!run || !dir || !a.agentProfile) throw new Error(`Attempt ${a.id} has no worktree or agent profile to start with`);
     try {
       const snap = await client.start({
         conversationId: a.conversationId,
         profileId: a.agentProfile,
-        workingDir: run.integrationDir,
-        text,
+        workingDir: dir,
+        text: briefFor(run, a, wo),
         runId: run.id,
         role: a.role,
+        seq: wo?.seq,
       });
       ledger.updateAttempt(a.id, { state: "running", seenRunning: snap.status === "running", costUsd: snap.costUsd, lastSentAt: now() });
     } catch (err) {
@@ -357,10 +415,34 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /**
-   * The plan goes to whoever approves it at this autonomy. Work orders come
-   * from tasks.md once the planner (waves.ts) exists; until then the plan has none.
+   * Work orders from tasks.md (replacing those of an earlier plan), then the
+   * plan goes to whoever approves it at this autonomy. A tasks.md that can't
+   * be planned goes back to a person as spec_failed; a retry's spec agent is told why.
    */
   function toPlan(run: Run) {
+    const replaced = ledger.deleteWorkOrders(run.id);
+    let plan: ReturnType<typeof planWorkOrders>;
+    try {
+      plan = planWorkOrders(run.integrationDir ?? "", run.change);
+    } catch (err) {
+      const reason = errorText(err);
+      markHandled(specAttempt(run), { outcome: "unplannable", reason: clip(reason, 2000) });
+      openItem(
+        run,
+        "spec_failed",
+        `Autopilot couldn't plan ${run.change}`,
+        `The change is valid, but its tasks.md can't be turned into work orders:\n\n${reason}\n\nRetry starts a new spec agent in the same worktree and tells it this.`,
+        RETRY,
+      );
+      return moveRun(run, "spec", { data: { reason: clip(reason), workOrdersDropped: replaced } });
+    }
+    ledger.addWorkOrders(run.id, plan);
+    record(SYSTEM, "autopilot.work_orders_planned", run.id, {
+      change: run.change,
+      workOrders: plan.length,
+      waves: Math.max(...plan.map((w) => w.wave)),
+      replaced,
+    });
     if (run.autonomy === "suggest") {
       openItem(run, "spec_approval", `Approve the spec for ${run.change}`, approvalBody(run), APPROVAL);
       return moveRun(run, "awaiting_spec_approval");
@@ -424,6 +506,95 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     ].join("\n");
   }
 
+  // ---- build stage ----
+
+  const builders = (wo: WorkOrder) => ledger.listAttempts({ runId: wo.runId, workOrderId: wo.id, role: "builder" });
+
+  function workOrderOf(item: InboxItem): WorkOrder {
+    const wo = item.workOrderId ? ledger.getWorkOrder(item.workOrderId) : undefined;
+    if (!wo) throw new Error(`Inbox item ${item.id} has no work order.`);
+    return wo;
+  }
+
+  /** Acts on builders that stopped, then dispatches what's ready. */
+  async function buildStep(run: Run) {
+    for (const wo of ledger.listWorkOrders(run.id)) {
+      if (wo.state !== "building") continue;
+      const a = builders(wo).at(-1);
+      if (!a || ACTIVE.has(a.state) || a.state === "paused" || handled(a)) continue;
+      if (a.state === "finished") await built(wo, a);
+      else await builderFailed(run, wo, a);
+    }
+    // Pending work orders whose dependencies are merged or skipped, in wave order, while there's room.
+    const wos = ledger.listWorkOrders(run.id);
+    const stateOf = new Map(wos.map((w) => [w.seq, w.state]));
+    let room = PARALLEL - wos.filter((w) => BUSY_WO.has(w.state)).length;
+    for (const wo of wos) {
+      if (room <= 0) break;
+      if (wo.state !== "pending" || !wo.dependsOn.every((d) => DONE_WO.has(stateOf.get(d) ?? "pending"))) continue;
+      await dispatch(run, wo);
+      room--;
+    }
+  }
+
+  /**
+   * A builder in a fresh worktree on the work order's own branch from the
+   * integration tip. Git first, then the attempt (write-ahead), then the
+   * agent server: a restart in between redoes the worktree or restarts the
+   * conversation with the same id.
+   */
+  async function dispatch(run: Run, wo: WorkOrder) {
+    const profile = await client.resolveProfile(null);
+    const dir = path.join(worktrees, run.id, `wo-${wo.seq}`);
+    // Not autopilot/<change>/wo-N: git can't have that next to the branch autopilot/<change>.
+    const branch = `${run.integrationBranch}--wo-${wo.seq}`;
+    const baseSha = await headSha(workspace, run.integrationBranch);
+    await addWorktree(workspace, dir, branch, baseSha);
+    const round = builders(wo).length + 1;
+    const attempt = ledger.transaction(() => {
+      const a = ledger.addAttempt({ runId: run.id, workOrderId: wo.id, role: "builder", conversationId: randomUUID(), agentProfile: profile.id });
+      moveWorkOrder(wo, "building", {
+        patch: { branch, worktree: dir, baseSha, resumeState: null },
+        action: "autopilot.work_order_dispatched",
+        data: { attempt: a.id, conversationId: a.conversationId, profile: profile.name, round, branch, baseSha },
+      });
+      return a;
+    });
+    await startConversation(attempt);
+  }
+
+  /** The builder is done: commit what it left uncommitted. Gates and review come next. */
+  async function built(wo: WorkOrder, a: Attempt) {
+    const dir = wo.worktree as string;
+    const sha = (await commitAll(dir, `WO-${wo.seq}: ${clip(wo.title, 72)}`)) ?? (await headSha(dir));
+    ledger.transaction(() => {
+      markHandled(a, { outcome: "built", sha });
+      moveWorkOrder(wo, "verifying", { data: { attempt: a.id, sha } });
+    });
+  }
+
+  /** The builder stopped with an error or got stuck: a person decides (repair rounds come with the gates). */
+  async function builderFailed(run: Run, wo: WorkOrder, a: Attempt) {
+    const why = await whyStopped(a, "The builder");
+    const findings: Finding[] = [{ source: "agent", severity: "high", title: why, detail: "" }];
+    ledger.transaction(() => {
+      markHandled(a, { outcome: "failed" });
+      moveWorkOrder(wo, "needs_attention", {
+        patch: { resumeState: "building", findings },
+        action: "autopilot.work_order_failed",
+        data: { attempt: a.id, state: a.state },
+      });
+      openItem(
+        run,
+        "work_order_failed",
+        `WO-${wo.seq} of ${run.change} failed: ${wo.title}`,
+        `${why}\n\nRetry gives it to a fresh agent in a new worktree from the integration branch, told what went wrong. Skip lets the work orders that depend on it go ahead without it.`,
+        WO_FAILED,
+        wo.id,
+      );
+    });
+  }
+
   // ---- the scheduler ----
 
   /** Starts or polls the run's agents, then takes its next step. */
@@ -434,6 +605,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const run = ledger.getRun(runId);
     if (run?.state === "spec") await specStep(run);
     else if (run?.state === "critic") await criticStep(run);
+    else if (run?.state === "building") await buildStep(run);
   }
 
   /** Cheap: hands each live run to advance(), skipping runs that are still busy. */
@@ -512,6 +684,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (!ACTIVE.has(a.state) && a.state !== "paused") continue;
       await client.pause(a.conversationId).catch(warn);
       ledger.updateAttempt(a.id, { state: "cancelled", finishedAt: now() });
+    }
+    for (const wo of ledger.listWorkOrders(run.id)) {
+      if (wo.worktree) await removeWorktree(workspace, wo.worktree).catch(warn);
+      if (wo.branch) await deleteBranch(workspace, wo.branch).catch(warn);
+      if (!DONE_WO.has(wo.state)) moveWorkOrder(wo, "cancelled", { actor, patch: { worktree: null, resumeState: null } });
     }
     // The integration branch stays: it holds whatever was committed so far.
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir).catch(warn);
@@ -600,6 +777,16 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       case "error:retry":
         if (run.state === "paused") await unpause(run, actor);
         return;
+      case "work_order_failed:retry":
+        // Back in the queue: dispatch gives it a fresh worktree, and wo.findings go into the new brief.
+        moveWorkOrder(workOrderOf(item), "pending", { actor, patch: { resumeState: null } });
+        return;
+      case "work_order_failed:skip": {
+        const wo = workOrderOf(item);
+        if (wo.worktree) await removeWorktree(workspace, wo.worktree).catch(warn); // the branch keeps what it did
+        moveWorkOrder(wo, "skipped", { actor, patch: { worktree: null, resumeState: null } });
+        return;
+      }
       default:
         throw new Error(`Autopilot doesn't know how to "${choice}" a ${item.kind} item.`);
     }

@@ -2,9 +2,10 @@
 // follow-ups the orchestrator sends back. Pure functions of the run's data, so
 // a restart can rebuild a brief exactly. Briefs point at files rather than
 // pasting them, like briefs.ts does for hand-started work orders.
-import type { Autonomy, Finding } from "./ledger.js";
+import type { Autonomy, Finding, WorkOrder } from "./ledger.js";
 
-export function specBrief(o: { goal: string; change: string; autonomy: Autonomy; openspecVersion: string }): string {
+/** `problem`: why the previous spec agent of this run stopped (a retry), so this one can fix it. */
+export function specBrief(o: { goal: string; change: string; autonomy: Autonomy; openspecVersion: string; problem?: string | null }): string {
   const dir = `openspec/changes/${o.change}/`;
   const cli = `npx -y @fission-ai/openspec@${o.openspecVersion}`;
   const questions =
@@ -28,6 +29,7 @@ export function specBrief(o: { goal: string; change: string; autonomy: Autonomy;
     "   - `tasks.md` in the format below.",
     `3. Run \`openspec validate ${o.change} --strict\` and fix everything it reports until it passes.`,
     "",
+    ...(o.problem ? ["A previous spec agent for this change stopped on this problem. Fix it:", "", o.problem, ""] : []),
     "tasks.md format:",
     "- One `## N. Title` group per work order: a small piece of work one agent can build and test on its own.",
     "- Checklist lines `- [ ] N.M item` under each group. They become the work order's acceptance criteria.",
@@ -61,6 +63,34 @@ export function criticBrief(o: { change: string }): string {
     '{ "verdict": "pass" | "revise", "findings": [{ "severity": "high" | "medium" | "low", "where": "file and section", "issue": "what is wrong", "suggestion": "how to fix it" }] }',
     "```",
     'Say "revise" only when a finding matters (high or medium).',
+  ].join("\n");
+}
+
+/** A builder's first message: one work order, built and tested in its own worktree. */
+export function builderBrief(o: {
+  change: string;
+  wo: Pick<WorkOrder, "seq" | "title" | "acceptance" | "controls" | "branch" | "findings">;
+}): string {
+  const { wo } = o;
+  return [
+    `You are a builder in a Software Factory Autopilot run. Build work order WO-${wo.seq}: ${wo.title}.`,
+    "",
+    `It comes from the OpenSpec change in \`openspec/changes/${o.change}/\`. Read proposal.md, design.md, the scenarios in specs/ and task group ${wo.seq} in tasks.md before you start.`,
+    "",
+    "Acceptance criteria (write tests for each one):",
+    ...wo.acceptance.map((a, i) => `${i + 1}. ${a}`),
+    ...(wo.controls.length ? ["", `Security controls this work order must meet, as design.md describes them: ${wo.controls.join(", ")}.`] : []),
+    ...(wo.findings?.length ? ["", "A previous attempt at this work order failed:", "", findingList(wo.findings), "", "Start from the code as it is now and avoid those problems."] : []),
+    "",
+    "When you finish, the factory runs these checks itself in this folder: `npm run typecheck`, `npm run lint` and `npm run test` in every package that has those scripts, after installing dependencies where node_modules is missing. Make them pass.",
+    "",
+    "Rules:",
+    "- This folder is a git worktree made for this work order. Work only here.",
+    `- Commit your work on the current branch${wo.branch ? ` (\`${wo.branch}\`)` : ""} when you're done.`,
+    "- Don't create or switch branches, merge or rebase. The factory merges.",
+    "- Don't change `openspec/`, `.factory/` or `backlog/`. This is an Autopilot work order: don't use Backlog.md for it.",
+    "",
+    "Finish with a short summary of what you changed and how you tested it.",
   ].join("\n");
 }
 

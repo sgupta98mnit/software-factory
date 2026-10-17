@@ -67,6 +67,15 @@ test("worktrees: added on a new branch, replaced when added again, removed with 
   assert.match(sha ?? "", /^[0-9a-f]{40}$/);
   assert.equal(await commitAll(wt, "Nothing"), null);
   assert.equal(await headSha(r, "autopilot/demo"), sha);
+  // An agent's npm install never lands in a commit, even without a .gitignore.
+  for (const dir of ["node_modules/left-pad", "svc/node_modules/x"]) {
+    mkdirSync(path.join(wt, dir), { recursive: true });
+    writeFileSync(path.join(wt, dir, "index.js"), "module.exports = 1;\n");
+  }
+  assert.equal(await commitAll(wt, "Only packages"), null);
+  writeFileSync(path.join(wt, "svc", "app.js"), "1;\n");
+  const withApp = await commitAll(wt, "Add app");
+  assert.deepEqual((await git(wt, ["ls-tree", "-r", "--name-only", withApp ?? ""])).stdout.trim().split("\n"), ["a.txt", "b.txt", "svc/app.js"]);
   assert.equal(await isAncestor(r, "main", "autopilot/demo"), true);
   assert.equal(await isAncestor(r, "autopilot/demo", "main"), false);
 

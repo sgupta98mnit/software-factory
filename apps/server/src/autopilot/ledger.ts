@@ -408,6 +408,11 @@ export function openLedger(file: string) {
     return getWorkOrder(id) as WorkOrder;
   }
 
+  /** Drops a run's work orders to plan again after the spec changed. Refused (foreign key) once any has an attempt. */
+  function deleteWorkOrders(runId: string): number {
+    return Number(db.prepare("DELETE FROM work_orders WHERE run_id = $runId").run({ runId }).changes);
+  }
+
   // Attempts (one agent conversation each)
 
   /** Write-ahead: record the attempt (state "starting") before asking the agent server to start it. */
@@ -530,6 +535,7 @@ export function openLedger(file: string) {
     listWorkOrders,
     getWorkOrder,
     updateWorkOrder,
+    deleteWorkOrders,
     addAttempt,
     getAttempt,
     getAttemptByConversation,

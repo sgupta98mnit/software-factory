@@ -20,6 +20,9 @@ const BASE_ARGS = [
   "-c", "user.email=factory@localhost",
 ];
 
+// Everything but installed packages: agents run npm install in worktrees that may have no .gitignore.
+const ADD_ALL = ["add", "-A", "--", ".", ":(exclude,glob)**/node_modules/**"];
+
 /** Runs git in `cwd`. Throws on a non-zero exit unless `allowFail`. */
 export function git(cwd: string, args: string[], opts: { allowFail?: boolean } = {}): Promise<GitResult> {
   return new Promise((resolve, reject) => {
@@ -71,7 +74,7 @@ export async function ensureRepo(dir: string): Promise<{ initialized: boolean }>
     return { initialized: false };
   }
   if (!isRoot) await git(dir, ["init", "-b", "main"]);
-  await git(dir, ["add", "-A"]);
+  await git(dir, ADD_ALL);
   await git(dir, ["commit", "--allow-empty", "-m", "Baseline (Software Factory)"]);
   return { initialized: true };
 }
@@ -129,9 +132,9 @@ export function deleteBranch(repo: string, name: string): Promise<void> {
 const mergeInProgress = async (dir: string) =>
   (await git(dir, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], { allowFail: true })).code === 0;
 
-/** Commits everything in the worktree; concludes a merge in progress. null when there was nothing to commit. */
+/** Commits everything in the worktree but node_modules; concludes a merge in progress. null when there was nothing to commit. */
 export async function commitAll(dir: string, message: string): Promise<string | null> {
-  await git(dir, ["add", "-A"]);
+  await git(dir, ADD_ALL);
   const merging = await mergeInProgress(dir);
   if (!merging && (await git(dir, ["diff", "--cached", "--quiet"], { allowFail: true })).code === 0) return null;
   await git(dir, merging ? ["commit", "--no-edit"] : ["commit", "-m", message]);

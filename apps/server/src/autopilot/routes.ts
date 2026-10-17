@@ -5,12 +5,11 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { LOCAL_USER } from "../config.js";
 import type { Attempt, InboxItem, Run, WorkOrder } from "./ledger.js";
-import type { Orchestrator } from "./orchestrator.js";
+import { PARALLEL, type Orchestrator } from "./orchestrator.js";
 
-// Work-order states that count as in progress, and how many build at once (policy `parallel` later).
+// Work-order states that count as in progress.
 const ACTIVE_WO = new Set<string>(["building", "verifying", "reviewing", "ready", "awaiting_merge_approval", "merging"]);
 const FINISHED_WO = new Set<string>(["merged", "skipped", "cancelled"]);
-const PARALLEL = 3;
 
 const attemptView = ({ seenRunning: _s, lastSentAt: _l, ...a }: Attempt) => a;
 const inboxView = ({ notifiedAt: _n, ...item }: InboxItem) => item;

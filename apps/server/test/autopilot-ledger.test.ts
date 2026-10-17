@@ -119,6 +119,19 @@ test("work orders: a duplicate task group rolls back the whole batch", () =>
     assert.deepEqual(l.listWorkOrders(run.id), []);
   }));
 
+test("work orders: deleted to plan again, but not once an agent worked on one", () =>
+  withLedger((l) => {
+    const run = newRun(l);
+    const other = newRun(l, "other");
+    twoWorkOrders(l, run.id);
+    twoWorkOrders(l, other.id);
+    assert.equal(l.deleteWorkOrders(run.id), 2);
+    assert.deepEqual(l.listWorkOrders(run.id), []);
+    assert.equal(l.listWorkOrders(other.id).length, 2);
+    l.addAttempt({ runId: other.id, workOrderId: `${other.id}/WO-1`, role: "builder", conversationId: "c-1" });
+    assert.throws(() => l.deleteWorkOrders(other.id), /FOREIGN KEY/);
+  }));
+
 test("attempts: write-ahead defaults, lookups, filters, active ones, JSON result", () =>
   withLedger((l) => {
     const run = newRun(l);
