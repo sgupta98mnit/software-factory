@@ -44,6 +44,16 @@ pnpm setup:canvas        # fetches OpenHands Canvas into canvas\, applies our pa
 
 `pnpm setup:canvas` takes a few minutes the first time. Run it again any time; it skips what's done.
 
+## See it first: `pnpm demo`
+
+```powershell
+pnpm demo
+```
+
+The whole factory with scripted agents: no model login, no API keys, no network. It makes a sample workspace in `data\demo\` (hidden tests and the preview are on in its policy), starts a scripted agent server, the factory API and Canvas, and prints the address (**http://127.0.0.1:3001/autopilot**). The first time, Canvas shows its welcome steps and asks about usage data: choose **Skip for now**, then **Confirm** (nothing is sent; the demo runs with Do Not Track, though the question can come back after a reload). Type a goal such as *Let applicants check a claim's status* and watch the pipeline. The spec agent writes a valid OpenSpec change, you approve the plan, and three work orders build in two waves. WO-2's first try has a bug its test catches and is repaired; WO-3 touches `src/auth`, so its merge waits for you in the Inbox. At the end the preview runs the app and the release decision shows its screenshots. Evidence, budgets, the audit log and the metrics all work as they would with real agents.
+
+`pnpm demo --reset` starts over with a fresh workspace; `pnpm demo --no-canvas` runs only the agents and the API. The agents are scripts, never models, so the demo can't spend anything or reach anything outside your machine.
+
 ## Run it
 
 ```powershell
