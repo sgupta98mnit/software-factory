@@ -53,6 +53,7 @@ import type {
   InboxKind,
   InboxOption,
   Ledger,
+  Risk,
   Run,
   RunState,
   WorkOrder,
@@ -761,13 +762,30 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /**
+   * Which profile builds a work order: policy.routing by its risk, falling
+   * back to agents.builder (then Canvas's active profile). A fresh builder
+   * after one that failed moves up a level, so a cheaper model that couldn't
+   * do it hands over to a stronger one.
+   */
+  function builderRoute(run: Run, wo: WorkOrder): { profile: string | null; why: string } {
+    const policy = pinnedPolicy(run);
+    const levels: Risk[] = ["low", "medium", "high"];
+    const before = builders(wo).length;
+    const level = levels[Math.min(levels.indexOf(wo.risk) + before, levels.length - 1)] ?? wo.risk;
+    const routed = policy.routing[level];
+    const why = before && level !== wo.risk ? `escalated to ${level} after ${before} builder(s)` : `risk ${level}`;
+    return routed ? { profile: routed, why: `${why} (routing.${level})` } : { profile: policy.agents.builder, why: `${why} (agents.builder)` };
+  }
+
+  /**
    * A builder in a fresh worktree on the work order's own branch from the
    * integration tip. Git first, then the attempt (write-ahead), then the
    * agent server: a restart in between redoes the worktree or restarts the
    * conversation with the same id. `findings` go into the brief.
    */
   async function dispatch(run: Run, wo: WorkOrder, findings = wo.findings) {
-    const builder = await profile(pinnedPolicy(run).agents.builder);
+    const route = builderRoute(run, wo);
+    const builder = await profile(route.profile);
     const dir = path.join(worktrees, run.id, `wo-${wo.seq}`);
     // Not autopilot/<change>/wo-N: git can't have that next to the branch autopilot/<change>.
     const branch = `${run.integrationBranch}--wo-${wo.seq}`;
@@ -781,7 +799,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       moveWorkOrder(wo, "building", {
         patch: { branch, worktree: dir, baseSha, findings, resumeState: null },
         action: "autopilot.work_order_dispatched",
-        data: { attempt: a.id, conversationId: a.conversationId, profile: builder.name, round, branch, baseSha },
+        data: { attempt: a.id, conversationId: a.conversationId, profile: builder.name, routedBy: route.why, round, branch, baseSha },
       });
       return a;
     });
@@ -1550,11 +1568,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * it may come up later, and every agent start checks again.
    */
   async function missingProfiles(policy: Policy): Promise<string[]> {
-    const named = Object.entries(policy.agents).filter((e): e is [string, string] => !!e[1]);
+    const named: [string, string][] = [];
+    for (const [role, ref] of Object.entries(policy.agents)) if (ref) named.push([`agents.${role}`, ref]);
+    for (const [risk, ref] of Object.entries(policy.routing)) if (ref) named.push([`routing.${risk}`, ref]);
     if (!named.length) return [];
     const list = await client.listProfiles().catch(() => null);
     if (!list) return [];
-    return named.filter(([, ref]) => !list.profiles.some((p) => p.id === ref || p.name === ref)).map(([role, ref]) => `agents.${role}: "${ref}"`);
+    return named.filter(([, ref]) => !list.profiles.some((p) => p.id === ref || p.name === ref)).map(([key, ref]) => `${key}: "${ref}"`);
   }
 
   // One run is created at a time: two at once (a double-click) would both init the repo or pick the same change name.

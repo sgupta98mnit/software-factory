@@ -213,7 +213,16 @@ audited (`autopilot.budget_raised`). `GET /runs/:id` reports the effective
 budgets and `projectedCostUsd` (spent so far plus the merged average for each
 work order left).
 
-## 12. Changes since the first build
+## 12. Builder routing
+
+`builderRoute`: the profile `policy.routing[risk]` names, else
+`agents.builder`, else Canvas's active profile. Each fresh builder after one
+that failed moves the level up (low → medium → high), so a cheaper model that
+couldn't do the work hands it to a stronger one. The reason is audited with
+the dispatch (`routedBy`). Profiles named in `routing` are checked at
+`createRun` and in `/status`, like `agents`.
+
+## 13. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

@@ -3185,10 +3185,10 @@ index 0000000..380b38f
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..a3ed43f
+index 0000000..1afba08
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,829 @@
+@@ -0,0 +1,838 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -3211,7 +3211,7 @@ index 0000000..a3ed43f
 +import type { Attempt, AutopilotWorkOrder, Check, RunDetail } from "../api";
 +import { isNotFound } from "../api";
 +import { useFactoryCopy } from "../copy";
-+import { useRun, useRunAction } from "../hooks";
++import { useAutopilotStatus, useRun, useRunAction } from "../hooks";
 +import {
 +  FactoryError,
 +  FactoryLoading,
@@ -3785,6 +3785,10 @@ index 0000000..a3ed43f
 +function AttemptList({ attempts }: { attempts: Attempt[] }) {
 +  const copy = useFactoryCopy();
 +  const { i18n } = useTranslation("openhands");
++  // Which agent profile each ran on (the policy routes builders by risk).
++  const profiles = useAutopilotStatus().data?.agentServer.profiles ?? [];
++  const profileName = (id: string | null) =>
++    profiles.find((p) => p.id === id)?.name ?? null;
 +  const n = new Map<string, number>();
 +  return (
 +    <ul className="flex flex-col gap-1">
@@ -3799,6 +3803,11 @@ index 0000000..a3ed43f
 +            <span className="text-foreground">
 +              {`${copy.pipeline.roles[a.role] ?? a.role} ${index}`}
 +            </span>
++            {profileName(a.agentProfile) ? (
++              <span className="text-xs text-muted">
++                {profileName(a.agentProfile)}
++              </span>
++            ) : null}
 +            <span className="text-xs text-muted">
 +              {copy.pipeline.attemptStates[a.state] ?? a.state}
 +            </span>
