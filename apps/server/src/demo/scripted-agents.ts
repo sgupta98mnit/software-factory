@@ -38,8 +38,19 @@ function briefOf(conv: FakeConversation) {
   return { change, goal };
 }
 
-/** A capability name from the change name: its first three words. */
-const capabilityOf = (change: string) => change.split("-").slice(0, 3).join("-") || "feature";
+/**
+ * A capability name from the change name: its first three words, plus the
+ * number the factory adds to a repeated goal ("...-2"), so a second run of
+ * the same goal in the same workspace writes new files instead of the ones
+ * the first run already merged.
+ */
+export function capabilityOf(change: string) {
+  const words = change.split("-").filter(Boolean);
+  const cap = words.slice(0, 3);
+  const last = words.at(-1) ?? "";
+  if (words.length > 3 && /^\d+$/.test(last)) cap.push(last);
+  return cap.join("-") || "feature";
+}
 const sentence = (text: string) => {
   const line = text.replace(/\s+/g, " ").trim();
   return /[.!?]$/.test(line) ? line : `${line}.`;
@@ -149,7 +160,7 @@ Depends on: none
 Depends on: 1, 2
 
 - [ ] 3.1 Add an audit record per request in \`src/${cap}/audit.js\` without the raw input
-- [ ] 3.2 Add the access check in \`src/auth/check.js\`
+- [ ] 3.2 Add the access check in \`src/auth/${cap}.js\`
 `,
   };
 }
@@ -186,8 +197,8 @@ function builtFiles(cap: string, seq: number, buggy: boolean): Record<string, st
           'import { audit, records } from "./audit.js";',
           '  audit("secret-claim", true);\n  assert.equal(records.length, 1);\n  assert.ok(!JSON.stringify(records).includes("secret-claim"));',
         ),
-        "src/auth/check.js": "export const allowed = (caller) => typeof caller === \"string\" && caller.length > 0;\n",
-        "src/auth/check.test.js": t("access check", 'import { allowed } from "./check.js";', '  assert.equal(allowed(""), false);\n  assert.equal(allowed("clerk"), true);'),
+        [`src/auth/${cap}.js`]: "export const allowed = (caller) => typeof caller === \"string\" && caller.length > 0;\n",
+        [`src/auth/${cap}.test.js`]: t("access check", `import { allowed } from "./${cap}.js";`, '  assert.equal(allowed(""), false);\n  assert.equal(allowed("clerk"), true);'),
       };
   }
 }

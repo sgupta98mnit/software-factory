@@ -68,7 +68,7 @@ test("a finished run asks a person to release it; released, the base branch (and
     assert.equal(run.releasedBy, "user:alice");
     assert.equal(await headSha(t.workspace, "main"), run.releasedSha);
     assert.equal((await git(t.workspace, ["log", "-1", "--format=%s", "main"])).stdout.trim(), `Release ${run.change} (${run.id})`);
-    assert.match(readFileSync(path.join(t.workspace, "src", "auth", "check.js"), "utf8"), /allowed/); // the checkout moved too
+    assert.match(readFileSync(path.join(t.workspace, "src", "auth", "let-applicants-check.js"), "utf8"), /allowed/); // the checkout moved too
     assert.deepEqual((await auditOf(t.run.id, "autopilot.run_released")).map((e) => [e.actor, e.data.base, e.data.retested]), [["user:alice", "main", false]]);
   } finally {
     await t.close();
@@ -92,7 +92,7 @@ test("release: a base branch that moved meanwhile is merged and tested again fir
     await t.o.decide(t.item()!.id, { choice: "release" }, "user:test");
     await t.until(() => t.state() === "released");
     assert.notEqual(await fileAt(t.workspace, "main", "NOTES.md"), null);
-    assert.notEqual(await fileAt(t.workspace, "main", "src/auth/check.js"), null);
+    assert.notEqual(await fileAt(t.workspace, "main", "src/auth/let-applicants-check.js"), null);
     assert.deepEqual((await auditOf(t.run.id, "autopilot.run_released")).map((e) => e.data.retested), [true]);
   } finally {
     await t.close();
