@@ -59,6 +59,23 @@ run against the fake agent server), and the Phase 1 UI review.
 | 30 | low | `squash` left a single commit's own message (never scanned) on what merges. |
 | 31 | low | Slack alerts posted agent-written work-order titles unescaped (`<!channel>`, `<https://x\|Open the Inbox>`). |
 
+## Found by the review of Phase 4 (all fixed in "review fixes for Phase 4", tests in `autopilot-review-p4.test.ts`)
+
+| # | Severity | Issue |
+| --- | --- | --- |
+| 32 | high | A tag (or `refs/main`) any agent names after the base branch swapped the base's policy for the defaults: `currentBranch` used `--short`, which then says `heads/main`, so every new run, intake and `/status` read `refs/heads/heads/main` and pinned `DEFAULT_POLICY` (a stricter `autonomy.max`, gates or hidden tests on the base were gone). Queued runs couldn't start at all (`git worktree add ... main`: "ambiguous object name") and paused with a git error. The base is read by its full ref now, and integration branches start from `refs/heads/<base>`. |
+| 33 | medium | The watchdog stranded an agent whose nudge the agent server refused (a 500, a 429): it had paused the conversation first, so the attempt stayed `running` in the ledger, the conversation paused, and nothing polled it as working again; the run waited for ever with nobody told. The watchdog now resumes it (a 429 counts as sent) and tries again on the next poll. |
+| 34 | medium | A restarted spec agent or validator whose fresh agent couldn't start (the agent server away while its profile was looked up, or a missing profile a person then fixed) was never started: the restarted attempt counted as handled. The run sat in `spec` for ever, holding a queue slot; without a validator, work orders went on with hidden tests "missing". The steps start it now, and work orders wait for it. |
+| 35 | medium | Two deliveries of one issue at once (GitHub sends `opened` and `labeled` together for an issue created with the label) both passed the duplicate check, so the same issue made two runs. Intake handles one request at a time. |
+| 36 | medium | Intake text reached markdown and the spec brief unescaped: a webhook's `author` and `reference` (end-user text a helpdesk passes on) made links in the Inbox item, and their line breaks started lines of their own in the spec brief outside `<goal>`; the URL went in raw, so `https://x/1) [Open the Inbox](https://evil...` was a link elsewhere; and a body with `</goal>` closed the goal tag, so what followed read as the factory's instructions. Author and reference are one line and escaped, the URL is normalized and shown as an autolink, and the goal's own tags are escaped. |
+| 37 | medium-low | A flaky-gate re-run could hide a failure that isn't flaky: a test that rewrites its golden file (or snapshot) when it doesn't match fails, then passes on the second run against files that aren't committed, at verify, on the integration branch and at release. A gate whose failing run changed the worktree's files isn't run again. |
+| 38 | medium-low | The watchdog took only a higher event count as progress: after the count went down (a conversation the agent server restored with fewer events), a working agent was nudged and stopped until it passed the old count. Any change counts. |
+| 39 | low-medium | A builder the agent server lost still counted against `repair` when it was the latest one: with the fresh builders used up (`repair.fresh` 1 after a failed first builder, or 0), an agent-server restart sent the work order to a person instead of a fresh agent. The latest lost one is forgiven too (two at most, as before). |
+| 40 | low | A release paused while its merge was tested kept that merge in memory and, after Resume, skipped the order check, racing the release that went meanwhile (one of them failed back to a person, the race the order was for). Pause forgets the merge, a release takes the base in the same moment it checks, and one being made or tested goes first. |
+| 41 | low | A run cancelled while releasing left its release worktree (`worktrees/<run>/release`, still in `git worktree list`). |
+| 42 | low | `POST /intake/:source` read the whole body before checking its 512 KB limit, so a chunked body of any size (no Content-Length) sat in memory first. The limit applies while it's read (`hono/body-limit`). |
+| 43 | low | On a detached HEAD, intake decided with the default policy while the run it made pinned `main`'s, so `intake.github: off` on `main` didn't stop GitHub issues. Intake uses `main` too. |
+
 ## Plausible, not fixed yet (tracked for later phases)
 
 - **A conversation paused by hand in Canvas** stays `running` in the ledger, and
@@ -93,6 +110,35 @@ run against the fake agent server), and the Phase 1 UI review.
 - **The base branch is whatever the workspace has checked out.** A hand-started
   agent working in the workspace could switch it. The real fix is running agents
   in a sandbox (Docker), which also keeps them out of `data/` (hidden tests).
+- **The watchdog's nudge, during an outage:** if the agent server goes away
+  between the watchdog's pause and its nudge, the resume fails too and the
+  conversation stays paused, like one paused by hand in Canvas.
+- **Flaky re-runs see only what `git status` sees.** A gate whose failing run
+  changed an ignored file (a SQLite file under an ignored folder, a cache) or
+  something outside the worktree (a database, a deploy) is still run again. A
+  per-gate `rerun: false` in `policy.gates` would let a migration or deploy
+  step opt out.
+- **A queued or proposed run keeps the policy of the day it was made.** One
+  proposed by intake and started a week later runs under that week-old policy,
+  not the base's current one. The line is by creation time, so it also goes
+  ahead of runs queued meanwhile, and `waitedSeconds` counts the days it was
+  proposed.
+- `queue.maxActiveRuns` holds only at start: resuming a paused run or approving
+  a plan can put more runs to work than the limit.
+- **A slow agent server can flap the outage:** when one conversation's calls
+  time out every tick and others answer, an outage opens and closes each tick
+  (two audit records every 3 s); no notice goes out under `outageAlertMs`.
+- **`POST /intake/bug` takes no signature** (it's Home's form, as the local
+  user). A relay that forwards all of `/intake/*` lets anyone outside file bug
+  reports; it should forward only `github` and `webhook`.
+- Webhook requests without a `reference` aren't deduplicated (a redelivery is a
+  new run), and nothing uses `X-GitHub-Delivery`; a `labeled` event on a closed
+  issue is taken like any other.
+- `takenChangeNames` and the integration branch checks (`integrationMoved`,
+  `releaseStep`, `mergeInto`) still read refs by bare name: a tag called
+  `autopilot/<change>` pauses that run as "moved" (a stop, not a way in).
+- `unpause` and `resumeWorkOrder` keep `nudgedAt`: an agent nudged before a
+  pause is stopped after one quiet spell after Resume, without a second nudge.
 
 ## Phase 1 UI review (fixed in "Home, Pipeline and Inbox screens")
 

@@ -89,8 +89,9 @@ export async function ensureRepo(dir: string): Promise<{ initialized: boolean }>
 
 /** null on a detached HEAD. */
 export async function currentBranch(dir: string): Promise<string | null> {
-  const r = await git(dir, ["symbolic-ref", "--short", "-q", "HEAD"], { allowFail: true });
-  return r.code === 0 ? r.stdout.trim() : null;
+  // The full ref, not --short: that says "heads/main" once a tag (or refs/main) is called main too, which any agent can make.
+  const r = await git(dir, ["symbolic-ref", "-q", "HEAD"], { allowFail: true });
+  return r.code === 0 ? r.stdout.trim().replace(/^refs\/heads\//, "") : null;
 }
 
 export async function headSha(dir: string, ref = "HEAD"): Promise<string> {

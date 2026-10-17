@@ -36,11 +36,14 @@ const MAX_BODY = 3000;
 
 /** One clipped string, or "" for anything that isn't one. */
 const str = (v: unknown, max: number) => (typeof v === "string" ? v.replace(/\r\n?/g, "\n").trim().slice(0, max) : "");
-/** An https link, or null: nothing else goes into a person's Inbox as a link. */
+/** One line: names and ids go into the spec brief's own text, where a line break would start instructions of the sender's. */
+const line = (v: unknown, max: number) => str(v, max).replace(/\s+/g, " ");
+/** An https link, or null: nothing else goes into a person's Inbox as a link. Normalized, so it has no spaces, < or >. */
 const link = (v: unknown) => {
   if (typeof v !== "string") return null;
   try {
-    return new URL(v).protocol === "https:" ? v.slice(0, 500) : null;
+    const url = new URL(v);
+    return url.protocol === "https:" && url.href.length <= 500 ? url.href : null;
   } catch {
     return null;
   }
@@ -97,7 +100,7 @@ export function fromWebhook(payload: unknown): IntakeRequest {
   const title = str(p.title, MAX_TITLE);
   if (!title) throw new Error("title is required (a string, at most 200 characters are kept)");
   if (p.kind !== undefined && p.kind !== "feature" && p.kind !== "bug") throw new Error('kind must be "feature" or "bug"');
-  const reference = str(p.reference, 200);
+  const reference = line(p.reference, 200);
   return {
     source: "webhook",
     kind: p.kind === "bug" ? "bug" : "feature",
@@ -105,7 +108,7 @@ export function fromWebhook(payload: unknown): IntakeRequest {
     body: str(p.body, MAX_BODY),
     reference: reference ? `webhook:${reference}` : null,
     url: link(p.url),
-    author: str(p.author, 100) || null,
+    author: line(p.author, 100) || null,
   };
 }
 

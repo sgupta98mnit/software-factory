@@ -19,7 +19,8 @@ export function specBrief(o: { goal: string; change: string; autonomy: Autonomy;
     "You are the spec agent in a Software Factory Autopilot run. Write an OpenSpec change for this goal:",
     "",
     "<goal>",
-    o.goal,
+    // A goal can't close its own tag: an outside request's text would carry on as the factory's instructions.
+    o.goal.replace(/<(\s*\/?\s*goal\s*)>/gi, "&lt;$1>"),
     "</goal>",
     "",
     ...(o.origin

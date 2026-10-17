@@ -3,6 +3,7 @@
 // JSON, costs summed from attempts, nothing about prompts or keys.
 import { readFileSync } from "node:fs";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { LOCAL_USER } from "../config.js";
 import type { Attempt, InboxItem, Run, WorkOrder } from "./ledger.js";
@@ -207,11 +208,12 @@ export function createAutopilotRoutes(o: Orchestrator) {
 
   // Requests from outside: GitHub's issues webhook and other systems' signed JSON (through a relay: this API is
   // on 127.0.0.1), and Home's bug form. The policy decides what each becomes (intake.ts).
-  app.post("/intake/:source", async (c) => {
+  // The limit while reading (Content-Length, or counted as it streams in), not after: a chunked body never sits in memory whole.
+  const limit = bodyLimit({ maxSize: 512_000, onError: (c) => c.json({ error: "The request is too large." }, 413) });
+  app.post("/intake/:source", limit, async (c) => {
     const source = c.req.param("source") as IntakeSource;
     if (!INTAKE_SOURCES.includes(source)) throw new HTTPException(404, { message: `No intake source "${source}" (one of: ${INTAKE_SOURCES.join(", ")})` });
     const raw = await c.req.text();
-    if (raw.length > 512_000) return c.json({ error: "The request is too large." }, 413);
     const secret = source === "github" ? process.env.SF_INTAKE_GITHUB_SECRET : source === "webhook" ? process.env.SF_INTAKE_SECRET : undefined;
     const header = source === "github" ? c.req.header("x-hub-signature-256") : c.req.header("x-sf-signature");
     if (source !== "bug" && !signatureOk(secret, raw, header)) {

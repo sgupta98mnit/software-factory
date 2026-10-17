@@ -5,6 +5,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { git } from "./git.js";
 import { OUTPUT_LIMIT, type Finding } from "./ledger.js";
 
 /** One gate, as policy.yml's `gates` list gives it. `cwd` is relative to the worktree. */
@@ -202,6 +203,10 @@ export interface GatesOutcome {
 }
 
 const INSTALL = /(^|:)install$/;
+const NOT_AGAIN = "\n[Not run again: the first run changed files in the worktree, so a second run wouldn't test what's committed.]";
+
+/** The worktree's files as git sees them (tracked changes and untracked files); "" where git can't say. */
+const filesNow = async (dir: string) => (await git(dir, ["status", "--porcelain", "-z", "--untracked-files=all"], { allowFail: true }).catch(() => null))?.stdout ?? "";
 
 /** One gate's two runs as one result: the second decides, and the output says what happened. */
 function ranAgain(first: GateResult, second: GateResult): GateResult {
@@ -217,8 +222,9 @@ function ranAgain(first: GateResult, second: GateResult): GateResult {
  * Runs the gates one after another in `dir`. A failing install stops the
  * rest, since nothing after it can pass. No gates at all is a failure too.
  * `signal` stops the gate that's running and the rest. With `rerunFailed`,
- * a gate that fails (not an install, not a timeout) runs once more: a pass
- * then counts, marked flaky, so a flaky test costs a minute, not a repair.
+ * a gate that fails (not an install, not a timeout, and not one that changed
+ * the worktree's files) runs once more: a pass then counts, marked flaky, so
+ * a flaky test costs a minute, not a repair.
  */
 export async function runGates(dir: string, gates: Gate[], opts: { signal?: AbortSignal; rerunFailed?: boolean } = {}): Promise<GatesOutcome> {
   if (!gates.length) {
@@ -227,9 +233,12 @@ export async function runGates(dir: string, gates: Gate[], opts: { signal?: Abor
   const results: GateResult[] = [];
   for (const gate of gates) {
     if (opts.signal?.aborted) break;
+    const before = opts.rerunFailed ? await filesNow(dir) : "";
     let result = await runGate(dir, gate, opts.signal);
     if (!result.ok && opts.rerunFailed && !result.timedOut && !INSTALL.test(gate.name) && !opts.signal?.aborted) {
-      result = ranAgain(result, await runGate(dir, gate, opts.signal));
+      // Only on the same files: one that rewrote a fixture or snapshot on failing would pass on something that isn't committed.
+      if ((await filesNow(dir)) === before) result = ranAgain(result, await runGate(dir, gate, opts.signal));
+      else result = { ...result, output: `${result.output.slice(-(OUTPUT_LIMIT - NOT_AGAIN.length))}${NOT_AGAIN}` };
     }
     results.push(result);
     if (!result.ok && INSTALL.test(gate.name)) break;

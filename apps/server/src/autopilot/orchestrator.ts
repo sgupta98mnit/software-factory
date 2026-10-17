@@ -278,7 +278,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return job.outcome;
   }
 
-  /** Stops the run's gate jobs (pause, cancel) and waits for their processes to go. */
+  /** Stops the run's gate jobs (pause, cancel) and waits for their processes to go. A release merge being tested is made again after Resume. */
   async function stopJobs(runId: string) {
     const mine = [...jobs.entries()].filter(([, j]) => j.runId === runId);
     for (const [, j] of mine) j.controller.abort();
@@ -287,6 +287,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       jobs.delete(key);
       prepared.delete(key);
     }
+    releases.delete(runId);
   }
 
   const changed = (runId: string) => broadcast({ type: "autopilot.changed", runId });
@@ -451,8 +452,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   function restartable(a: Attempt): boolean {
     if (a.state === "finished") return false;
     const same = ledger.listAttempts({ runId: a.runId, role: a.role }).filter((x) => x.workOrderId === a.workOrderId);
-    return !same.some((x) => (x.result as { outcome?: string } | null)?.outcome === "restarted");
+    return !same.some(restarted);
   }
+  /** Restarted: its fresh agent is the next attempt, or still to start when the agent server wasn't there for it. */
+  const restarted = (a: Attempt) => (a.result as { outcome?: string } | null)?.outcome === "restarted";
 
   async function restart(run: Run, a: Attempt, why: string) {
     markHandled(a, { outcome: "restarted", error: (a.result as { error?: string } | null)?.error });
@@ -587,7 +590,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (quiet < quietMs / 2) return;
     const events = await client.eventCount(a.conversationId);
     if (events === null) return; // the agent server can't say, so the watchdog can't either
-    if (a.events === null || events > a.events) {
+    // Any change: a count that went down (a conversation the agent server restored) and grows again is work too.
+    if (a.events === null || events !== a.events) {
       ledger.updateAttempt(a.id, a.events === null ? { events } : { events, progressAt: now() });
       return;
     }
@@ -596,7 +600,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     await client.pause(a.conversationId).catch(warn);
     if (!a.nudgedAt) {
       // Not a turn: the repair limits count the factory's findings, not this.
-      await client.send(a.conversationId, quietNudge(minutes));
+      try {
+        await client.send(a.conversationId, quietNudge(minutes));
+      } catch (err) {
+        // Not left paused by the watchdog, where nothing would look at it again: it goes on, the next poll
+        // tries the nudge again, and three errors in a row fail the attempt. 429: the nudge is saved; this starts it.
+        await client.resume(a.conversationId).catch(warn);
+        if (!(err instanceof OpenHandsError && err.status === 429)) throw err;
+      }
       ledger.updateAttempt(a.id, { nudgedAt: now(), progressAt: now(), seenRunning: false, lastSentAt: now(), events: await client.eventCount(a.conversationId).catch(() => events) });
       record(SYSTEM, "autopilot.agent_nudged", a.runId, { role: a.role, attempt: a.id, quietMinutes: minutes });
     } else {
@@ -650,7 +661,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   async function specStep(run: Run) {
     const a = latest(run.id, "spec");
-    if (!a) return startAgent(run, "spec");
+    if (!a || restarted(a)) return startAgent(run, "spec");
     if (ACTIVE.has(a.state) || a.state === "paused" || handled(a)) return; // working, or waiting for a person
     const dir = run.integrationDir as string;
     if (a.state !== "finished") {
@@ -1023,7 +1034,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   function hiddenState(run: Run): "off" | "waiting" | "ready" | "missing" {
     if (!pinnedPolicy(run).hiddenTests.enabled) return "off";
     const v = latest(run.id, "validator");
-    if (!v || !handled(v)) return "waiting";
+    if (!v || !handled(v) || restarted(v)) return "waiting";
     return hiddenTests(run).length ? "ready" : "missing";
   }
 
@@ -1037,6 +1048,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (!pinnedPolicy(run).hiddenTests.enabled) return;
     const v = latest(run.id, "validator");
     if (!v) return startValidator(run);
+    if (restarted(v)) return startAgent(run, "validator");
     if (ACTIVE.has(v.state) || v.state === "paused" || handled(v)) return;
     if (restartable(v)) return restart(run, v, await whyStopped(v, "The validator"));
     const tests = v.state === "finished" ? listHiddenTestFiles(testsDir(run)) : [];
@@ -1434,10 +1446,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function repair(run: Run, wo: WorkOrder, findings: Finding[], opts: { conflict?: boolean } = {}) {
     // Builders whose conversation the agent server lost (an outage, a restart) aren't the work order's
     // failures: up to two of them don't count, so an agent server that keeps losing them still runs out.
+    // The latest one too: it's the one a fresh builder replaces now.
     const everyone = builders(wo);
-    const forgiven = new Set(everyone.slice(0, -1).filter((b) => (b.result as { lost?: boolean } | null)?.lost).slice(0, 2));
+    const forgiven = new Set(everyone.filter((b) => (b.result as { lost?: boolean } | null)?.lost).slice(0, 2));
     const all = everyone.filter((b) => !forgiven.has(b));
-    const last = all.at(-1);
+    const last = everyone.at(-1);
     const data = { workOrder: `WO-${wo.seq}`, findings: findings.length };
     const limits = pinnedPolicy(run).repair;
     // A merge conflict comes from another work order's merge, not this builder's work: it has rounds of its own.
@@ -2021,7 +2034,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     { id: "hold", label: "Not now" },
   ];
   const releaseDir = (run: Run) => path.join(worktrees, run.id, "release");
-  const releases = new Map<string, { sha: string; baseTip: string }>(); // runId -> the release merge being tested
+  const releases = new Map<string, { sha: string; baseTip: string } | null>(); // runId -> the release merge being tested (null: being made)
 
   /** What a person sees before releasing: what's in it, who let each part in, the checks and the cost. */
   async function releaseBody(run: Run, why?: string): Promise<string> {
@@ -2106,7 +2119,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const outcome = takeJob(key);
     if (outcome === "running") return;
     // One release into a base branch at a time, in the order they were asked for: the base won't move under this one.
-    if (!releases.has(run.id) && releaseAhead(run)) return;
+    if (!releases.has(run.id)) {
+      if (releaseAhead(run)) return;
+      releases.set(run.id, null); // this one has the base now, in the same moment it checked: a resumed one waits for it
+    }
     const dir = releaseDir(run);
     const tip = await headSha(workspace, run.integrationBranch).catch(() => null);
     if (!tip || tip !== run.integrationSha) return releaseFailed(run, `\`${run.integrationBranch}\` moved since the run finished, so it isn't what was checked.`);
@@ -2220,7 +2236,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const run = ledger.getRun(runId);
     if (run?.state !== "queued") return;
     const integrationDir = path.join(worktrees, run.id, "integration");
-    await addWorktree(workspace, integrationDir, run.integrationBranch, run.baseBranch);
+    // refs/heads/: a tag (or refs/<base>) with the branch's name, which any agent can make, would make it ambiguous.
+    await addWorktree(workspace, integrationDir, run.integrationBranch, `refs/heads/${run.baseBranch}`);
     const integrationSha = await headSha(integrationDir);
     moveRun(run, "spec", {
       patch: { integrationDir, integrationSha },
@@ -2241,10 +2258,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return { queuePosition: run.state === "queued" ? line.findIndex((r) => r.id === run.id) + 1 : null, releaseAfter: ahead?.change ?? null };
   }
 
-  /** The release into the same base branch that was asked for before this one and is still going. */
+  /**
+   * The release into the same base branch that goes before this one: one
+   * whose merge is being tested (it went while an earlier one was paused),
+   * else the earliest asked for before this one that's still going.
+   */
   function releaseAhead(run: Run, runs = ledger.listRuns()): Run | undefined {
     const key = (r: Run) => `${r.releaseRequestedAt ?? ""}|${r.id}`;
-    return runs.filter((r) => r.id !== run.id && r.state === "releasing" && r.baseBranch === run.baseBranch && key(r) < key(run)).sort((a, b) => key(a).localeCompare(key(b)))[0];
+    const going = runs.filter((r) => r.id !== run.id && r.state === "releasing" && r.baseBranch === run.baseBranch);
+    return going.find((r) => releases.has(r.id)) ?? going.filter((r) => key(r) < key(run)).sort((a, b) => key(a).localeCompare(key(b)))[0];
   }
 
   /** Cheap: hands each live run to advance(), skipping runs that are still busy. */
@@ -2336,7 +2358,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     let integrationSha: string | null = null;
     if (state === "spec") {
       integrationDir = path.join(worktrees, id, "integration");
-      await addWorktree(workspace, integrationDir, integrationBranch, baseBranch);
+      await addWorktree(workspace, integrationDir, integrationBranch, `refs/heads/${baseBranch}`);
       integrationSha = await headSha(integrationDir);
     }
 
@@ -2363,10 +2385,21 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * person's Start in the Inbox, or a run. A reference already behind a run
    * that isn't cancelled is a duplicate (GitHub redelivers; a label can be
    * added twice). Audit data holds the source, reference and a clipped title,
-   * never the body.
+   * never the body. One request at a time: two deliveries of one issue
+   * (GitHub sends `opened` and `labeled` together) would both pass the check.
    */
-  async function intake(input: { source: IntakeSource; payload: unknown; event?: string }, actor: string): Promise<{ outcome: "ignored" | "duplicate" | "proposed" | "started"; reason?: string; run?: Run }> {
-    const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
+  type IntakeInput = { source: IntakeSource; payload: unknown; event?: string };
+  type IntakeResult = { outcome: "ignored" | "duplicate" | "proposed" | "started"; reason?: string; run?: Run };
+  let intaking: Promise<unknown> = Promise.resolve();
+  function intake(input: IntakeInput, actor: string): Promise<IntakeResult> {
+    const next = intaking.then(() => intakeNow(input, actor));
+    intaking = next.catch(() => undefined);
+    return next;
+  }
+
+  async function intakeNow(input: IntakeInput, actor: string): Promise<IntakeResult> {
+    // The base branch createRun will use (main on a detached HEAD), so the policy that decides is the one the run pins.
+    const branch = (await isRepoRoot(workspace).catch(() => false)) ? ((await currentBranch(workspace)) ?? "main") : null;
     const { policy } = branch ? await loadPolicy(workspace, branch) : { policy: DEFAULT_POLICY };
     const request: IntakeRequest | null =
       input.source === "github" ? fromGithub(input.event, input.payload, policy.intake.githubLabel) : input.source === "webhook" ? fromWebhook(input.payload) : fromBugForm(input.payload, actor.replace(/^user:/, ""));
@@ -2389,7 +2422,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const run = await createRun({ goal: goalFor(request), autonomy: policy.intake.autonomy, actor, origin: originOf(request), proposed: mode === "inbox" });
     if (mode === "inbox") {
       const body = [
-        `A ${describeOrigin(run.origin as RunOrigin)} asks for this${request.url ? ` (${request.url})` : ""}:`,
+        // A sender's author and reference are text like the title; the URL is one autolink (link() normalized it: no spaces or <>).
+        `A ${mdText(describeOrigin(run.origin as RunOrigin))} asks for this${request.url ? ` (<${request.url}>)` : ""}:`,
         "",
         `> ${mdText(request.title)}`,
         ...(request.body ? ["", ...request.body.split("\n").map((l) => `> ${mdText(l)}`)] : []),
@@ -2427,6 +2461,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (run.revision?.dir) await removeWorktree(workspace, run.revision.dir).catch(warn);
     // The integration branch stays: it holds whatever was committed so far.
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir).catch(warn);
+    if (run.state === "releasing" || run.resumeState === "releasing") await removeWorktree(workspace, releaseDir(run)).catch(warn); // a release merge it was testing
     ledger.dismissInbox({ runId: run.id });
     return moveRun(run, "cancelled", {
       patch: { integrationDir: null, resumeState: null },

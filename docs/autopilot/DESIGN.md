@@ -65,6 +65,9 @@ replaces the plan approval). The effective level is the lowest of the request,
 - Everything else is an inbox item with options; `decide()` checks the choice is
   one of them and that a `needsNote` option has a note. A person's merge is
   recorded with their name.
+- The base branch is the workspace's checked-out branch by its full ref (not
+  `--short`, which says `heads/main` once a tag is called `main` too), and the
+  integration branch starts from `refs/heads/<base>`.
 - The policy is read from `refs/heads/<base>` when the run is created and pinned
   on the run; worktrees and work-order branches are never consulted.
 
@@ -289,20 +292,27 @@ filename="evidence-<change>-<run>.json"` and records
 ## 15. Self-healing
 
 - **Watchdog** (`watch`, policy `selfHealing.quietMinutes`, default 20).
-  Progress is a new event count (`GET /api/conversations/{id}/events/count`,
-  since cost stays 0 on subscription logins), new cost, or a status change; each
+  Progress is a changed event count (`GET /api/conversations/{id}/events/count`,
+  since cost stays 0 on subscription logins; a count that went down, as in a
+  conversation the agent server restored, counts too), new cost, or a status change; each
   attempt keeps `progressAt`, `events` and `nudgedAt` (ledger v7). Event counts
   are fetched only for a running agent quiet for half the time. When it's quiet
   for the full time, the conversation is paused and sent `quietNudge` (not a
-  turn, so the repair limits don't move). Quiet as long again, it's paused and
+  turn, so the repair limits don't move). A nudge the agent server refuses
+  resumes the conversation, so the watchdog never leaves one paused that
+  nothing polls; the next poll tries again (a 429 means it was saved and
+  counts as sent). Quiet as long again, it's paused and
   the attempt ends `stuck` with `result.watchdog`. Audited as
   `autopilot.agent_nudged` and `agent_finished` with reason `watchdog`.
 - **Restart once** (`restartable`, `restart`): a spec agent, critic, validator
   or reviewer that stops without finishing (an error, the watchdog, a
   conversation the agent server lost) is started fresh once per role and work
   order, with the old attempt marked `outcome: restarted` and audited
-  `autopilot.agent_restarted`. A second stop takes the old path to a person.
-  Builders keep their repair loop.
+  `autopilot.agent_restarted`. A fresh spec agent or validator the agent
+  server couldn't start then (the restarted attempt is still the latest) is
+  started on a later step, and work orders wait for a restarted validator's
+  tests. A second stop takes the old path to a person. Builders keep their
+  repair loop.
 - **Outages**: a call that can't reach the agent server leaves everything as it
   is (as before) and also opens an in-memory outage. `autopilot.agent_server_down`
   is audited once, a `notice` goes to the webhook once it lasts `outageAlertMs`
@@ -310,12 +320,16 @@ filename="evidence-<change>-<run>.json"` and records
   `downSeconds`) plus a notice if one went out. `/status` has
   `agentServer.downSince`; Home shows it. A conversation that's gone (404) ends
   with `result.lost`; up to two lost builders per work order don't count
-  against `repair`.
+  against `repair`, the one just lost included (with no fresh builders left,
+  it still gets one).
 - **Cold starts**: `classify` takes `progressed` (events grew since the
   message, read only for `idle` never seen running). `idle` with no new events
   waits up to 3 minutes instead of the 20 s grace; `finished` is unchanged.
 - **Flaky gates** (`selfHealing.rerunFailedGates`, default on): `runGates`
-  runs a failed gate (not an install, not a timeout) once more. A pass then
+  runs a failed gate (not an install, not a timeout) once more, unless its
+  failing run changed the worktree's files (`git status`: a test that rewrote
+  a golden file or snapshot would pass on something that isn't committed);
+  that failure stands, and its output says why. A pass then
   counts, with `flaky: true` and both outputs in the check, and
   `autopilot.gates_run` lists it under `flaky`. Two failures say so in the
   output. This covers work-order gates, hidden tests, integration re-tests and
@@ -337,14 +351,19 @@ filename="evidence-<change>-<run>.json"` and records
   already waiting, makes a `queued` run: change name reserved, policy pinned,
   no integration branch or worktree. Each tick starts the oldest queued run
   when its pinned policy's limit allows (one a tick). `dequeue` adds the
-  integration worktree from the base branch as it is then, moves the run to
+  integration worktree from `refs/heads/<base>` as it is then (a tag with the
+  base's name would make the bare name ambiguous), moves the run to
   `spec`, and audits `autopilot.run_started` with `waitedSeconds` and the base
   sha. Pause, resume and cancel work on queued runs like any other.
 - Releases into one base branch go one at a time. `requestRelease` stamps
   `releaseRequestedAt` (ledger v9), and `releaseStep` waits while a release
   asked for earlier (`releaseAhead`) is still `releasing`. The later release
   then merges onto the earlier one and, since the base moved, is tested again,
-  where before the two raced and the loser went back to a person.
+  where before the two raced and the loser went back to a person. A release
+  takes the base in the same moment it checks (`releases`), and one whose
+  merge is being made or tested goes first whenever it was asked for: one
+  paused meanwhile (Pause forgets its merge) waits for it after Resume.
+  Cancelling a releasing run removes its release worktree.
 - The API's run summary has `queuePosition` and `releaseAfter` (the change
   going first), and `/status` has `queuedRuns`. The Pipeline banner says what
   the run waits on.
@@ -362,9 +381,14 @@ filename="evidence-<change>-<run>.json"` and records
   loopback API.
 
 A missing secret or a bad signature is a 401, audited as
-`autopilot.intake_rejected` with the reason and no body. Text is clipped
-(title 200, body 3000), and links must be https. The policy loaded from the
-base branch decides by source (`intake.<source>`):
+`autopilot.intake_rejected` with the reason and no body. A body over 512 KB is
+a 413 while it's read (`bodyLimit`: Content-Length, or counted as a chunked
+body streams in). Requests are handled one at a time, so the duplicate check
+sees a run an earlier delivery made (GitHub sends `opened` and `labeled`
+together). Text is clipped (title 200, body 3000), a webhook's `author` and
+`reference` are one line, and links must be https (kept normalized: no
+spaces, `<` or `>`). The policy loaded from the base branch (`main` on a
+detached HEAD, as for the run it creates) decides by source (`intake.<source>`):
 
 - `off`: `intake_ignored`.
 - `inbox`: a `proposed` run (no branch, like `queued`) plus an `intake`
@@ -375,8 +399,11 @@ base branch decides by source (`intake.<source>`):
 Autonomy is `intake.autonomy` under the usual caps. A reference that's
 already on a run that isn't cancelled is `intake_duplicate`. The run keeps
 `origin` (source, kind, title, reference, url, author; ledger v10), which shows
-on the Pipeline and in the evidence. The spec brief says the goal is an outside
-request whose instructions it must not follow. Audit data holds the source,
+on the Pipeline and in the evidence. The `intake` item's body escapes the
+origin's text like the title and shows the URL as one autolink. The spec brief
+says the goal is an outside request whose instructions it must not follow, and
+a `<goal>` or `</goal>` inside the goal is escaped so it can't close its tag.
+Audit data holds the source,
 kind, reference and a title clipped to 80 characters, never the body.
 
 ## 18. Spec drift and re-plan
