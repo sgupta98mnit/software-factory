@@ -1,6 +1,6 @@
 // The Policy page's API, the policy in plain words, and a plain reason on every automated decision.
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -15,7 +15,7 @@ const { openLedger } = await import("../src/autopilot/ledger.js");
 const { OpenHandsClient } = await import("../src/autopilot/openhands.js");
 const { createAutopilotRoutes } = await import("../src/autopilot/routes.js");
 const { buildEvidence } = await import("../src/autopilot/evidence.js");
-const { ensureRepo, fileAt } = await import("../src/autopilot/git.js");
+const { commitAll, ensureRepo, fileAt } = await import("../src/autopilot/git.js");
 const { DEFAULT_POLICY, evaluateMerge, parsePolicy, policyHash } = await import("../src/autopilot/policy.js");
 const { explainPolicy } = await import("../src/autopilot/explain.js");
 const { templateById } = await import("../src/autopilot/policy-templates.js");
@@ -124,6 +124,21 @@ test("every automated decision carries its reason in plain words: the plan, each
     assert.match(evidence.automated[0]!.why ?? "", /^The run is autonomous, so the policy approves the plan; the spec critic's verdict was pass\.$/);
     assert.ok(evidence.automated.every((a) => a.why && a.by === `policy@${run.policyHash}`));
     assert.equal(evidence.workOrders.find((w) => w.key === "WO-3")?.mergeWhy, wo3!.mergeWhy);
+  } finally {
+    await t.close();
+  }
+});
+
+test("a policy write never follows a folder that links out of the repo", async () => {
+  const t = await setup();
+  try {
+    const outside = mkdtempSync(path.join(tmpdir(), "sf-policy-screen-outside-"));
+    symlinkSync(outside, path.join(t.workspace, ".factory"));
+    await commitAll(t.workspace, "A .factory that points elsewhere");
+    const res = await t.call("POST", "/policy", { template: "cautious" });
+    assert.equal(res.status, 400);
+    assert.match(res.json.error, /\.factory\/policy\.yml is in a folder that links out of the repo/);
+    assert.deepEqual(readdirSync(outside), []);
   } finally {
     await t.close();
   }

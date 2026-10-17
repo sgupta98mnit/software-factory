@@ -159,8 +159,8 @@ const RULES: Record<string, Rule> = {
   "intake.autonomy": oneOf(AUTONOMY),
   "preview.enabled": flag,
   "preview.start": text,
-  // A path on the app ("/status"), never another host.
-  "preview.paths": (v, key) => listOf((p, k) => (typeof p === "string" && /^\/(?!\/)/.test(p) && p.length <= 200 ? null : `${k} must be a path starting with one /`))(v, key) ?? (Array.isArray(v) && v.length > 20 ? `${key} lists at most 20 paths` : null),
+  // A path on the app ("/status"), never another host: URLs read "/\host" and "/<tab>/host" as "//host" (they drop tabs and newlines).
+  "preview.paths": (v, key) => listOf((p, k) => (typeof p === "string" && /^\/(?![/\\])[^\\\s]*$/.test(p) && p.length <= 200 ? null : `${k} must be a path starting with one / (no backslashes or spaces)`))(v, key) ?? (Array.isArray(v) && v.length > 20 ? `${key} lists at most 20 paths` : null),
   "preview.readyTimeoutSec": whole(1, 600),
   "learning.proposals": flag,
   "learning.threshold": whole(2, 100),

@@ -410,8 +410,9 @@ kind, reference and a title clipped to 80 characters, never the body.
 
 - `run.planTree` (ledger v11) is the git tree of
   `openspec/changes/<change>` the work orders came from, set on the first
-  build step. Each build step, `specDrift` compares it with the tree at
-  `integrationSha`, after merges in flight settle. When they differ, the plan
+  build step (or by a spec change asked for before it). Each build step,
+  `specDrift` compares it with the tree at `integrationSha`, after merges in
+  flight settle. When they differ, the plan
   is made again from tasks.md (`planWorkOrders`) and compared by group number
   (`diffPlan` gives added, removed, changed and unchanged). Audited as
   `autopilot.spec_drift`.
@@ -421,18 +422,24 @@ kind, reference and a title clipped to 80 characters, never the body.
   holds `revision.stage = "approval"`. An item for an older tree is marked
   superseded.
 - `applyReplan` stops the agents, gate jobs and worktree of every changed or
-  removed work order in progress. Removed ones become `skipped` (merged ones
-  keep their code). Changed ones take the new title, criteria and dependencies
-  and go back to `pending` with a finding for the next builder; a merged one
+  removed work order in progress; a merge of one being tested comes off the
+  integration branch (back to its `preMergeSha`). Removed ones become
+  `skipped` with `resumeState: pending` (merged ones keep their code), so a
+  later plan that has the group again counts it as changed and builds it; a
+  person's skip stands. Changed ones take the new title, criteria and
+  dependencies and go back to `pending` with a finding for the next builder; a merged one
   is reopened (`work_order_reopened`). Added ones are `pending`. Open items of
   stopped work orders are marked superseded, and the result is audited as
   `autopilot.replanned`. When `specs/` changed and hidden tests are on, the
-  validator starts over (`hidden_tests_reset`).
+  validator still working is stopped and a fresh one starts over
+  (`hidden_tests_reset`).
 - A person's spec change while building (`POST /runs/:id/revise`,
   `reviseSpec`) records `revision.stage = "writing"` with a worktree and
   branch (`<integration>--spec`) of its own from `integrationSha`, and starts
-  a spec agent there with `reviseBrief`. `revisionStep` validates it (with
-  the usual follow-ups), commits only the change's markdown (`commitPaths`),
+  a spec agent there with `reviseBrief` (one that can't be started then is
+  started by a later step). `revisionStep` validates it and plans its
+  tasks.md (with the usual follow-ups for either), commits only the change's
+  markdown (`commitPaths`),
   waits for any merge in flight, merges it into the integration branch
   (`spec_revised`) and removes the worktree. The drift check then re-plans. A
   stop (after the one restart) or a conflict opens a `spec_revision` item:
@@ -454,8 +461,10 @@ stopped by pause and cancel), audited as `autopilot.preview_started`.
   with `PORT` (a free loopback port) and `HOST=127.0.0.1`;
 - waits until anything answers on it, up to `readyTimeoutSec`. An exit
   before that, or a timeout, is `error`;
-- fetches each of `preview.paths` (paths only, at most 20; status < 400
-  passes);
+- fetches each of `preview.paths` (paths only, at most 20, no backslashes or
+  whitespace, which URLs read as another host; one whose URL isn't on the app
+  fails without a request; status < 400 passes). A stopped job (Pause, Cancel)
+  ends the page in flight and the browser at once;
 - screenshots each at 1280×800 with playwright-core 1.63.0 (no browser
   download) driving `SF_PREVIEW_BROWSER`, Playwright's expected Chromium, or
   the newest under `PLAYWRIGHT_BROWSERS_PATH`. With none, `noScreenshots`
@@ -463,8 +472,9 @@ stopped by pause and cancel), audited as `autopilot.preview_started`.
 - stops the app.
 
 Afterwards the integration worktree is cleaned (installed packages stay).
-The result goes on `run.preview` with its sha (ledger v12), as a check with
-stage `preview`, and in `autopilot.preview_run` (paths, statuses and whether
+The result goes on `run.preview` with the sha it ran on (ledger v12; one
+that ran on an older sha, as when a spec change merged meanwhile, runs
+again), as a check with stage `preview`, and in `autopilot.preview_run` (paths, statuses and whether
 there's a screenshot). Screenshots live in `data/previews/<run>/` and are
 served by `GET /runs/:id/preview/:file`, which only accepts names the preview
 recorded. The release decision lists the pages and embeds the screenshots. A
@@ -476,7 +486,8 @@ releasing; a person can still release.
 - `findLessons` (learning.ts) runs across every run in the ledger:
   - `gate:<name>`: a gate whose first run in a work order failed (flaky passes
     count as passing; hidden tests and the factory's scans excluded), with a
-    command from the pinned policy's gates or `npm run <script>`;
+    command from the pinned policy's gates or `npm run <script>` (a detected
+    gate's folder only when its name is plain: agents name folders);
   - `secrets`: work orders the secret scan caught;
   - `deps-pinned`: dependency scans that found unpinned versions.
 
@@ -485,9 +496,11 @@ releasing; a person can still release.
   `lessons`, ledger v13), audited as `autopilot.lesson_proposed`.
 - Accept: `commitToBase` writes the line into AGENTS.md on the base branch
   under "Learned by the Software Factory" (`withLesson`) in a detached
-  worktree. It commits as "agents: … (<person>)", then moves the branch with
-  the same compare-and-swap as a release. The result is recorded on the
-  lesson and as `lesson_accepted` with the sha. Decline records
+  worktree. An AGENTS.md that's a link to a file in the repo (`CLAUDE.md`) gets
+  the line in that file; a link anywhere else is refused. It commits as
+  "agents: … (<person>)", then moves the branch with the same
+  compare-and-swap as a release. The result is recorded on the lesson and as
+  `lesson_accepted` with the sha. Decline records
   `lesson_declined`. Either way the key isn't proposed again.
 - `askMergeApproval` now records the reasons with the move to
   `awaiting_merge_approval`. `buildInsights` groups runs by policy hash and
@@ -505,15 +518,19 @@ registry.ts. `SF_WORKSPACE` is workspace `default`, with its ledger at
 `data/autopilot.db` as before. `POST /workspaces {name, path}` registers
 another project:
 
-- the name becomes the id (slug), unique;
+- the name becomes the id (slug), unique, and not one whose kept data folder
+  (`workspace.json` there names its folder) belongs to another folder;
 - the path must be an existing absolute folder, not inside the data folder
-  (or containing it), and not already registered (compared by realpath);
+  (or containing it), not already registered, and not inside another
+  workspace or around one (compared by realpath);
 - it's audited as `workspace.registered`.
 
 Each added workspace gets `data/workspaces/<id>/` (ledger, worktrees, hidden
 tests, previews) and an orchestrator of its own, started with the others; its
 runs pin the policy from its own base branch. `/w/<id>/autopilot/*` forwards
-to that workspace's Autopilot routes (`/autopilot` stays the default's).
+to that workspace's Autopilot routes (`/autopilot` stays the default's), the
+body as a stream so the routes' own limits apply; links the orchestrator
+writes into Inbox bodies (preview screenshots) use that path (`apiPath`).
 `GET /workspaces` lists them with run and Inbox counts.
 `GET /workspaces/inbox` merges every workspace's items, each tagged with its
 workspace, and `/workspaces/inbox/count` sums them. `DELETE /workspaces/:id`

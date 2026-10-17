@@ -46,10 +46,21 @@ export function createRegistry(deps: { dataDir: string; client: OpenHandsClient;
   const spaces = new Map<string, Workspace>();
   let interval: number | null = null;
 
+  // Each data folder says whose it is: removal keeps it, and its runs and open items only belong to that folder.
+  const dataOf = (id: string) => path.join(deps.dataDir, "workspaces", id);
+  const ownerOf = (id: string): string | null => {
+    try {
+      return (JSON.parse(readFileSync(path.join(dataOf(id), "workspace.json"), "utf8")) as { path?: string }).path ?? null;
+    } catch {
+      return null;
+    }
+  };
+
   const open = (entry: WorkspaceEntry): Workspace => {
-    const dir = path.join(deps.dataDir, "workspaces", entry.id);
+    const dir = dataOf(entry.id);
     mkdirSync(dir, { recursive: true });
-    const orchestrator = createOrchestrator({ ledger: openLedger(path.join(dir, "autopilot.db")), client: deps.client, workspace: entry.path, dataDir: dir });
+    if (!ownerOf(entry.id)) writeFileSync(path.join(dir, "workspace.json"), `${JSON.stringify({ path: entry.path })}\n`);
+    const orchestrator = createOrchestrator({ ledger: openLedger(path.join(dir, "autopilot.db")), client: deps.client, workspace: entry.path, dataDir: dir, apiPath: `/sf-api/w/${entry.id}/autopilot` });
     return { entry, orchestrator, routes: createAutopilotRoutes(orchestrator) };
   };
 
@@ -97,6 +108,13 @@ export function createRegistry(deps: { dataDir: string; client: OpenHandsClient;
       if (target === data || target.startsWith(`${data}${path.sep}`) || data.startsWith(`${target}${path.sep}`)) throw new Error("A workspace can't be inside the factory's data folder, or contain it.");
       const taken = [...spaces.values()].find((w) => real(w.entry.path) === target);
       if (taken) throw new Error(`That folder is already the workspace "${taken.entry.name}".`);
+      // Nested projects share files: one's release (a merge in its checkout) would rewrite the other's.
+      const outer = [...spaces.values()].find((w) => target.startsWith(`${real(w.entry.path)}${path.sep}`));
+      if (outer) throw new Error(`That folder is inside the workspace "${outer.entry.name}".`);
+      const inner = [...spaces.values()].find((w) => real(w.entry.path).startsWith(`${target}${path.sep}`));
+      if (inner) throw new Error(`That folder contains the workspace "${inner.entry.name}".`);
+      const owner = ownerOf(id);
+      if (owner && owner !== target) throw new Error(`"${id}" was the workspace for ${owner}, and its runs are kept under that name. Choose another name, or register that folder again.`);
       const entry: WorkspaceEntry = { id, name, path: target, addedBy: actor, addedAt: new Date().toISOString() };
       const w = open(entry);
       spaces.set(id, w);
@@ -171,8 +189,9 @@ export function createRegistryRoutes(registry: Registry, actor: string) {
     const url = new URL(c.req.url);
     url.pathname = url.pathname.replace(/^.*?\/w\/[^/]+\/autopilot/, "") || "/";
     const method = c.req.method;
-    const body = method === "GET" || method === "HEAD" ? undefined : await c.req.arrayBuffer();
-    return w.routes.fetch(new Request(url, { method, headers: c.req.raw.headers, body }));
+    // The body as a stream, not read here first: the routes' own limits (intake's 512 KB) apply while it's read.
+    const body = method === "GET" || method === "HEAD" ? undefined : c.req.raw.body;
+    return w.routes.fetch(new Request(url, { method, headers: c.req.raw.headers, body, duplex: "half" } as RequestInit));
   });
   return app;
 }

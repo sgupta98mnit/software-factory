@@ -97,8 +97,18 @@ export async function runPreview(
       await sleep(250);
     }
     const pages: PreviewPage[] = [];
+    // The app's own pages only: a path a URL reads as another host ("/\host") isn't fetched or screenshot.
+    const onApp = (p: string) => (new URL(p, base).origin === base ? new URL(p, base) : null);
+    // Each page's wait ends at its timeout or when the preview is stopped, so Pause never waits behind a page that hangs.
+    const stopOr = (ms: number) => (opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms));
     for (const p of cfg.paths) {
-      const res = await fetch(new URL(p, base), { signal: AbortSignal.timeout(10_000) }).then(
+      if (opts.signal?.aborted) return result({ ok: false, pages, error: "Stopped.", noScreenshots: null });
+      const url = onApp(p);
+      if (!url) {
+        pages.push({ path: p, status: null, ok: false, screenshot: null, error: "This is not a path on the app." });
+        continue;
+      }
+      const res = await fetch(url, { signal: stopOr(10_000) }).then(
         (r) => ({ status: r.status, error: null as string | null }),
         (err: unknown) => ({ status: null, error: err instanceof Error ? err.message : String(err) }),
       );
@@ -111,14 +121,18 @@ export async function runPreview(
       try {
         const { chromium } = await import("playwright-core");
         const b = await chromium.launch({ executablePath: browser, headless: true, args: ["--no-sandbox"] });
+        const close = () => void b.close().catch(() => undefined); // a page being loaded when the preview is stopped fails at once
+        opts.signal?.addEventListener("abort", close, { once: true });
         try {
           const page = await b.newPage({ viewport: { width: 1280, height: 800 } });
           mkdirSync(outDir, { recursive: true });
           for (const [i, p] of pages.entries()) {
             if (opts.signal?.aborted) break;
+            const url = onApp(p.path);
+            if (!url) continue;
             const file = `${i + 1}-${slug(p.path)}.png`;
             try {
-              await page.goto(new URL(p.path, base).toString(), { waitUntil: "load", timeout: 15_000 });
+              await page.goto(url.toString(), { waitUntil: "load", timeout: 15_000 });
               await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => undefined);
               await page.screenshot({ path: path.join(outDir, file) });
               p.screenshot = file;
@@ -127,6 +141,7 @@ export async function runPreview(
             }
           }
         } finally {
+          opts.signal?.removeEventListener("abort", close);
           await b.close();
         }
       } catch (err) {

@@ -13,7 +13,7 @@
 // One run is handled by one thing at a time: the scheduler's step for it, or
 // a person's decision, pause or cancel, which wait for that step to finish.
 import { randomBytes, randomUUID } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { audit, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
@@ -113,6 +113,8 @@ export interface OrchestratorDeps {
   quietMs?: number;
   /** How long an agent server outage lasts before anyone is told (default 2 minutes). */
   outageAlertMs?: number;
+  /** Where this workspace's Autopilot API is served, for links in Inbox bodies (default /sf-api/autopilot; a registered workspace's is /sf-api/w/<id>/autopilot). */
+  apiPath?: string;
 }
 
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
@@ -1075,6 +1077,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function startValidator(run: Run, reset = false) {
     const dir = hiddenDir(run);
     if (reset) {
+      // A validator still writing tests for the old scenarios stops: they'd land in the new one's folder.
+      for (const a of ledger.listAttempts({ runId: run.id, role: "validator" })) {
+        if (!ACTIVE.has(a.state) && a.state !== "paused") continue;
+        await client.pause(a.conversationId).catch(warn);
+        ledger.updateAttempt(a.id, { state: "cancelled", finishedAt: now() });
+        record(SYSTEM, "autopilot.agent_finished", run.id, { role: "validator", attempt: a.id, state: "cancelled", reason: "the spec's scenarios changed" });
+      }
       rmSync(dir, { recursive: true, force: true });
       ledger.setHiddenTests(run.id, []);
       record(SYSTEM, "autopilot.hidden_tests_reset", run.id, { reason: "the spec's scenarios changed" });
@@ -1110,16 +1119,25 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const dir = rev.dir as string;
     if (rev.stage === "writing") {
       const a = latest(run.id, "spec");
-      // A restart whose fresh agent couldn't be started (the agent server looked away) starts it now.
-      if (a && restarted(a)) return startAgent(ledger.getRun(run.id) ?? run, "spec");
-      if (!a || ACTIVE.has(a.state) || a.state === "paused" || handled(a)) return;
+      // No agent of its own yet: the one asked for (or a restart's fresh one) couldn't be started when the
+      // agent server looked away. The latest spec attempt is then one already dealt with: start it now.
+      if (!a || handled(a)) return startAgent(ledger.getRun(run.id) ?? run, "spec");
+      if (ACTIVE.has(a.state) || a.state === "paused") return;
       if (a.state !== "finished") {
         const why = await whyStopped(a, "The spec agent");
         if (restartable(a)) return restart(ledger.getRun(run.id) ?? run, a, why);
         markHandled(a, { outcome: "failed" });
         return revisionFailed(run, why);
       }
-      const check = await checkChange(run.change, dir);
+      let check = await checkChange(run.change, dir);
+      // Valid isn't enough: once merged, the plan is made from its tasks.md, which validates with a "Depends on" a missing group too.
+      if (check.ok) {
+        try {
+          planWorkOrders(dir, run.change);
+        } catch (err) {
+          check = { ...check, ok: false, output: `The change is valid, but its tasks.md can't be turned into work orders: ${errorText(err)}` };
+        }
+      }
       const tries = check.ok ? 0 : invalidStreak(run, a) + 1;
       const { validateTries } = pinnedPolicy(run).spec;
       if (!check.ok && tries < validateTries) await sendFollowUp(a, validateFollowUp(run.change, check.output), "validate");
@@ -1216,7 +1234,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     } catch (err) {
       throw new Error(`The spec changed, and its tasks.md can't be planned: ${errorText(err)}`);
     }
-    const diff = diffPlan(ledger.listWorkOrders(run.id), plan);
+    const diff = replanDiff(ledger.listWorkOrders(run.id), plan);
     const scenarios = (await treeAt(fresh.planTree, "specs")) !== (await treeAt(tree, "specs"));
     const keys = (list: { seq: number }[]) => list.map((w) => `WO-${w.seq}`);
     record(SYSTEM, "autopilot.spec_drift", run.id, { from: fresh.planTree, to: tree, added: keys(diff.added), removed: keys(diff.removed), changed: keys(diff.changed.map((c) => c.wo)), scenarios });
@@ -1231,10 +1249,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
   }
 
+  /** Skipped by a re-plan (its group left the plan), not by a person: it comes back when a later plan has the group again. */
+  const dropped = (w: WorkOrder) => w.state === "skipped" && w.resumeState === "pending";
+
+  /** diffPlan, where a work order an earlier re-plan dropped and the new plan has again counts as changed: it's built again. */
+  function replanDiff(current: WorkOrder[], plan: ReturnType<typeof planWorkOrders>) {
+    const diff = diffPlan(current, plan);
+    const back = diff.unchanged.filter((c) => dropped(c.wo));
+    return { ...diff, changed: [...diff.changed, ...back], unchanged: diff.unchanged.filter((c) => !back.includes(c)) };
+  }
+
   function replanBody(diff: ReturnType<typeof diffPlan<WorkOrder>>, scenarios: boolean): string {
     const label = (w: { seq: number; title: string }) => `WO-${w.seq}: ${mdText(w.title)}`;
     const fate = (w: WorkOrder, verb: string) =>
-      w.state === "merged" ? `already merged; ${verb === "removed" ? "its code stays on the integration branch" : "it's reopened and a fresh builder updates it"}` : w.state === "pending" ? "not started" : `${w.state.replaceAll("_", " ")} now; it stops${verb === "removed" ? "" : " and starts again from the new plan"}`;
+      dropped(w) ? "dropped by an earlier re-plan; it's built again" : w.state === "merged" ? `already merged; ${verb === "removed" ? "its code stays on the integration branch" : "it's reopened and a fresh builder updates it"}` : w.state === "pending" ? "not started" : `${w.state.replaceAll("_", " ")} now; it stops${verb === "removed" ? "" : " and starts again from the new plan"}`;
     const lines = [
       ...diff.added.map((n) => `- **Added** ${label(n)}`),
       ...diff.changed.map(({ wo, next }) => `- **Changed** ${label(next)} (${fate(wo, "changed")})`),
@@ -1250,8 +1278,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     ].join("\n");
   }
 
-  /** Stops one work order's agents and gates and removes its worktree; its branch stays. */
-  async function stopWorkOrder(run: Run, wo: WorkOrder) {
+  /** Stops one work order's agents and gates and removes its worktree; its branch stays. A merge it had being tested comes off the integration branch. */
+  async function stopWorkOrder(run: Run, wo: WorkOrder, actor: string) {
     for (const key of [`${wo.id}#build`, `${wo.id}#integrate`]) {
       const job = jobs.get(key);
       if (!job) continue;
@@ -1260,6 +1288,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       jobs.delete(key);
       prepared.delete(key);
     }
+    // Untested, and for a plan that's gone: left there, the next step would take it for a branch moved outside the factory.
+    if (wo.state === "merging" && wo.preMergeSha && run.integrationDir) await resetIntegration(run, wo, wo.preMergeSha, actor);
+    if (wo.preMergeSha || wo.mergeSha) ledger.updateWorkOrder(wo.id, { preMergeSha: null, mergeSha: null });
     for (const a of ledger.listAttempts({ runId: run.id, workOrderId: wo.id })) {
       if (!ACTIVE.has(a.state) && a.state !== "paused") continue;
       await client.pause(a.conversationId).catch(warn);
@@ -1276,20 +1307,21 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * scenarios changed.
    */
   async function applyReplan(run: Run, plan: ReturnType<typeof planWorkOrders>, tree: string, actor: string, scenarios: boolean) {
-    const diff = diffPlan(ledger.listWorkOrders(run.id), plan);
+    const diff = replanDiff(ledger.listWorkOrders(run.id), plan);
     const touched = [...diff.removed, ...diff.changed.map((c) => c.wo)].filter((w) => !["merged", "skipped", "cancelled", "pending"].includes(w.state));
-    for (const wo of touched) await stopWorkOrder(run, wo);
+    for (const wo of touched) await stopWorkOrder(run, wo, actor);
     const stopped = new Set(touched.map((w) => w.id));
     const keys = (list: { seq: number }[]) => list.map((w) => `WO-${w.seq}`);
     const reopened = diff.changed.filter((c) => c.wo.state === "merged").map((c) => c.wo);
     ledger.transaction(() => {
       for (const wo of diff.removed) {
         if (["merged", "skipped", "cancelled"].includes(wo.state)) continue;
-        moveWorkOrder(ledger.getWorkOrder(wo.id) ?? wo, "skipped", { actor, patch: { worktree: null, resumeState: null }, action: "autopilot.work_order_superseded", data: { reason: "no longer in the plan" } });
+        // resumeState "pending": the plan's skip (see dropped), so the group comes back if a later plan has it again.
+        moveWorkOrder(ledger.getWorkOrder(wo.id) ?? wo, "skipped", { actor, patch: { worktree: null, resumeState: "pending" }, action: "autopilot.work_order_superseded", data: { reason: "no longer in the plan" } });
       }
       for (const { wo, next } of diff.changed) {
         const fields = { title: next.title, acceptance: next.acceptance, controls: next.controls, dependsOn: next.dependsOn, wave: next.wave, risk: next.risk, riskScore: next.riskScore ?? 0 };
-        if (wo.state === "skipped" || wo.state === "cancelled") {
+        if ((wo.state === "skipped" && !dropped(wo)) || wo.state === "cancelled") {
           ledger.updateWorkOrder(wo.id, fields); // a person's skip stands
           continue;
         }
@@ -1327,9 +1359,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const branch = `${run.integrationBranch}--spec`;
       const base = run.integrationSha ?? (await headSha(workspace, run.integrationBranch));
       await addWorktree(workspace, dir, branch, base);
-      const revising = ledger.updateRun(run.id, { revision: { stage: "writing", note: text, requestedBy: actor, requestedAt: now(), dir, branch, base, sha: null } });
+      // The tree the plan came from, when no build step has recorded it yet: otherwise the first one would take the revised spec for it.
+      const planTree = run.planTree ?? (await treeAt(base, `openspec/changes/${run.change}`));
+      const revising = ledger.updateRun(run.id, { planTree, revision: { stage: "writing", note: text, requestedBy: actor, requestedAt: now(), dir, branch, base, sha: null } });
       record(actor, "autopilot.spec_revision_requested", run.id, { note: clip(text) });
-      await startAgent(revising, "spec");
+      await startAgent(revising, "spec").catch(warn); // recorded either way: a later step starts it if this couldn't
       return ledger.getRun(run.id) ?? revising;
     });
   }
@@ -1921,7 +1955,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   // ---- the preview: the app itself, before release ----
 
   const previewDir = (run: Run) => path.join(deps.dataDir, "previews", run.id);
-  const previewResults = new Map<string, PreviewResult>(); // a preview job's key -> what it found
+  const previewResults = new Map<string, PreviewResult & { sha: string }>(); // a preview job's key -> what it found, on which sha
 
   /**
    * With policy.preview on, the app runs from the integration branch (as a
@@ -1938,14 +1972,16 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (outcome === "running") return;
     const found = previewResults.get(key);
     previewResults.delete(key);
-    if (!outcome || outcome.aborted || !found) {
+    // One that ran on an older sha (a spec change merged while it ran) is no preview of this one.
+    if (!outcome || outcome.aborted || !found || found.sha !== run.integrationSha) {
       const dir = run.integrationDir;
+      const sha = run.integrationSha as string;
       const out = previewDir(run);
       rmSync(out, { recursive: true, force: true }); // screenshots of an older sha go
       record(SYSTEM, "autopilot.preview_started", run.id, { sha: run.integrationSha, paths: policy.preview.paths });
       startJob(run.id, key, async (signal) => {
         const r = await runPreview(dir, policy.preview, out, { signal });
-        previewResults.set(key, r);
+        previewResults.set(key, { ...r, sha });
         return { ok: r.ok, results: [], aborted: signal.aborted };
       });
       return;
@@ -1954,10 +1990,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const lines = found.error ? [found.error] : found.pages.map((p) => `${p.ok ? "ok" : "FAILED"} ${p.path}: ${p.status ?? p.error ?? "no answer"}${p.screenshot ? ` (${p.screenshot})` : ""}`);
     ledger.transaction(() => {
       ledger.addCheck({ runId: run.id, stage: "preview", name: "preview", ok: found.ok, exitCode: found.ok ? 0 : 1, output: [...lines, ...(found.noScreenshots ? [found.noScreenshots] : []), "", found.output.slice(-2000)].join("\n") });
-      ledger.updateRun(run.id, { preview: { ...found, sha: run.integrationSha as string } });
+      ledger.updateRun(run.id, { preview: found });
       record(SYSTEM, "autopilot.preview_run", run.id, {
         ok: found.ok,
-        sha: run.integrationSha,
+        sha: found.sha,
         pages: found.pages.map((p) => ({ path: p.path, status: p.status, ok: p.ok, screenshot: !!p.screenshot })),
         ...(found.error ? { error: clip(found.error) } : {}),
       });
@@ -2012,6 +2048,21 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /**
+   * `file` in the worktree `dir`, or the file in the repo it links to (AGENTS.md -> CLAUDE.md). A link out
+   * of the repo (any agent's merged work can make one) would have the write land there, so it's refused.
+   */
+  function repoFile(dir: string, file: string): string {
+    const full = path.join(dir, file);
+    if (!lstatSync(full, { throwIfNoEntry: false })?.isSymbolicLink()) return file;
+    const root = realpathSync(dir);
+    const target = existsSync(full) ? realpathSync(full) : null;
+    if (!target || !target.startsWith(`${root}${path.sep}`) || !statSync(target).isFile()) {
+      throw new Error(`${file} is a link to something other than a file in the repo, so the factory doesn't write to it. Add the line by hand.`);
+    }
+    return path.relative(root, target).split(path.sep).join("/");
+  }
+
+  /**
    * One file changed on the base branch, as a person's decision (a lesson
    * accepted): committed in a detached worktree, then the branch moves only if
    * it's still where that started, like a release.
@@ -2022,9 +2073,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const dir = path.join(worktrees, `_base-${randomBytes(3).toString("hex")}`);
     await addDetachedWorktree(workspace, dir, tip);
     try {
-      mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
-      writeFileSync(path.join(dir, file), edit(await fileAt(workspace, ref, file)));
-      await git(dir, ["add", "--", file]);
+      const target = repoFile(dir, file);
+      // The folder too (".factory" for the policy): one that links out of the repo would take the write with it.
+      const folder = path.dirname(path.join(dir, target));
+      mkdirSync(folder, { recursive: true });
+      if (!`${realpathSync(folder)}${path.sep}`.startsWith(`${realpathSync(dir)}${path.sep}`)) throw new Error(`${file} is in a folder that links out of the repo, so the factory doesn't write to it.`);
+      writeFileSync(path.join(dir, target), edit(await fileAt(workspace, tip, target)));
+      await git(dir, ["add", "--", target]);
       await git(dir, ["commit", "-q", "-m", message]);
       const sha = await headSha(dir);
       if ((await currentBranch(workspace)) === base) {
@@ -2087,7 +2142,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       "",
       `### Preview: ${p.ok ? "every page answered" : "some pages failed"}`,
       ...p.pages.map((page) => `- \`${page.path}\`: ${page.ok ? `answered ${page.status}` : `**failed** (${page.status ?? mdText(page.error ?? "no answer")})`}`),
-      ...p.pages.filter((page) => page.screenshot).map((page) => `\n![${page.path}](/sf-api/autopilot/runs/${run.id}/preview/${page.screenshot})`),
+      ...p.pages.filter((page) => page.screenshot).map((page) => `\n![${page.path}](${deps.apiPath ?? "/sf-api/autopilot"}/runs/${run.id}/preview/${page.screenshot})`),
       ...(p.noScreenshots ? [`- ${mdText(p.noScreenshots)}`] : []),
     ];
   }
@@ -2617,7 +2672,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         const rev = run.revision;
         if (rev?.stage !== "failed") throw new Error("There's no stopped spec change to try again.");
         const writing = ledger.updateRun(run.id, { revision: { ...rev, stage: "writing" } });
-        await startAgent(writing, "spec");
+        await startAgent(writing, "spec").catch(warn); // like reviseSpec: a later step starts it if this couldn't
         return;
       }
       case "spec_revision:drop":

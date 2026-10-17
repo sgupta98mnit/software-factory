@@ -76,6 +76,27 @@ run against the fake agent server), and the Phase 1 UI review.
 | 42 | low | `POST /intake/:source` read the whole body before checking its 512 KB limit, so a chunked body of any size (no Content-Length) sat in memory first. The limit applies while it's read (`hono/body-limit`). |
 | 43 | low | On a detached HEAD, intake decided with the default policy while the run it made pinned `main`'s, so `intake.github: off` on `main` didn't stop GitHub issues. Intake uses `main` too. |
 
+## Found by the review of Phase 4's second half (all fixed in "review fixes for Phase 4 (drift, preview, learning, registry)", tests in `autopilot-review-p4b.test.ts`)
+
+| # | Severity | Issue |
+| --- | --- | --- |
+| 44 | medium-high | A spec change whose spec agent couldn't be started when a person asked for it (the agent server answered the profile lookup with an error) held the run for ever: the revision stayed `writing` with no agent, nothing new was dispatched, the run never finished, and no item said why. `revisionStep` now starts an agent whenever the latest spec attempt is one already dealt with, and `reviseSpec` and Try again record the change even when the start fails. |
+| 45 | medium | A spec change asked for just as building started (before the first build step) was never re-planned: that step recorded the revised change folder as the tree the plan came from. `reviseSpec` records the plan's tree first. |
+| 46 | medium | A re-plan a person approved while a work order's merge was being re-tested stopped that work order but left its untested merge commit on the integration branch, so the next step paused the run as "moved outside the factory". Stopping a work order mid-merge puts the branch back to its `preMergeSha`. |
+| 47 | medium | A task group one re-plan removed and a later spec change brought back stayed skipped for ever: the plan's skip counted as a person's, so the group was never built and the run finished without it. A re-plan's skip is marked (`resumeState: pending`) and counts as changed when the group comes back. |
+| 48 | medium | A spec change whose tasks.md validated but couldn't be planned (a `Depends on` a missing group, a cycle) was merged anyway; every build step then stopped the run on it, and Retry couldn't get past it. The revision is planned before it's committed, and the reason goes back to its spec agent like a validation failure. |
+| 49 | medium | A preview that was running when a spec change was asked for was kept as the preview of the new integration sha, so the release decision (and `release.auto`) relied on a preview of older code. A preview's result keeps the sha it ran on; one of an older sha runs again. |
+| 50 | medium-low | `preview.paths` like `/\host/x` or `/<tab>/host/x` passed the policy's "path, never another host" check, and the preview fetched and screenshot that host (URLs read both as `//host`). The policy refuses backslashes and whitespace, and `runPreview` skips any path whose URL isn't on the app. |
+| 51 | low-medium | Pause or Cancel during a preview waited for every page's fetch (10 s each, up to 20 pages) and screenshot before the app was killed. Fetches end on the job's signal, and the browser closes when it's stopped. |
+| 52 | low-medium | A re-plan whose scenarios changed started a fresh validator but left the old one running (and spending), writing into the folder the new one's tests are read from. Earlier validators are paused and marked cancelled. |
+| 53 | medium-low | Accepting a lesson wrote through `AGENTS.md` when it was a symlink: one pointing out of the repo (merged work can make one) had its target overwritten, and one pointing at `CLAUDE.md` got the link's text instead of the file. Only a link to a file in the repo is followed; anything else is refused. |
+| 54 | low-medium | A lesson for a detected gate put the gate's folder name into AGENTS.md as written, and agents name folders: a folder whose name closes the code span and adds a `curl … \| sh` became an instruction for every agent, one Accept away. Only plain folder names make a lesson. |
+| 55 | low-medium | A removed workspace's name registered again for another folder took over the old project's data folder: its runs, open release and lesson items showed up under the new project, where Release would act on the wrong repo. Each data folder records its folder, and another folder can't take the name. |
+| 56 | low | A workspace could be registered inside another's folder, or around it; one project's release (`merge --ff-only` in its checkout) rewrites files in the other's. Refused now. |
+| 57 | low | `/w/<id>/autopilot/*` read the whole request body before forwarding it, so intake's 512 KB limit (#42) no longer applied while reading for registered workspaces. The body is forwarded as a stream. |
+| 58 | low | A registered workspace's release decision linked its preview screenshots under `/sf-api/autopilot` (the default workspace's API), so they never loaded. Each orchestrator knows its own `apiPath`. |
+| 59 | low-medium | Found while merging #53 with the Policy page: a write to the base branch (the policy, AGENTS.md, a lesson) checked only the file for a link out of the repo, not its folder, so a merged `.factory` symlinked elsewhere took the policy file with it. The folder is checked too (`autopilot-policy-screen.test.ts`). |
+
 ## Plausible, not fixed yet (tracked for later phases)
 
 - **A conversation paused by hand in Canvas** stays `running` in the ledger, and
@@ -139,6 +160,42 @@ run against the fake agent server), and the Phase 1 UI review.
   `autopilot/<change>` pauses that run as "moved" (a stop, not a way in).
 - `unpause` and `resumeWorkOrder` keep `nudgedAt`: an agent nudged before a
   pause is stopped after one quiet spell after Resume, without a second nudge.
+- **Re-plan reads tasks.md from the integration worktree's files**, which hold a
+  merge being tested while a person decides; the new plan can come from a
+  merge whose gates then fail. Reading it from the item's tree would close it.
+- **A stale `replan_approval` item.** `applyReplan` supersedes only work orders'
+  items, so when the spec changes again to a plan equal to the current work
+  orders, the earlier item stays open: Re-plan on it errors, and Keep the
+  current plan on it clears whatever spec change is under way by then.
+- Between a spec change merging and its drift being handled (deferred while a
+  merge is tested), work orders of the old plan can still be dispatched.
+- **A person-approved work order that makes tasks.md unplannable** stops every
+  build step (Retry can't get past it), and one that deletes the change folder
+  is merged without a re-plan.
+- Keep the current plan keeps the hidden tests of the old scenarios.
+- **Restart once is per role, and every spec agent of a run shares one**: after a
+  restart in the spec stage (or an earlier spec change), a revising spec agent
+  that stops goes straight to a person.
+- A cancelled run keeps its revision branch `<integration>--spec`.
+- **The spec commit takes any `*.md` in the change folder, symlinks included.**
+  A spec agent's `tasks.md` linking to a file outside `openspec/` would let a
+  builder change the plan's source without the `openspec/` rule seeing it.
+- `DELETE /workspaces/:id` doesn't wait for a `createRun` or intake in flight
+  (`idle()` doesn't track them): the ledger can close under it, leaving a
+  worktree and branch behind.
+- **The preview's port** is free when chosen, but another process can take it
+  before the app binds; readiness then sees that process. The app is asked to
+  bind 127.0.0.1 (`HOST`) but can bind anything. Processes that leave the
+  app's process group outlive it (as for gates).
+- **Lessons and releases share the base branch** without an order: a lesson
+  committed while a release is tested sends the release back to a person; a
+  base checked out in another worktree moves under it (as for releases); a
+  crash between the commit and recording it writes the line again on a second
+  Accept.
+- Insights don't count flaky re-runs in the release test (it records no
+  `gates_run`).
+- The combined Inbox's item ids repeat across workspaces; Canvas keys and
+  routes have to use the workspace too.
 
 ## Phase 1 UI review (fixed in "Home, Pipeline and Inbox screens")
 

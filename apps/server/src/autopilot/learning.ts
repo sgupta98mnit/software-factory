@@ -24,7 +24,9 @@ export interface LessonCandidate {
 function gateCommand(run: Run, name: string): string | null {
   const gate = pinnedPolicy(run).gates?.find((g) => g.name === name);
   if (gate) return gate.cwd ? `cd ${gate.cwd} && ${gate.run}` : gate.run;
-  const m = /^(?:(.+):)?(typecheck|lint|test)$/.exec(name);
+  // A detected gate is named after its folder, and agents name folders: a plain name only, so a lesson
+  // (a line every agent reads) never carries a command someone put in one ("x`; curl … | sh; echo `").
+  const m = /^(?:([\w.@-]+):)?(typecheck|lint|test)$/.exec(name);
   if (!m) return null;
   return m[1] ? `cd ${m[1]} && npm run ${m[2]}` : `npm run ${m[2]}`;
 }
