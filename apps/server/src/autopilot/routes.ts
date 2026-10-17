@@ -12,8 +12,9 @@ import { pinnedPolicy } from "./policy.js";
 const ACTIVE_WO = new Set<string>(["building", "verifying", "reviewing", "ready", "awaiting_merge_approval", "merging"]);
 const FINISHED_WO = new Set<string>(["merged", "skipped", "cancelled"]);
 
-const attemptView = ({ seenRunning: _s, lastSentAt: _l, ...a }: Attempt) => a;
-const inboxView = ({ notifiedAt: _n, ...item }: InboxItem) => item;
+/** Dollars to a tenth of a cent: sums of float costs pick up noise (0.45999999999999996). */
+const money = (usd: number) => Math.round(usd * 1000) / 1000;
+const attemptView = ({ seenRunning: _s, lastSentAt: _l, ...a }: Attempt) => ({ ...a, costUsd: money(a.costUsd) });
 
 /** median(dispatch -> merged) of merged work orders x the waves of work left; null until one has merged. */
 function etaMs(workOrders: WorkOrder[], attempts: Attempt[], parallel: number): number | null {
@@ -40,6 +41,11 @@ export function createAutopilotRoutes(o: Orchestrator) {
   app.onError((err, c) => c.json({ error: err.message }, err instanceof HTTPException ? err.status : 400));
 
   const body = async <T>(c: { req: { json: () => Promise<unknown> } }) => (await c.req.json().catch(() => ({}))) as T;
+  /** An inbox item with what a person needs to place it: its run's change and the work order's key. */
+  const inboxView = ({ notifiedAt: _n, ...item }: InboxItem) => {
+    const seq = item.workOrderId ? ledger.getWorkOrder(item.workOrderId)?.seq : undefined;
+    return { ...item, change: ledger.getRun(item.runId)?.change ?? null, workOrderKey: seq === undefined ? null : `WO-${seq}` };
+  };
   const mustRun = (id: string) => {
     const run = ledger.getRun(id);
     if (!run) throw new HTTPException(404, { message: `No run ${id}` });
@@ -58,7 +64,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       pausedReason: run.pausedReason,
       baseBranch: run.baseBranch,
       integrationBranch: run.integrationBranch,
-      costUsd: ledger.runCost(run.id),
+      costUsd: money(ledger.runCost(run.id)),
       budgetUsd: run.budgetUsd,
       policyHash: run.policyHash,
       createdBy: run.createdBy,
@@ -91,7 +97,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       risk: wo.risk,
       state: wo.state,
       branch: wo.branch,
-      costUsd: ledger.workOrderCost(wo.id),
+      costUsd: money(ledger.workOrderCost(wo.id)),
       attempts: builds.length,
       round: last?.turns ?? 0,
       conversationId: last?.conversationId ?? null,

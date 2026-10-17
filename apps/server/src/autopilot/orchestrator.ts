@@ -64,7 +64,7 @@ import {
   validateFollowUp,
   verdictReminder,
 } from "./prompts.js";
-import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash } from "./policy.js";
+import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash, type Policy } from "./policy.js";
 import { clusterFindings, parseVerdict, passed, type ReviewVerdict } from "./review.js";
 import {
   assumptionsOf,
@@ -142,6 +142,8 @@ const clip = (text: string, max = 120) => {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 };
 const warn = (err: unknown) => console.warn(`[autopilot] ${errorText(err)}`);
+// Plain text inside a markdown body: a sensitive-path glob's double stars must not turn bold.
+const mdText = (text: string) => text.replace(/[\\`*_[\]<>#|~]/g, (c) => `\\${c}`);
 
 export function createOrchestrator(deps: OrchestratorDeps) {
   const { ledger, client, workspace } = deps;
@@ -877,7 +879,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       `**WO-${wo.seq}: ${wo.title}** passed its gates and review. Merging brings \`${wo.branch}\` into \`${run.integrationBranch}\`, where the gates run again.`,
       "",
       "### Why it needs you",
-      bullets(check.reasons),
+      bullets(check.reasons.map(mdText)),
       "",
       `### ${files.length} file(s), ${linesChanged} line(s) changed`,
       ...list,
@@ -1249,12 +1251,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const isRepo = await isRepoRoot(workspace).catch(() => false);
     const branch = isRepo ? await currentBranch(workspace) : null;
     // The policy a run started now would pin; an invalid policy.yml shows here before anyone starts one.
+    // `autonomy`: what Home preselects, and the most anyone can pick (the policy's max under SF_AUTONOMY_CAP).
+    const autonomyOf = (p: Policy) => ({ default: clampAutonomy(p.autonomy.default, p.autonomy.max), max: clampAutonomy("autonomous", p.autonomy.max) });
     const policy = branch
       ? await loadPolicy(workspace, branch).then(
-          (p) => ({ source: p.source, hash: p.hash, error: null as string | null }),
-          (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err) }),
+          (p) => ({ source: p.source, hash: p.hash, error: null as string | null, autonomy: autonomyOf(p.policy) as ReturnType<typeof autonomyOf> | null }),
+          (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err), autonomy: null }),
         )
-      : { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null };
+      : { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null, autonomy: autonomyOf(DEFAULT_POLICY) };
     return {
       agentServer: { url: client.baseUrl, ...agent },
       workspace: { path: workspace, isRepo, branch },

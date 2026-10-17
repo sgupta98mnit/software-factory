@@ -351,7 +351,8 @@ test("e2e, supervised with .factory/policy.yml on the base branch: a work order 
     assert.deepEqual(t.ledger.listChecks({ runId: run.id, workOrderId: `${run.id}/WO-1` }).map((c) => `${c.stage}:${c.name}`), ["build:unit"]);
     assert.match(t.fake.conversations.get(t.builders(run.id, 1)[0]!.conversationId)?.messages[0] ?? "", /these checks itself, in this order: unit \(`node --test`\)/);
     const item = t.item(run.id, "merge_approval", 1)!;
-    assert.match(item.body, /### Why it needs you\n- Changes sensitive paths: secure\/keys\.js \(secure\/\*\*\)\.\n/);
+    // Escaped, so the glob's stars show as stars instead of turning the rest bold.
+    assert.match(item.body, /### Why it needs you\n- Changes sensitive paths: secure\/keys\.js \(secure\/\\\*\\\*\)\.\n/);
 
     await t.o.decide(item.id, { choice: "merge" }, "user:test");
     await t.until(() => t.ledger.getRun(run.id)?.state === "done");

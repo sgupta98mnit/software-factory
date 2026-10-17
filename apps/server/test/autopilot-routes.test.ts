@@ -123,6 +123,19 @@ test("two POST /runs at once (a double-click) both succeed with their own change
     assert.deepEqual([a.json.change, b.json.change].sort(), ["add-a-status-page", "add-a-status-page-2"]);
   }));
 
+test("costs are summed from attempts and rounded to a tenth of a cent, for the run, its work orders and each attempt", () =>
+  withApp(async ({ call, ledger }) => {
+    const run = (await call("POST", "/runs", { goal: "Add a status page" })).json;
+    const [wo] = ledger.addWorkOrders(run.id, [{ seq: 1, title: "Page", acceptance: ["It shows"], controls: [], dependsOn: [], wave: 1, risk: "low" }]);
+    ledger.addAttempt({ runId: run.id, workOrderId: wo!.id, role: "builder", conversationId: "c1", costUsd: 0.1 });
+    ledger.addAttempt({ runId: run.id, workOrderId: wo!.id, role: "reviewer", conversationId: "c2", costUsd: 0.2 });
+    ledger.addAttempt({ runId: run.id, role: "spec", conversationId: "c3", costUsd: 1 / 3 });
+    const detail = (await call("GET", `/runs/${run.id}`)).json;
+    assert.equal(detail.costUsd, 0.633);
+    assert.equal(detail.workOrders[0].costUsd, 0.3); // 0.1 + 0.2 is 0.30000000000000004 in floats
+    assert.deepEqual(detail.attempts.map((a: Json) => a.costUsd), [0.1, 0.2, 0.333]);
+  }));
+
 test("POST /inbox/:id/decide takes only the item's choices, needs a note where asked, and decides once", () =>
   withApp(async ({ call, ledger }) => {
     const run = (await call("POST", "/runs", { goal: "Add a status page" })).json;
@@ -148,6 +161,7 @@ test("POST /inbox/:id/decide takes only the item's choices, needs a note where a
     const open = (await call("GET", "/inbox")).json;
     assert.equal(open.length, 1);
     assert.equal("notifiedAt" in open[0], false);
+    assert.deepEqual([open[0].change, open[0].workOrderKey], [run.change, null]); // where it belongs, for the Inbox page
     assert.equal((await call("GET", `/runs/${run.id}`)).json.openInbox, 1);
 
     r = await decide({ choice: "approve", note: " Looks right " });
@@ -223,7 +237,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
         activeProfileId: "00000000-0000-4000-8000-000000000001",
       },
       workspace: { path: workspace, isRepo: false, branch: null },
-      policy: { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null },
+      policy: { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null, autonomy: { default: "supervised", max: "autonomous" } },
       openInbox: 0,
       activeRuns: 0,
     });
@@ -231,6 +245,13 @@ test("GET /status reports the agent server, the workspace and the counts", async
     s = (await call("GET", "/status")).json;
     assert.deepEqual(s.workspace, { path: workspace, isRepo: true, branch: "main" });
     assert.equal(s.activeRuns, 1);
+    // The org-wide cap lowers what Home offers, and what it preselects.
+    process.env.SF_AUTONOMY_CAP = "suggest";
+    try {
+      assert.deepEqual((await call("GET", "/status")).json.policy.autonomy, { default: "suggest", max: "suggest" });
+    } finally {
+      delete process.env.SF_AUTONOMY_CAP;
+    }
   });
 
   // Nothing listens on port 9: the status says so instead of failing.

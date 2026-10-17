@@ -20,42 +20,48 @@ index 821b542..1ec6a3c 100644
              key={`${page.extension.name}:${page.contribution.id}`}
 diff --git a/src/factory/README.md b/src/factory/README.md
 new file mode 100644
-index 0000000..3d7ac28
+index 0000000..cfc572e
 --- /dev/null
 +++ b/src/factory/README.md
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,65 @@
 +# Software Factory pages
 +
-+This folder adds three pages to Agent Canvas for spec-driven, governed delivery:
++This folder adds the Software Factory's pages to Agent Canvas for spec-driven, governed delivery:
 +
 +| Page | Route | Reads |
 +| --- | --- | --- |
++| Autopilot (Home) | `/autopilot` | Goal box, autonomy dial, budget, setup status, the list of runs |
++| Pipeline | `/autopilot/runs/:runId/:workOrderKey?` | One run: stage lanes, waves of work orders, decisions, each work order's agents and checks |
++| Inbox | `/inbox` | Decisions Autopilot leaves to a person, across runs; the sidebar shows how many wait |
 +| Requirements | `/requirements/:changeId?` | OpenSpec changes: proposal, specs with scenarios, design, tasks |
 +| Work orders | `/work-orders/:workOrderId?` | Backlog.md tasks, as a board with a detail panel |
 +| Audit log | `/audit-log` | The factory's hash-chained audit log |
 +
 +The data comes from the Software Factory API (`apps/server` in the software-factory
 +repo), not from the OpenHands agent server. Vite proxies `/sf-api` to it
-+(`SF_API_URL`, default `http://127.0.0.1:4317`). Agents run as ordinary Canvas
-+conversations: "Start with an agent" calls `useCreateConversation` with the
-+workspace as the working folder and a brief written by the API.
++(`SF_API_URL`, default `http://127.0.0.1:4317`). Autopilot's agents are ordinary
++OpenHands conversations started by the API, so every one of them opens in Canvas
++("Open in Canvas" on the Pipeline). Hand-started work orders still use "Start with an
++agent", which calls `useCreateConversation` with the workspace as the working folder
++and a brief written by the API.
 +
 +## Files
 +
 +```
-+api.ts                 Typed client for /sf-api
-+hooks.ts               React Query hooks, and live updates over Server-Sent Events
++api.ts                 Typed client for /sf-api (shapes match apps/server/src/autopilot/routes.ts)
++hooks.ts               React Query hooks, and live updates over one shared Server-Sent Events stream
 +copy.ts                The pages' words (English and Spanish)
-+factory-nav-links.tsx  Sidebar entries
-+routes/                The three pages
-+components/            Page frame, markdown, badges, and the plan/approve/start-agent dialogs
++factory-nav-links.tsx  Sidebar entries, with the Inbox badge
++factory-routes.ts      The factory's routes, spread into src/routes.ts
++routes/                The pages
++components/            Page frame, markdown, badges, the decision card, and the plan/approve/start-agent dialogs
 +```
 +
 +## Outside this folder
 +
 +Only three upstream files are touched, so pulling new OpenHands releases stays easy:
 +
-+- `src/routes.ts`: the three routes
++- `src/routes.ts`: `...factoryRoutes` and its import (new pages go in `factory-routes.ts`)
 +- `src/components/features/sidebar/sidebar-rail-body.tsx`: `<FactoryNavLinks />`
 +- `vite.config.ts`: the `/sf-api` proxy
 +
@@ -66,14 +72,29 @@ index 0000000..3d7ac28
 +- If a work order reaches the last status any other way (an agent ran the
 +  Backlog.md CLI, someone edited the file), the API flags it as not approved and
 +  the board shows it.
++- Autopilot decisions happen only through an Inbox item's buttons (or Pause, Resume
++  and Cancel on the Pipeline). The API records who chose what; a choice that needs a
++  note can't be sent without one, and cancelling asks to confirm.
 +- Strings live in `copy.ts`, not `src/i18n/translation.json`, to keep the
 +  factory self-contained. Other Canvas languages fall back to English.
++
++## Working on these pages without model logins
++
++Run the scripted fake agent server and point the API at it:
++
++```
++pnpm --filter @sf/server fake-agents                         # 127.0.0.1:18100
++SF_AGENT_SERVER_URL=http://127.0.0.1:18100 pnpm dev:api
++```
++
++Its agents write a valid OpenSpec change, build three work orders (one fails its test
++once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..7ab8bbf
+index 0000000..7c78882
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,470 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -212,6 +233,233 @@ index 0000000..7ab8bbf
 +  reason?: string;
 +}
 +
++// ---- Autopilot (/sf-api/autopilot): shapes from apps/server/src/autopilot/routes.ts ----
++
++export type Autonomy = "suggest" | "supervised" | "autonomous";
++export const AUTONOMY_LEVELS: Autonomy[] = [
++  "suggest",
++  "supervised",
++  "autonomous",
++];
++
++export type RunState =
++  | "spec"
++  | "critic"
++  | "awaiting_spec_approval"
++  | "awaiting_answers"
++  | "awaiting_plan_approval"
++  | "building"
++  | "done"
++  | "paused"
++  | "failed"
++  | "cancelled";
++
++export type AutopilotWorkOrderState =
++  | "pending"
++  | "building"
++  | "verifying"
++  | "reviewing"
++  | "ready"
++  | "awaiting_merge_approval"
++  | "merging"
++  | "merged"
++  | "needs_attention"
++  | "skipped"
++  | "cancelled";
++
++export type Severity = "critical" | "high" | "medium" | "low";
++
++export interface Finding {
++  source: "gate" | "review" | "hidden" | "integration" | "critic" | "agent";
++  severity: Severity;
++  title: string;
++  detail: string;
++  file?: string | null;
++  criterion?: number | null;
++  scenario?: string | null;
++}
++
++export interface RunSummary {
++  id: string;
++  goal: string;
++  change: string;
++  autonomy: Autonomy;
++  state: RunState;
++  pausedReason: string | null;
++  baseBranch: string;
++  integrationBranch: string;
++  costUsd: number;
++  budgetUsd: number | null;
++  policyHash: string | null;
++  createdBy: string;
++  createdAt: string;
++  updatedAt: string;
++  counts: {
++    total: number;
++    merged: number;
++    active: number;
++    failed: number;
++    pending: number;
++  };
++  openInbox: number;
++}
++
++export interface AutopilotWorkOrder {
++  id: string;
++  runId: string;
++  seq: number;
++  key: string;
++  title: string;
++  acceptance: string[];
++  controls: string[];
++  dependsOn: number[];
++  wave: number;
++  risk: "low" | "medium" | "high";
++  state: AutopilotWorkOrderState;
++  branch: string | null;
++  costUsd: number;
++  /** Builder conversations so far. */
++  attempts: number;
++  /** Messages sent to the latest builder (1 = the brief, 2+ = repairs). */
++  round: number;
++  /** The latest builder's conversation, openable in Canvas. */
++  conversationId: string | null;
++  findings: Finding[] | null;
++  mergedBy: string | null;
++  updatedAt: string;
++}
++
++export type AttemptRole =
++  | "spec"
++  | "critic"
++  | "builder"
++  | "reviewer"
++  | "validator";
++
++export interface Attempt {
++  id: number;
++  runId: string;
++  workOrderId: string | null;
++  role: AttemptRole;
++  conversationId: string;
++  agentProfile: string | null;
++  state:
++    | "starting"
++    | "running"
++    | "finished"
++    | "error"
++    | "stuck"
++    | "paused"
++    | "cancelled";
++  turns: number;
++  costUsd: number;
++  result: unknown;
++  startedAt: string;
++  finishedAt: string | null;
++}
++
++export interface Check {
++  id: number;
++  runId: string;
++  workOrderId: string | null;
++  stage: "spec" | "build" | "integrate";
++  name: string;
++  ok: boolean;
++  exitCode: number | null;
++  durationMs: number | null;
++  output: string;
++  at: string;
++}
++
++export interface InboxOption {
++  id: string;
++  label: string;
++  tone?: "primary" | "danger" | "default";
++  needsNote?: boolean;
++}
++
++export type InboxKind =
++  | "spec_approval"
++  | "plan_approval"
++  | "questions"
++  | "spec_failed"
++  | "merge_approval"
++  | "work_order_failed"
++  | "budget_reached"
++  | "run_paused"
++  | "error"
++  | "release";
++
++export interface InboxItem {
++  id: number;
++  runId: string;
++  workOrderId: string | null;
++  kind: InboxKind;
++  title: string;
++  /** Markdown. */
++  body: string;
++  options: InboxOption[];
++  state: "open" | "decided" | "dismissed";
++  decision: string | null;
++  note: string | null;
++  decidedBy: string | null;
++  decidedAt: string | null;
++  createdAt: string;
++  /** The run's OpenSpec change, and "WO-N" when the item is about a work order. */
++  change: string | null;
++  workOrderKey: string | null;
++}
++
++export interface RunDetail extends RunSummary {
++  workOrders: AutopilotWorkOrder[];
++  attempts: Attempt[];
++  checks: Check[];
++  inbox: InboxItem[];
++  /** null until a work order has merged. */
++  etaMs: number | null;
++}
++
++export interface AgentProfileSummary {
++  id: string;
++  name: string;
++  kind: string;
++  server: string | null;
++}
++
++export interface AutopilotStatus {
++  agentServer: {
++    url: string;
++    reachable: boolean;
++    error: string | null;
++    profiles: AgentProfileSummary[];
++    activeProfileId: string | null;
++  };
++  workspace: { path: string; isRepo: boolean; branch: string | null };
++  /** `autonomy`: what to preselect, and the most a run may use; null when the policy file is invalid. */
++  policy: {
++    source: string;
++    hash: string;
++    error: string | null;
++    autonomy: { default: Autonomy; max: Autonomy } | null;
++  };
++  openInbox: number;
++  activeRuns: number;
++}
++
++/** An error answer from the factory API, with its HTTP status. */
++export class FactoryHttpError extends Error {
++  constructor(
++    message: string,
++    readonly status: number,
++  ) {
++    super(message);
++    this.name = "FactoryHttpError";
++  }
++}
++
++export const isNotFound = (error: unknown) =>
++  error instanceof FactoryHttpError && error.status === 404;
++
 +/** Thrown when the factory API can't be reached at all (server not running). */
 +export class FactoryOfflineError extends Error {
 +  constructor() {
@@ -241,9 +489,10 @@ index 0000000..7ab8bbf
 +  }
 +  const data = isJson ? await response.json() : null;
 +  if (!response.ok) {
-+    throw new Error(
++    throw new FactoryHttpError(
 +      (data as { error?: string } | null)?.error ??
 +        `${response.status} ${response.statusText}`,
++      response.status,
 +    );
 +  }
 +  return data as T;
@@ -291,6 +540,30 @@ index 0000000..7ab8bbf
 +    ),
 +  audit: () => request<AuditEvent[]>("/audit"),
 +  verifyAudit: () => request<AuditVerification>("/audit/verify"),
++
++  autopilotStatus: () => request<AutopilotStatus>("/autopilot/status"),
++  runs: () => request<RunSummary[]>("/autopilot/runs"),
++  run: (id: string) =>
++    request<RunDetail>(`/autopilot/runs/${encodeURIComponent(id)}`),
++  createRun: (body: {
++    goal: string;
++    autonomy?: Autonomy;
++    budgetUsd?: number | null;
++  }) => post<RunSummary>("/autopilot/runs", body),
++  runAction: (
++    id: string,
++    action: "pause" | "resume" | "cancel",
++    note?: string,
++  ) =>
++    post<RunSummary>(
++      `/autopilot/runs/${encodeURIComponent(id)}/${action}`,
++      note ? { note } : {},
++    ),
++  inbox: (state: "open" | "decided" | "all" = "open") =>
++    request<InboxItem[]>(`/autopilot/inbox?state=${state}`),
++  inboxCount: () => request<{ open: number }>("/autopilot/inbox/count"),
++  decide: (id: number, body: { choice: string; note?: string }) =>
++    post<InboxItem>(`/autopilot/inbox/${id}/decide`, body),
 +};
 diff --git a/src/factory/components/approve-modal.tsx b/src/factory/components/approve-modal.tsx
 new file mode 100644
@@ -421,6 +694,345 @@ index 0000000..2305eef
 +      />
 +      {text}
 +    </p>
++  );
++}
+diff --git a/src/factory/components/autopilot-badges.tsx b/src/factory/components/autopilot-badges.tsx
+new file mode 100644
+index 0000000..804d266
+--- /dev/null
++++ b/src/factory/components/autopilot-badges.tsx
+@@ -0,0 +1,148 @@
++import { cn } from "#/utils/utils";
++import type { AutopilotWorkOrderState, RunState } from "../api";
++import { useFactoryCopy } from "../copy";
++
++type Tone = "active" | "waiting" | "good" | "bad" | "quiet";
++
++const DOT: Record<Tone, string> = {
++  active: "bg-primary",
++  waiting: "bg-warning",
++  good: "bg-success",
++  bad: "bg-danger",
++  quiet: "bg-muted",
++};
++
++const RUN_TONE: Record<RunState, Tone> = {
++  spec: "active",
++  critic: "active",
++  awaiting_spec_approval: "waiting",
++  awaiting_answers: "waiting",
++  awaiting_plan_approval: "waiting",
++  building: "active",
++  done: "good",
++  paused: "waiting",
++  failed: "bad",
++  cancelled: "quiet",
++};
++
++const WORK_ORDER_TONE: Record<AutopilotWorkOrderState, Tone> = {
++  pending: "quiet",
++  building: "active",
++  verifying: "active",
++  reviewing: "active",
++  ready: "active",
++  awaiting_merge_approval: "waiting",
++  merging: "active",
++  merged: "good",
++  needs_attention: "bad",
++  skipped: "quiet",
++  cancelled: "quiet",
++};
++
++/** Run states a person has to act on. */
++export const WAITING_RUN_STATES = new Set<RunState>([
++  "awaiting_spec_approval",
++  "awaiting_answers",
++  "awaiting_plan_approval",
++  "paused",
++]);
++export const FINISHED_RUN_STATES = new Set<RunState>([
++  "done",
++  "failed",
++  "cancelled",
++]);
++
++function Pill({
++  tone,
++  label,
++  testId,
++}: {
++  tone: Tone;
++  label: string;
++  testId?: string;
++}) {
++  return (
++    <span
++      data-testid={testId}
++      className="inline-flex shrink-0 items-center gap-1.5 text-xs"
++    >
++      <span
++        aria-hidden
++        className={cn(
++          "size-2 rounded-full",
++          DOT[tone],
++          tone === "active" && "animate-pulse",
++        )}
++      />
++      <span className="text-foreground">{label}</span>
++    </span>
++  );
++}
++
++export function RunStatePill({ state }: { state: RunState }) {
++  const copy = useFactoryCopy();
++  return (
++    <Pill
++      tone={RUN_TONE[state] ?? "quiet"}
++      label={copy.autopilot.runStates[state] ?? state}
++      testId="autopilot-run-state"
++    />
++  );
++}
++
++export function WorkOrderStatePill({
++  state,
++}: {
++  state: AutopilotWorkOrderState;
++}) {
++  const copy = useFactoryCopy();
++  return (
++    <Pill
++      tone={WORK_ORDER_TONE[state] ?? "quiet"}
++      label={copy.autopilot.workOrderStates[state] ?? state}
++    />
++  );
++}
++
++export function RiskChip({ risk }: { risk: "low" | "medium" | "high" }) {
++  const copy = useFactoryCopy();
++  return (
++    <span
++      className={cn(
++        "inline-flex items-center rounded-md border px-1.5 py-0.5 text-xs",
++        risk === "high"
++          ? "border-warning text-foreground"
++          : "border-border-subtle text-muted",
++      )}
++    >
++      {copy.autopilot.risk[risk] ?? risk}
++    </span>
++  );
++}
++
++/** Dollars: two decimals, and "<$0.01" for a cost that isn't zero but rounds to it. */
++export function formatMoney(usd: number, language: string) {
++  const format = new Intl.NumberFormat(language, {
++    style: "currency",
++    currency: "USD",
++  });
++  if (usd > 0 && usd < 0.01) return `<${format.format(0.01)}`;
++  return format.format(usd);
++}
++
++/** A rough, readable duration: "0.3 s", "40 s", "3 min", "1 h 20 min". */
++export function formatDuration(ms: number) {
++  if (ms < 10_000) return `${(Math.max(0, ms) / 1000).toFixed(1)} s`;
++  const s = Math.round(ms / 1000);
++  if (s < 60) return `${s} s`;
++  const min = Math.round(s / 60);
++  if (min < 60) return `${min} min`;
++  const h = Math.floor(min / 60);
++  const rest = min % 60;
++  return rest ? `${h} h ${rest} min` : `${h} h`;
++}
++
++/** "user:sumit" -> "sumit"; "policy@abc123" stays, since it names the exact rules. */
++export function approverName(actor: string) {
++  return actor.replace(/^user:/, "");
++}
+diff --git a/src/factory/components/decision-card.tsx b/src/factory/components/decision-card.tsx
+new file mode 100644
+index 0000000..6fc67af
+--- /dev/null
++++ b/src/factory/components/decision-card.tsx
+@@ -0,0 +1,179 @@
++import React from "react";
++import { useTranslation } from "react-i18next";
++import { Link } from "react-router";
++import { CircleCheck, Inbox } from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { displaySuccessToast } from "#/utils/custom-toast-handlers";
++import { cn } from "#/utils/utils";
++import type { InboxItem, InboxOption } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useDecide } from "../hooks";
++import { formatWhen } from "./factory-badges";
++import { approverName } from "./autopilot-badges";
++import { FactoryError } from "./factory-page";
++import { FactoryMarkdown } from "./factory-markdown";
++import { factoryFieldClassName } from "./start-agent-modal";
++
++const variantOf = (o: InboxOption) =>
++  o.tone === "primary"
++    ? "primary"
++    : o.tone === "danger"
++      ? "ghost-danger"
++      : "secondary";
++
++/**
++ * One inbox item: what the factory needs decided, why, and the choices. A
++ * choice that needs a note waits for one; a dangerous one (cancel) asks to
++ * confirm. Decided items show who chose what.
++ */
++export function DecisionCard({
++  item,
++  showRun = true,
++}: {
++  item: InboxItem;
++  /** Link to the run's pipeline (on the Inbox page; not on the pipeline itself). */
++  showRun?: boolean;
++}) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const decide = useDecide();
++  const [note, setNote] = React.useState("");
++  const [confirming, setConfirming] = React.useState<string | null>(null);
++  const [missingNote, setMissingNote] = React.useState<string | null>(null);
++  // The same item can be on the page twice (Inbox and a panel); ids stay unique.
++  const uid = React.useId();
++  const noteId = `factory-inbox-note-${uid}`;
++  const titleId = `factory-inbox-title-${uid}`;
++  const noteRef = React.useRef<HTMLTextAreaElement>(null);
++  const open = item.state === "open";
++  const busy = decide.isPending;
++  const wantsNote = item.options.some((o) => o.needsNote);
++
++  const choose = (option: InboxOption) => {
++    if (option.needsNote && !note.trim()) {
++      setMissingNote(option.label);
++      noteRef.current?.focus();
++      return;
++    }
++    if (option.tone === "danger" && confirming !== option.id) {
++      setConfirming(option.id);
++      return;
++    }
++    decide.mutate(
++      { id: item.id, choice: option.id, note: note.trim() || undefined },
++      { onSuccess: () => displaySuccessToast(copy.inbox.decidedToast) },
++    );
++  };
++
++  const chosen = item.options.find((o) => o.id === item.decision);
++
++  return (
++    <article
++      data-testid={`factory-inbox-item-${item.id}`}
++      aria-labelledby={titleId}
++      className={cn(
++        "flex flex-col gap-3 rounded-xl border bg-surface px-4 py-3.5",
++        open ? "border-warning" : "border-border-subtle",
++      )}
++    >
++      <header className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
++        <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
++          <Inbox className="size-3.5" aria-hidden />
++          {copy.inbox.kinds[item.kind] ?? item.kind}
++        </span>
++        {item.workOrderKey ? (
++          <span className="font-mono">{item.workOrderKey}</span>
++        ) : null}
++        {showRun && item.change ? (
++          <Link
++            to={`/autopilot/runs/${item.runId}`}
++            className="font-mono text-link hover:underline"
++          >
++            {item.change}
++          </Link>
++        ) : null}
++        <span>{formatWhen(item.createdAt, i18n.language)}</span>
++      </header>
++      <h3 id={titleId} className="text-sm font-semibold text-foreground">
++        {item.title}
++      </h3>
++      {open ? (
++        // A long body (a plan, a diff summary) scrolls, so the choices stay in view.
++        <div className="max-h-96 min-w-0 overflow-y-auto custom-scrollbar">
++          <FactoryMarkdown text={item.body} headings />
++        </div>
++      ) : (
++        <details className="min-w-0 text-sm">
++          <summary className="cursor-pointer text-muted hover:text-foreground">
++            {copy.inbox.whatWasAsked}
++          </summary>
++          <div className="mt-2 max-h-96 overflow-y-auto custom-scrollbar">
++            <FactoryMarkdown text={item.body} headings />
++          </div>
++        </details>
++      )}
++
++      {open ? (
++        <>
++          {wantsNote ? (
++            <div className="flex flex-col gap-1.5">
++              <label
++                htmlFor={noteId}
++                className="text-sm font-medium text-foreground"
++              >
++                {copy.inbox.noteLabel}
++              </label>
++              <textarea
++                id={noteId}
++                ref={noteRef}
++                className={cn(factoryFieldClassName, "min-h-20")}
++                value={note}
++                onChange={(e) => {
++                  setNote(e.target.value);
++                  setMissingNote(null);
++                }}
++                disabled={busy}
++                aria-describedby={`${noteId}-help`}
++              />
++              <p id={`${noteId}-help`} className="text-xs text-muted">
++                {missingNote
++                  ? copy.inbox.noteRequired(missingNote)
++                  : copy.inbox.noteHelp}
++              </p>
++            </div>
++          ) : null}
++          <div className="flex flex-wrap gap-2">
++            {item.options.map((option) => (
++              <BrandButton
++                key={option.id}
++                testId={`factory-inbox-${item.id}-${option.id}`}
++                type="button"
++                variant={variantOf(option)}
++                onClick={() => choose(option)}
++                isDisabled={busy}
++              >
++                {confirming === option.id
++                  ? copy.inbox.confirm(option.label)
++                  : option.label}
++              </BrandButton>
++            ))}
++          </div>
++          <FactoryError error={decide.error} />
++        </>
++      ) : (
++        <p className="flex items-center gap-2 text-sm text-muted">
++          <CircleCheck className="size-4 text-success" aria-hidden />
++          {item.state === "dismissed"
++            ? copy.inbox.dismissed
++            : `${copy.inbox.decidedBy(
++                approverName(item.decidedBy ?? ""),
++                chosen?.label ?? item.decision ?? "",
++              )}${item.decidedAt ? ` · ${formatWhen(item.decidedAt, i18n.language)}` : ""}`}
++          {item.note ? (
++            <span className="text-foreground">{`“${item.note}”`}</span>
++          ) : null}
++        </p>
++      )}
++    </article>
 +  );
 +}
 diff --git a/src/factory/components/factory-badges.tsx b/src/factory/components/factory-badges.tsx
@@ -1000,10 +1612,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..22a85cd
+index 0000000..bde40f0
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,853 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1016,6 +1628,10 @@ index 0000000..22a85cd
 + */
 +const en = {
 +  nav: {
++    autopilot: "Autopilot",
++    inbox: "Inbox",
++    inboxCount: (n: number) =>
++      n === 1 ? "1 decision waits for you" : `${n} decisions wait for you`,
 +    requirements: "Requirements",
 +    workOrders: "Work orders",
 +    audit: "Audit log",
@@ -1071,6 +1687,206 @@ index 0000000..22a85cd
 +    } as Record<string, string>,
 +    artifactDone: "done",
 +    artifactPending: "not written yet",
++  },
++  autopilot: {
++    title: "Autopilot",
++    subtitle: (workspace: string) =>
++      `Type a goal. The factory writes the spec, plans it, builds it in parallel, checks it and merges it into an integration branch of ${workspace}. It asks you only when it's stuck or the policy says a person decides.`,
++    goalLabel: "What should we build?",
++    goalPlaceholder:
++      "For example: let applicants check a claim's status by claim number, without signing in",
++    goalHelp:
++      "Say what it should do and for whom. The spec agent turns this into requirements with testable scenarios.",
++    autonomyLabel: "How much should it do on its own?",
++    autonomy: {
++      suggest: {
++        label: "Suggest",
++        help: "You approve the spec, the plan and every merge.",
++      },
++      supervised: {
++        label: "Supervised",
++        help: "You approve the plan with one click. Merges follow the policy.",
++      },
++      autonomous: {
++        label: "Autonomous",
++        help: "A critic approves the plan. You see only the Inbox.",
++      },
++    } as Record<string, { label: string; help: string }>,
++    autonomyCapped: (max: string) =>
++      `Your policy allows up to ${max}; a higher choice starts at ${max}.`,
++    budgetLabel: "Budget in dollars (optional)",
++    budgetHelp: "Shown against the run's live agent cost.",
++    start: "Start Autopilot",
++    starting: "Starting…",
++    runs: "Runs",
++    noRuns: "No runs yet. Type a goal above to start one.",
++    setup: "Setup",
++    agentServerOk: (n: number) =>
++      n === 1
++        ? "Agent server reachable, 1 agent profile"
++        : `Agent server reachable, ${n} agent profiles`,
++    agentServerDown: "Agent server not reachable",
++    agentServerHint:
++      "Autopilot's agents run there. Start Canvas (pnpm dev), or set SF_AGENT_SERVER_URL.",
++    workspaceRepo: (branch: string) => `Workspace is a git repo on ${branch}`,
++    workspaceNotRepo:
++      "Workspace isn't a git repo yet; the first run makes it one",
++    policyFile: (source: string, hash: string) =>
++      `Policy ${source} (policy@${hash})`,
++    policyDefaults: (hash: string) =>
++      `No .factory/policy.yml; using the default policy (policy@${hash})`,
++    policyError: "The policy file has a problem, so no run can start:",
++    progress: (merged: number, total: number) => `${merged} of ${total} merged`,
++    needsYou: (n: number) => (n === 1 ? "1 needs you" : `${n} need you`),
++    cost: (cost: string, budget: string | null) =>
++      budget ? `${cost} of ${budget}` : cost,
++    eta: (text: string) => `About ${text} left`,
++    by: (who: string) => `by ${who}`,
++    runStates: {
++      spec: "Writing the spec",
++      critic: "Reviewing the spec",
++      awaiting_spec_approval: "Spec waits for you",
++      awaiting_answers: "Questions for you",
++      awaiting_plan_approval: "Plan waits for you",
++      building: "Building",
++      done: "Done",
++      paused: "Paused",
++      failed: "Failed",
++      cancelled: "Cancelled",
++    } as Record<string, string>,
++    workOrderStates: {
++      pending: "Waiting",
++      building: "Building",
++      verifying: "Running checks",
++      reviewing: "In review",
++      ready: "Ready to merge",
++      awaiting_merge_approval: "Merge waits for you",
++      merging: "Merging",
++      merged: "Merged",
++      needs_attention: "Needs attention",
++      skipped: "Skipped",
++      cancelled: "Cancelled",
++    } as Record<string, string>,
++    risk: {
++      low: "Low risk",
++      medium: "Medium risk",
++      high: "High risk",
++    } as Record<string, string>,
++  },
++  pipeline: {
++    back: "All runs",
++    notFound: "There's no run with this id.",
++    pause: "Pause",
++    resume: "Resume",
++    cancel: "Cancel run",
++    confirmCancel: "Yes, cancel the run",
++    cancelHelp:
++      "Cancelling stops every agent and removes the worktrees. The integration branch stays with what was merged.",
++    pausedBecause: (reason: string) => `Paused: ${reason}`,
++    failedHelp:
++      "Nothing was merged, so there's nothing to deliver. The audit log has what happened.",
++    doneHelp: (branch: string, base: string) =>
++      `Everything is merged and re-tested on ${branch}. Review it and merge it into ${base} when you're ready.`,
++    stages: {
++      spec: "Spec",
++      plan: "Plan",
++      build: "Build",
++      verify: "Verify",
++      integrate: "Integrate",
++      done: "Done",
++    } as Record<string, string>,
++    stageCount: (n: number) => (n === 1 ? "1 work order" : `${n} work orders`),
++    needsYou: "Needs you",
++    waves: "Work orders",
++    wave: (n: number) => `Wave ${n}`,
++    waveHelp:
++      "Work orders in a wave build in parallel; a wave starts when the work orders it depends on are merged.",
++    noWorkOrders:
++      "The plan appears here once the spec agent has written tasks.md and it passes validation.",
++    attempt: (n: number, round: number) =>
++      round > 1 ? `Builder ${n}, round ${round}` : `Builder ${n}`,
++    mergedBy: (who: string) => `Merged by ${who}`,
++    dependsOn: (keys: string) => `After ${keys}`,
++    specStage: "Spec",
++    noSpecYet: "The spec agent is starting.",
++    activity: "History in the audit log",
++    detail: {
++      close: "Close details",
++      acceptance: "Acceptance criteria",
++      controls: "Controls",
++      branch: "Branch",
++      findings: "What the last check found",
++      agents: "Agent conversations",
++      checks: "Checks the factory ran",
++      noChecks: "No checks yet.",
++      output: "Output",
++      openConversation: "Open in Canvas",
++      duration: (s: string) => s,
++    },
++    roles: {
++      spec: "Spec agent",
++      critic: "Spec critic",
++      builder: "Builder",
++      reviewer: "Reviewer",
++      validator: "Validator",
++    } as Record<string, string>,
++    attemptStates: {
++      starting: "Starting",
++      running: "Working",
++      finished: "Finished",
++      error: "Error",
++      stuck: "Stuck",
++      paused: "Paused",
++      cancelled: "Cancelled",
++    } as Record<string, string>,
++    stagesOfCheck: {
++      spec: "Spec",
++      build: "Work order",
++      integrate: "Integration branch",
++    } as Record<string, string>,
++    turns: (n: number) => (n === 1 ? "1 message" : `${n} messages`),
++    labels: {
++      pipeline: "Pipeline stages",
++      state: "State",
++      cost: "Cost",
++      progress: "Progress",
++      eta: "Time left",
++      started: "Started",
++      passed: "Passed",
++      failed: "Failed",
++    },
++    noAgents: "No agent has worked on it yet.",
++  },
++  inbox: {
++    title: "Inbox",
++    subtitle:
++      "Only what needs a person: approvals the policy leaves to you, and work the factory couldn't finish on its own.",
++    open: "Waiting for you",
++    decided: "Decided",
++    empty: "Nothing needs you. Autopilot will put decisions here.",
++    emptyDecided: "No decisions yet.",
++    noteLabel: "Note",
++    noteHelp:
++      "Sent to the agent where it asks for changes, and kept in the audit log.",
++    noteRequired: (label: string) => `Write a note to “${label}”.`,
++    confirm: (label: string) => `Confirm: ${label}`,
++    decidedBy: (who: string, choice: string) => `${who} chose “${choice}”`,
++    dismissed: "Closed when the run was cancelled",
++    openRun: "Open the pipeline",
++    whatWasAsked: "What was asked",
++    kinds: {
++      spec_approval: "Spec approval",
++      plan_approval: "Plan approval",
++      questions: "Questions",
++      spec_failed: "Spec stopped",
++      merge_approval: "Merge approval",
++      work_order_failed: "Work order failed",
++      budget_reached: "Budget reached",
++      run_paused: "Run paused",
++      error: "Stopped on an error",
++      release: "Release",
++    } as Record<string, string>,
++    decidedToast: "Decision recorded",
 +  },
 +  plan: {
 +    title: (change: string) => `Create work orders from ${change}`,
@@ -1191,6 +2007,36 @@ index 0000000..22a85cd
 +      "work_order.done_without_approval": "Finished without approval",
 +      "work_order.conversation_started": "Started an agent conversation",
 +      "change.conversation_started": "Started an agent conversation",
++      "autopilot.run_created": "Started an Autopilot run",
++      "autopilot.policy_loaded": "Pinned the policy for a run",
++      "autopilot.run_state_changed": "Run moved on",
++      "autopilot.run_paused": "Paused a run",
++      "autopilot.run_resumed": "Resumed a run",
++      "autopilot.run_cancelled": "Cancelled a run",
++      "autopilot.run_completed": "Run finished",
++      "autopilot.run_failed": "Run failed",
++      "autopilot.agent_started": "Started an agent",
++      "autopilot.agent_finished": "An agent stopped",
++      "autopilot.followup_sent": "Sent an agent a follow-up",
++      "autopilot.spec_committed": "Committed the spec",
++      "autopilot.critic_verdict": "Critic's verdict",
++      "autopilot.work_orders_planned": "Planned work orders",
++      "autopilot.plan_approved": "Approved the plan",
++      "autopilot.spec_approved": "Approved the spec",
++      "autopilot.work_order_dispatched": "Gave a work order to a builder",
++      "autopilot.work_order_state_changed": "Work order moved on",
++      "autopilot.work_order_failed": "Work order needs attention",
++      "autopilot.repair_requested": "Asked for a repair",
++      "autopilot.gates_run": "Ran the gates",
++      "autopilot.review_verdict": "Reviewer's verdict",
++      "autopilot.edits_discarded": "Threw away a checker's edits",
++      "autopilot.work_order_merged": "Merged a work order",
++      "autopilot.merge_conflicted": "A merge conflicted",
++      "autopilot.merge_reverted": "Took a merge back off",
++      "autopilot.branch_cleaned": "Removed a merged branch",
++      "autopilot.inbox_opened": "Asked a person",
++      "autopilot.inbox_decided": "Decided",
++      "autopilot.workspace_initialized": "Made the workspace a git repo",
 +    } as Record<string, string>,
 +  },
 +};
@@ -1199,6 +2045,10 @@ index 0000000..22a85cd
 +
 +const es: FactoryCopy = {
 +  nav: {
++    autopilot: "Piloto automático",
++    inbox: "Bandeja",
++    inboxCount: (n) =>
++      n === 1 ? "1 decisión le espera" : `${n} decisiones le esperan`,
 +    requirements: "Requisitos",
 +    workOrders: "Órdenes de trabajo",
 +    audit: "Registro de auditoría",
@@ -1256,6 +2106,206 @@ index 0000000..22a85cd
 +    },
 +    artifactDone: "listo",
 +    artifactPending: "aún no escrito",
++  },
++  autopilot: {
++    title: "Piloto automático",
++    subtitle: (workspace) =>
++      `Escriba un objetivo. La fábrica redacta la especificación, la planifica, la construye en paralelo, la comprueba y la integra en una rama de integración de ${workspace}. Solo le consulta cuando se atasca o cuando la política dice que decide una persona.`,
++    goalLabel: "¿Qué debemos construir?",
++    goalPlaceholder:
++      "Por ejemplo: que los solicitantes consulten el estado de su reclamación por número, sin iniciar sesión",
++    goalHelp:
++      "Diga qué debe hacer y para quién. El agente de especificación lo convierte en requisitos con escenarios comprobables.",
++    autonomyLabel: "¿Cuánto debe hacer por su cuenta?",
++    autonomy: {
++      suggest: {
++        label: "Sugerir",
++        help: "Usted aprueba la especificación, el plan y cada integración.",
++      },
++      supervised: {
++        label: "Supervisado",
++        help: "Usted aprueba el plan con un clic. Las integraciones siguen la política.",
++      },
++      autonomous: {
++        label: "Autónomo",
++        help: "Un crítico aprueba el plan. Usted solo ve la bandeja.",
++      },
++    },
++    autonomyCapped: (max) =>
++      `Su política permite hasta ${max}; una opción superior empieza en ${max}.`,
++    budgetLabel: "Presupuesto en dólares (opcional)",
++    budgetHelp: "Se muestra junto al coste en vivo de los agentes.",
++    start: "Iniciar piloto automático",
++    starting: "Iniciando…",
++    runs: "Ejecuciones",
++    noRuns: "Aún no hay ejecuciones. Escriba un objetivo arriba para empezar.",
++    setup: "Configuración",
++    agentServerOk: (n) =>
++      n === 1
++        ? "Servidor de agentes accesible, 1 perfil de agente"
++        : `Servidor de agentes accesible, ${n} perfiles de agente`,
++    agentServerDown: "El servidor de agentes no responde",
++    agentServerHint:
++      "Los agentes del piloto automático se ejecutan allí. Inicie Canvas (pnpm dev) o defina SF_AGENT_SERVER_URL.",
++    workspaceRepo: (branch) =>
++      `El espacio de trabajo es un repositorio git en ${branch}`,
++    workspaceNotRepo:
++      "El espacio de trabajo aún no es un repositorio git; la primera ejecución lo convierte",
++    policyFile: (source, hash) => `Política ${source} (policy@${hash})`,
++    policyDefaults: (hash) =>
++      `Sin .factory/policy.yml; se usa la política predeterminada (policy@${hash})`,
++    policyError:
++      "El archivo de política tiene un problema, así que no puede empezar ninguna ejecución:",
++    progress: (merged, total) => `${merged} de ${total} integradas`,
++    needsYou: (n) => (n === 1 ? "1 le necesita" : `${n} le necesitan`),
++    cost: (cost, budget) => (budget ? `${cost} de ${budget}` : cost),
++    eta: (text) => `Faltan unos ${text}`,
++    by: (who) => `por ${who}`,
++    runStates: {
++      spec: "Redactando la especificación",
++      critic: "Revisando la especificación",
++      awaiting_spec_approval: "La especificación le espera",
++      awaiting_answers: "Preguntas para usted",
++      awaiting_plan_approval: "El plan le espera",
++      building: "Construyendo",
++      done: "Terminada",
++      paused: "En pausa",
++      failed: "Fallida",
++      cancelled: "Cancelada",
++    },
++    workOrderStates: {
++      pending: "En espera",
++      building: "Construyendo",
++      verifying: "Comprobando",
++      reviewing: "En revisión",
++      ready: "Lista para integrar",
++      awaiting_merge_approval: "La integración le espera",
++      merging: "Integrando",
++      merged: "Integrada",
++      needs_attention: "Requiere atención",
++      skipped: "Omitida",
++      cancelled: "Cancelada",
++    },
++    risk: {
++      low: "Riesgo bajo",
++      medium: "Riesgo medio",
++      high: "Riesgo alto",
++    },
++  },
++  pipeline: {
++    back: "Todas las ejecuciones",
++    notFound: "No hay ninguna ejecución con este identificador.",
++    pause: "Pausar",
++    resume: "Reanudar",
++    cancel: "Cancelar ejecución",
++    confirmCancel: "Sí, cancelar la ejecución",
++    cancelHelp:
++      "Cancelar detiene a todos los agentes y elimina los worktrees. La rama de integración se conserva con lo integrado.",
++    pausedBecause: (reason) => `En pausa: ${reason}`,
++    failedHelp:
++      "No se integró nada, así que no hay nada que entregar. El registro de auditoría muestra lo ocurrido.",
++    doneHelp: (branch, base) =>
++      `Todo está integrado y comprobado de nuevo en ${branch}. Revíselo e intégrelo en ${base} cuando quiera.`,
++    stages: {
++      spec: "Especificación",
++      plan: "Plan",
++      build: "Construcción",
++      verify: "Verificación",
++      integrate: "Integración",
++      done: "Hecho",
++    },
++    stageCount: (n) => (n === 1 ? "1 orden" : `${n} órdenes`),
++    needsYou: "Le necesita",
++    waves: "Órdenes de trabajo",
++    wave: (n) => `Ola ${n}`,
++    waveHelp:
++      "Las órdenes de una ola se construyen en paralelo; una ola empieza cuando están integradas las órdenes de las que depende.",
++    noWorkOrders:
++      "El plan aparece aquí cuando el agente de especificación haya escrito tasks.md y pase la validación.",
++    attempt: (n, round) =>
++      round > 1 ? `Constructor ${n}, ronda ${round}` : `Constructor ${n}`,
++    mergedBy: (who) => `Integrada por ${who}`,
++    dependsOn: (keys) => `Después de ${keys}`,
++    specStage: "Especificación",
++    noSpecYet: "El agente de especificación está empezando.",
++    activity: "Historial en el registro de auditoría",
++    detail: {
++      close: "Cerrar detalles",
++      acceptance: "Criterios de aceptación",
++      controls: "Controles",
++      branch: "Rama",
++      findings: "Lo que encontró la última comprobación",
++      agents: "Conversaciones con agentes",
++      checks: "Comprobaciones de la fábrica",
++      noChecks: "Aún no hay comprobaciones.",
++      output: "Salida",
++      openConversation: "Abrir en Canvas",
++      duration: (s) => s,
++    },
++    roles: {
++      spec: "Agente de especificación",
++      critic: "Crítico de la especificación",
++      builder: "Constructor",
++      reviewer: "Revisor",
++      validator: "Validador",
++    },
++    attemptStates: {
++      starting: "Empezando",
++      running: "Trabajando",
++      finished: "Terminado",
++      error: "Error",
++      stuck: "Atascado",
++      paused: "En pausa",
++      cancelled: "Cancelado",
++    },
++    stagesOfCheck: {
++      spec: "Especificación",
++      build: "Orden de trabajo",
++      integrate: "Rama de integración",
++    },
++    turns: (n) => (n === 1 ? "1 mensaje" : `${n} mensajes`),
++    labels: {
++      pipeline: "Etapas del flujo",
++      state: "Estado",
++      cost: "Coste",
++      progress: "Progreso",
++      eta: "Tiempo restante",
++      started: "Inicio",
++      passed: "Correcta",
++      failed: "Fallida",
++    },
++    noAgents: "Ningún agente ha trabajado en ella todavía.",
++  },
++  inbox: {
++    title: "Bandeja",
++    subtitle:
++      "Solo lo que necesita a una persona: aprobaciones que la política le deja a usted y trabajo que la fábrica no pudo terminar sola.",
++    open: "Le esperan",
++    decided: "Decididas",
++    empty: "Nada le necesita. El piloto automático pondrá aquí las decisiones.",
++    emptyDecided: "Aún no hay decisiones.",
++    noteLabel: "Nota",
++    noteHelp:
++      "Se envía al agente cuando pide cambios y queda en el registro de auditoría.",
++    noteRequired: (label) => `Escriba una nota para “${label}”.`,
++    confirm: (label) => `Confirmar: ${label}`,
++    decidedBy: (who, choice) => `${who} eligió “${choice}”`,
++    dismissed: "Cerrada al cancelar la ejecución",
++    openRun: "Abrir el flujo",
++    whatWasAsked: "Lo que se preguntó",
++    kinds: {
++      spec_approval: "Aprobación de la especificación",
++      plan_approval: "Aprobación del plan",
++      questions: "Preguntas",
++      spec_failed: "Especificación detenida",
++      merge_approval: "Aprobación de integración",
++      work_order_failed: "Orden de trabajo fallida",
++      budget_reached: "Presupuesto alcanzado",
++      run_paused: "Ejecución en pausa",
++      error: "Detenida por un error",
++      release: "Publicación",
++    },
++    decidedToast: "Decisión registrada",
 +  },
 +  plan: {
 +    title: (change) => `Crear órdenes de trabajo a partir de ${change}`,
@@ -1376,6 +2426,37 @@ index 0000000..22a85cd
 +      "work_order.conversation_started":
 +        "Inició una conversación con un agente",
 +      "change.conversation_started": "Inició una conversación con un agente",
++      "autopilot.run_created": "Inició una ejecución del piloto automático",
++      "autopilot.policy_loaded": "Fijó la política de una ejecución",
++      "autopilot.run_state_changed": "La ejecución avanzó",
++      "autopilot.run_paused": "Pausó una ejecución",
++      "autopilot.run_resumed": "Reanudó una ejecución",
++      "autopilot.run_cancelled": "Canceló una ejecución",
++      "autopilot.run_completed": "La ejecución terminó",
++      "autopilot.run_failed": "La ejecución falló",
++      "autopilot.agent_started": "Inició un agente",
++      "autopilot.agent_finished": "Un agente se detuvo",
++      "autopilot.followup_sent": "Envió un seguimiento a un agente",
++      "autopilot.spec_committed": "Confirmó la especificación",
++      "autopilot.critic_verdict": "Veredicto del crítico",
++      "autopilot.work_orders_planned": "Planificó las órdenes de trabajo",
++      "autopilot.plan_approved": "Aprobó el plan",
++      "autopilot.spec_approved": "Aprobó la especificación",
++      "autopilot.work_order_dispatched": "Asignó una orden a un constructor",
++      "autopilot.work_order_state_changed": "La orden avanzó",
++      "autopilot.work_order_failed": "La orden requiere atención",
++      "autopilot.repair_requested": "Pidió una reparación",
++      "autopilot.gates_run": "Ejecutó las comprobaciones",
++      "autopilot.review_verdict": "Veredicto del revisor",
++      "autopilot.edits_discarded": "Descartó cambios de un revisor",
++      "autopilot.work_order_merged": "Integró una orden de trabajo",
++      "autopilot.merge_conflicted": "Una integración tuvo conflictos",
++      "autopilot.merge_reverted": "Deshizo una integración",
++      "autopilot.branch_cleaned": "Eliminó una rama integrada",
++      "autopilot.inbox_opened": "Consultó a una persona",
++      "autopilot.inbox_decided": "Decidió",
++      "autopilot.workspace_initialized":
++        "Convirtió el espacio de trabajo en repositorio git",
 +    },
 +  },
 +};
@@ -1390,21 +2471,63 @@ index 0000000..22a85cd
 +}
 diff --git a/src/factory/factory-nav-links.tsx b/src/factory/factory-nav-links.tsx
 new file mode 100644
-index 0000000..66e69e4
+index 0000000..6cda042
 --- /dev/null
 +++ b/src/factory/factory-nav-links.tsx
-@@ -0,0 +1,35 @@
-+import { FileText, ShieldCheck, SquareKanban } from "lucide-react";
+@@ -0,0 +1,77 @@
++import {
++  FileText,
++  Inbox,
++  Rocket,
++  ShieldCheck,
++  SquareKanban,
++} from "lucide-react";
 +import { SidebarNavLink } from "#/components/features/sidebar/sidebar-nav-link";
++import { cn } from "#/utils/utils";
 +import { useFactoryCopy } from "./copy";
++import { useFactoryLiveUpdates, useInboxCount } from "./hooks";
 +
 +const ICON_SIZE = 18;
 +
 +/** The Software Factory's entries in the Canvas sidebar. */
 +export function FactoryNavLinks({ collapsed }: { collapsed: boolean }) {
 +  const copy = useFactoryCopy();
++  // The sidebar is always there, so the Inbox badge stays current on every page.
++  useFactoryLiveUpdates();
++  const open = useInboxCount().data?.open ?? 0;
 +  return (
 +    <>
++      <SidebarNavLink
++        to="/autopilot"
++        label={copy.nav.autopilot}
++        testId="sidebar-factory-autopilot-link"
++        collapsed={collapsed}
++        icon={<Rocket width={ICON_SIZE} height={ICON_SIZE} />}
++      />
++      <div className="relative">
++        <SidebarNavLink
++          to="/inbox"
++          label={copy.nav.inbox}
++          testId="sidebar-factory-inbox-link"
++          collapsed={collapsed}
++          icon={<Inbox width={ICON_SIZE} height={ICON_SIZE} />}
++        />
++        {open ? (
++          <span
++            data-testid="sidebar-factory-inbox-badge"
++            title={copy.nav.inboxCount(open)}
++            className={cn(
++              "pointer-events-none absolute flex min-w-4 items-center justify-center rounded-full bg-warning px-1 text-xs font-semibold leading-4 text-canvas-base",
++              collapsed
++                ? "right-1 top-0.5"
++                : "right-2 top-1/2 -translate-y-1/2",
++            )}
++          >
++            <span aria-hidden>{open > 99 ? "99+" : open}</span>
++            <span className="sr-only">{copy.nav.inboxCount(open)}</span>
++          </span>
++        ) : null}
++      </div>
 +      <SidebarNavLink
 +        to="/requirements"
 +        label={copy.nav.requirements}
@@ -1429,12 +2552,36 @@ index 0000000..66e69e4
 +    </>
 +  );
 +}
+diff --git a/src/factory/factory-routes.ts b/src/factory/factory-routes.ts
+new file mode 100644
+index 0000000..cba4719
+--- /dev/null
++++ b/src/factory/factory-routes.ts
+@@ -0,0 +1,18 @@
++import { route } from "@react-router/dev/routes";
++
++/**
++ * The Software Factory's pages, spread into `src/routes.ts` inside Canvas's
++ * root layout. Adding a factory page only changes this file. Paths are
++ * relative to `src/` (the app directory).
++ */
++export const factoryRoutes = [
++  route("autopilot", "factory/routes/autopilot.tsx"),
++  route(
++    "autopilot/runs/:runId/:workOrderKey?",
++    "factory/routes/autopilot-run.tsx",
++  ),
++  route("inbox", "factory/routes/inbox.tsx"),
++  route("requirements/:changeId?", "factory/routes/requirements.tsx"),
++  route("work-orders/:workOrderId?", "factory/routes/work-orders.tsx"),
++  route("audit-log", "factory/routes/audit-log.tsx"),
++];
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..b1dbf7f
+index 0000000..35f5a97
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,287 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -1442,7 +2589,13 @@ index 0000000..b1dbf7f
 +  useQueryClient,
 +  type QueryClient,
 +} from "@tanstack/react-query";
-+import { FACTORY_API_BASE, FactoryApi, FactoryOfflineError } from "./api";
++import {
++  FACTORY_API_BASE,
++  FactoryApi,
++  FactoryOfflineError,
++  isNotFound,
++  type Autonomy,
++} from "./api";
 +
 +export const FACTORY_QUERY_KEYS = {
 +  all: ["factory"] as const,
@@ -1452,11 +2605,18 @@ index 0000000..b1dbf7f
 +  plan: (id: string) => ["factory", "specs", "plan", id] as const,
 +  workOrders: ["factory", "work-orders"] as const,
 +  audit: ["factory", "audit"] as const,
++  autopilot: ["factory", "autopilot"] as const,
++  autopilotStatus: ["factory", "autopilot", "status"] as const,
++  runs: ["factory", "autopilot", "runs"] as const,
++  run: (id: string) => ["factory", "autopilot", "runs", id] as const,
++  inbox: (state: string) => ["factory", "autopilot", "inbox", state] as const,
++  inboxCount: ["factory", "autopilot", "inbox-count"] as const,
 +};
 +
-+// Don't hammer a server that isn't running; the offline card has a retry button.
++// Don't hammer a server that isn't running (the offline card has a retry
++// button), and don't ask again for something that isn't there.
 +const retry = (count: number, error: unknown) =>
-+  !(error instanceof FactoryOfflineError) && count < 2;
++  !(error instanceof FactoryOfflineError) && !isNotFound(error) && count < 2;
 +
 +export const useFactoryHealth = () =>
 +  useQuery({
@@ -1546,45 +2706,175 @@ index 0000000..b1dbf7f
 +  });
 +}
 +
++// ---- Autopilot ----
++
++export const useAutopilotStatus = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.autopilotStatus,
++    queryFn: FactoryApi.autopilotStatus,
++    retry,
++    // Nothing pushes agent-server reachability, so look again now and then.
++    refetchInterval: 30_000,
++    meta: { disableToast: true },
++  });
++
++export const useRuns = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.runs,
++    queryFn: FactoryApi.runs,
++    retry,
++    meta: { disableToast: true },
++  });
++
++export const useRun = (id: string | undefined) =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.run(id ?? ""),
++    queryFn: () => FactoryApi.run(id ?? ""),
++    enabled: Boolean(id),
++    retry,
++    // The ETA and agent costs move between events; a slow poll keeps them honest.
++    refetchInterval: (query) =>
++      isNotFound(query.state.error) ? false : 15_000,
++    meta: { disableToast: true },
++  });
++
++export const useInbox = (state: "open" | "decided" | "all") =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.inbox(state),
++    queryFn: () => FactoryApi.inbox(state),
++    retry,
++    meta: { disableToast: true },
++  });
++
++export const useInboxCount = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.inboxCount,
++    queryFn: FactoryApi.inboxCount,
++    retry: false,
++    refetchInterval: 30_000,
++    meta: { disableToast: true },
++  });
++
++function invalidateAutopilot(queryClient: QueryClient) {
++  return queryClient.invalidateQueries({
++    queryKey: FACTORY_QUERY_KEYS.autopilot,
++  });
++}
++
++export function useCreateRun() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (body: {
++      goal: string;
++      autonomy?: Autonomy;
++      budgetUsd?: number | null;
++    }) => FactoryApi.createRun(body),
++    onSettled: () => invalidateAutopilot(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++export function useRunAction() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (v: {
++      id: string;
++      action: "pause" | "resume" | "cancel";
++      note?: string;
++    }) => FactoryApi.runAction(v.id, v.action, v.note),
++    onSettled: () => invalidateAutopilot(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++export function useDecide() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (v: { id: number; choice: string; note?: string }) =>
++      FactoryApi.decide(v.id, { choice: v.choice, note: v.note }),
++    onSettled: () => invalidateAutopilot(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++// ---- live updates ----
++
++type Refetch = (type: string) => void;
++const subscribers = new Set<Refetch>();
++let source: EventSource | null = null;
++let reconnect: ReturnType<typeof setTimeout> | undefined;
++const EVENTS = [
++  "hello",
++  "workorders.changed",
++  "specs.changed",
++  "audit.appended",
++  "autopilot.changed",
++];
++
++/** One EventSource for the whole tab, however many components listen. */
++function connect() {
++  if (source || typeof EventSource === "undefined") return;
++  const es = new EventSource(`${FACTORY_API_BASE}/events`);
++  source = es;
++  for (const type of EVENTS) {
++    es.addEventListener(type, () => subscribers.forEach((fn) => fn(type)));
++  }
++  // A 502 from the dev proxy (API not running) closes the stream for good;
++  // try again later so the pages come back on their own when it starts.
++  es.addEventListener("error", () => {
++    if (es.readyState !== EventSource.CLOSED) return;
++    source = null;
++    clearTimeout(reconnect);
++    reconnect = setTimeout(() => subscribers.size && connect(), 10_000);
++  });
++}
++
++function disconnect() {
++  clearTimeout(reconnect);
++  source?.close();
++  source = null;
++}
++
 +/**
-+ * Keep factory data fresh while a factory page is open. The API sends an
-+ * event whenever an agent (or anyone) edits a work order or spec file, or the
-+ * audit log grows, and we refetch what changed.
++ * Keep factory data fresh while a factory page (or the sidebar) is open. The
++ * API sends an event whenever an agent (or anyone) edits a work order or spec
++ * file, Autopilot moves, or the audit log grows, and we refetch what changed.
 + */
 +export function useFactoryLiveUpdates() {
 +  const queryClient = useQueryClient();
 +  React.useEffect(() => {
-+    if (typeof EventSource === "undefined") return undefined;
-+    const source = new EventSource(`${FACTORY_API_BASE}/events`);
-+    const refetch = (key: readonly string[]) => () =>
-+      queryClient.invalidateQueries({ queryKey: key });
-+    source.addEventListener(
-+      "workorders.changed",
-+      refetch(FACTORY_QUERY_KEYS.workOrders),
-+    );
-+    source.addEventListener("specs.changed", refetch(FACTORY_QUERY_KEYS.specs));
-+    source.addEventListener("audit.appended", () => {
-+      queryClient.invalidateQueries({ queryKey: FACTORY_QUERY_KEYS.audit });
-+      queryClient.invalidateQueries({
-+        queryKey: FACTORY_QUERY_KEYS.workOrders,
-+      });
-+    });
 +    // After a reconnect (say the API restarted), pick up anything that changed
 +    // while it was down. The first hello is just the initial connection.
 +    let connectedBefore = false;
-+    source.addEventListener("hello", () => {
-+      if (connectedBefore) invalidateFactory(queryClient);
-+      connectedBefore = true;
-+    });
-+    return () => source.close();
++    const onEvent: Refetch = (type) => {
++      const refetch = (key: readonly string[]) =>
++        queryClient.invalidateQueries({ queryKey: key });
++      if (type === "workorders.changed") refetch(FACTORY_QUERY_KEYS.workOrders);
++      else if (type === "specs.changed") refetch(FACTORY_QUERY_KEYS.specs);
++      else if (type === "autopilot.changed")
++        refetch(FACTORY_QUERY_KEYS.autopilot);
++      else if (type === "audit.appended") {
++        refetch(FACTORY_QUERY_KEYS.audit);
++        refetch(FACTORY_QUERY_KEYS.workOrders);
++      } else if (type === "hello") {
++        if (connectedBefore) invalidateFactory(queryClient);
++        connectedBefore = true;
++      }
++    };
++    subscribers.add(onEvent);
++    connect();
++    return () => {
++      subscribers.delete(onEvent);
++      if (!subscribers.size) disconnect();
++    };
 +  }, [queryClient]);
 +}
 diff --git a/src/factory/routes/audit-log.tsx b/src/factory/routes/audit-log.tsx
 new file mode 100644
-index 0000000..690db11
+index 0000000..380b38f
 --- /dev/null
 +++ b/src/factory/routes/audit-log.tsx
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,228 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useSearchParams } from "react-router";
@@ -1609,6 +2899,7 @@ index 0000000..690db11
 +function summarize(event: AuditEvent): string {
 +  const d = event.data;
 +  const parts: string[] = [];
++  if (typeof d.workOrder === "string") parts.push(d.workOrder); // Autopilot: "WO-3"
 +  if (d.from !== undefined || d.to !== undefined) {
 +    parts.push(`${String(d.from ?? "∅")} → ${String(d.to ?? "∅")}`);
 +  } else if (typeof d.status === "string") {
@@ -1808,6 +3099,1211 @@ index 0000000..690db11
 +            </table>
 +          </div>
 +        ) : null}
++      </div>
++    </FactoryPage>
++  );
++}
+diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
+new file mode 100644
+index 0000000..3d195a4
+--- /dev/null
++++ b/src/factory/routes/autopilot-run.tsx
+@@ -0,0 +1,757 @@
++import React from "react";
++import { useTranslation } from "react-i18next";
++import { Link, useNavigate, useParams } from "react-router";
++import {
++  ArrowLeft,
++  ChevronRight,
++  CircleCheck,
++  CircleX,
++  GitBranch,
++  History,
++  MessageSquare,
++  Pause,
++  Play,
++  Shield,
++  X,
++} from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { cn } from "#/utils/utils";
++import type { Attempt, AutopilotWorkOrder, Check, RunDetail } from "../api";
++import { isNotFound } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useRun, useRunAction } from "../hooks";
++import {
++  FactoryError,
++  FactoryLoading,
++  FactoryPage,
++} from "../components/factory-page";
++import { formatWhen } from "../components/factory-badges";
++import {
++  FINISHED_RUN_STATES,
++  RiskChip,
++  RunStatePill,
++  WorkOrderStatePill,
++  approverName,
++  formatDuration,
++  formatMoney,
++} from "../components/autopilot-badges";
++import { DecisionCard } from "../components/decision-card";
++import { FactoryMarkdown } from "../components/factory-markdown";
++
++type Stage = "spec" | "plan" | "build" | "verify" | "integrate" | "done";
++const STAGES: Stage[] = [
++  "spec",
++  "plan",
++  "build",
++  "verify",
++  "integrate",
++  "done",
++];
++
++/** Which lane each work-order state sits in. */
++const LANE: Record<string, Stage | undefined> = {
++  building: "build",
++  verifying: "verify",
++  reviewing: "verify",
++  ready: "integrate",
++  awaiting_merge_approval: "integrate",
++  merging: "integrate",
++  merged: "done",
++  skipped: "done",
++};
++
++/** How far the run has come: the stage it's in (or stopped in). */
++function currentStage(run: RunDetail): Stage {
++  switch (run.state) {
++    case "spec":
++    case "critic":
++    case "awaiting_spec_approval":
++    case "awaiting_answers":
++      return "spec";
++    case "awaiting_plan_approval":
++      return "plan";
++    case "done":
++      return "done";
++    case "building":
++      return "build";
++    default:
++      // Stopped (paused, failed, cancelled) somewhere along the way. Cancelling
++      // marks pending work orders cancelled, which isn't progress.
++      if (
++        run.workOrders.some((w) => !["pending", "cancelled"].includes(w.state))
++      )
++        return "build";
++      return run.workOrders.length ? "plan" : "spec";
++  }
++}
++
++export default function FactoryAutopilotRunRoute() {
++  const copy = useFactoryCopy();
++  const { runId, workOrderKey } = useParams();
++  const navigate = useNavigate();
++  const run = useRun(runId);
++  const data = run.data;
++  const selected = data?.workOrders.find(
++    (w) => w.key.toLowerCase() === workOrderKey?.toLowerCase(),
++  );
++  const base = `/autopilot/runs/${runId}`;
++
++  return (
++    <FactoryPage
++      testId="factory-pipeline"
++      title={data?.goal ?? copy.autopilot.title}
++      subtitle={data ? <RunSubtitle run={data} /> : undefined}
++      error={run.error}
++      onRetry={() => void run.refetch()}
++      actions={data ? <RunActions run={data} /> : null}
++      fill
++    >
++      <div className="min-w-0 flex-1 overflow-y-auto custom-scrollbar-always">
++        <div className="flex flex-col gap-6 px-6 py-5">
++          <Link
++            to="/autopilot"
++            className="inline-flex items-center gap-1.5 self-start text-sm text-link hover:underline"
++          >
++            <ArrowLeft className="size-4" aria-hidden />
++            {copy.pipeline.back}
++          </Link>
++          {run.isLoading ? <FactoryLoading /> : null}
++          {isNotFound(run.error) ? (
++            <p className="text-sm text-muted">{copy.pipeline.notFound}</p>
++          ) : null}
++          {run.error && !data && !isNotFound(run.error) ? (
++            <FactoryError error={run.error} />
++          ) : null}
++          {data ? <RunBody run={data} base={base} selected={selected} /> : null}
++        </div>
++      </div>
++      {selected && data ? (
++        <WorkOrderPanel
++          key={selected.id}
++          run={data}
++          wo={selected}
++          onClose={() => navigate(base)}
++        />
++      ) : null}
++    </FactoryPage>
++  );
++}
++
++function RunSubtitle({ run }: { run: RunDetail }) {
++  const copy = useFactoryCopy();
++  return (
++    <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
++      <span className="font-mono">{run.change}</span>
++      <span>
++        {copy.autopilot.autonomy[run.autonomy]?.label ?? run.autonomy}
++      </span>
++      <span className="inline-flex items-center gap-1 font-mono">
++        <GitBranch className="size-3.5" aria-hidden />
++        {run.integrationBranch}
++      </span>
++    </span>
++  );
++}
++
++function RunActions({ run }: { run: RunDetail }) {
++  const copy = useFactoryCopy();
++  const action = useRunAction();
++  const [confirmCancel, setConfirmCancel] = React.useState(false);
++  if (FINISHED_RUN_STATES.has(run.state)) return null;
++  const busy = action.isPending;
++  const act = (a: "pause" | "resume" | "cancel") =>
++    action.mutate(
++      { id: run.id, action: a },
++      { onSettled: () => setConfirmCancel(false) },
++    );
++  return (
++    <>
++      {run.state === "paused" ? (
++        <BrandButton
++          testId="factory-run-resume"
++          type="button"
++          variant="primary"
++          onClick={() => act("resume")}
++          isDisabled={busy}
++          startContent={<Play className="size-4" aria-hidden />}
++        >
++          {copy.pipeline.resume}
++        </BrandButton>
++      ) : (
++        <BrandButton
++          testId="factory-run-pause"
++          type="button"
++          variant="secondary"
++          onClick={() => act("pause")}
++          isDisabled={busy}
++          startContent={<Pause className="size-4" aria-hidden />}
++        >
++          {copy.pipeline.pause}
++        </BrandButton>
++      )}
++      <span title={copy.pipeline.cancelHelp}>
++        <BrandButton
++          testId="factory-run-cancel"
++          type="button"
++          variant="ghost-danger"
++          onClick={() =>
++            confirmCancel ? act("cancel") : setConfirmCancel(true)
++          }
++          isDisabled={busy}
++        >
++          {confirmCancel ? copy.pipeline.confirmCancel : copy.pipeline.cancel}
++        </BrandButton>
++      </span>
++      {action.error ? (
++        <span className="basis-full">
++          <FactoryError error={action.error} />
++        </span>
++      ) : null}
++    </>
++  );
++}
++
++function RunBody({
++  run,
++  base,
++  selected,
++}: {
++  run: RunDetail;
++  base: string;
++  selected?: AutopilotWorkOrder;
++}) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const money = (usd: number) => formatMoney(usd, i18n.language);
++  // The selected work order's items show in its panel, not twice.
++  const open = run.inbox.filter(
++    (i) => i.state === "open" && i.workOrderId !== selected?.id,
++  );
++  const waves = [...new Set(run.workOrders.map((w) => w.wave))].sort(
++    (a, b) => a - b,
++  );
++
++  return (
++    <>
++      <dl className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
++        <div className="flex items-center gap-2">
++          <dt className="sr-only">{copy.pipeline.labels.state}</dt>
++          <dd>
++            <RunStatePill state={run.state} />
++          </dd>
++        </div>
++        <div>
++          <dt className="sr-only">{copy.pipeline.labels.cost}</dt>
++          <dd
++            className="tabular-nums text-foreground"
++            data-testid="factory-run-cost"
++          >
++            {copy.autopilot.cost(
++              money(run.costUsd),
++              run.budgetUsd === null ? null : money(run.budgetUsd),
++            )}
++          </dd>
++        </div>
++        {run.counts.total ? (
++          <div>
++            <dt className="sr-only">{copy.pipeline.labels.progress}</dt>
++            <dd className="tabular-nums text-foreground">
++              {copy.autopilot.progress(run.counts.merged, run.counts.total)}
++            </dd>
++          </div>
++        ) : null}
++        {run.state === "building" && run.etaMs ? (
++          <div>
++            <dt className="sr-only">{copy.pipeline.labels.eta}</dt>
++            <dd className="text-muted">
++              {copy.autopilot.eta(formatDuration(run.etaMs))}
++            </dd>
++          </div>
++        ) : null}
++        <div className="text-xs text-muted">
++          <dt className="sr-only">{copy.pipeline.labels.started}</dt>
++          <dd>
++            {`${formatWhen(run.createdAt, i18n.language)} · ${copy.autopilot.by(approverName(run.createdBy))}${run.policyHash ? ` · policy@${run.policyHash}` : ""}`}
++          </dd>
++        </div>
++      </dl>
++
++      <RunBanner run={run} />
++      <StageLanes run={run} />
++
++      {open.length ? (
++        <section
++          aria-labelledby="factory-needs-you"
++          className="flex flex-col gap-3"
++        >
++          <h2
++            id="factory-needs-you"
++            className="text-sm font-semibold text-foreground"
++          >
++            {copy.pipeline.needsYou}
++          </h2>
++          {open.map((item) => (
++            <DecisionCard key={item.id} item={item} showRun={false} />
++          ))}
++        </section>
++      ) : null}
++
++      <section aria-labelledby="factory-waves" className="flex flex-col gap-3">
++        <div>
++          <h2
++            id="factory-waves"
++            className="text-sm font-semibold text-foreground"
++          >
++            {copy.pipeline.waves}
++          </h2>
++          <p className="text-xs text-muted">
++            {run.workOrders.length
++              ? copy.pipeline.waveHelp
++              : copy.pipeline.noWorkOrders}
++          </p>
++        </div>
++        {waves.map((wave) => (
++          <div key={wave} className="flex flex-col gap-2">
++            <h3 className="text-xs font-medium text-muted">
++              {copy.pipeline.wave(wave)}
++            </h3>
++            <ul className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
++              {run.workOrders
++                .filter((w) => w.wave === wave)
++                .map((wo) => (
++                  <li key={wo.id}>
++                    <WorkOrderCard
++                      wo={wo}
++                      href={`${base}/${wo.key}`}
++                      selected={wo.id === selected?.id}
++                    />
++                  </li>
++                ))}
++            </ul>
++          </div>
++        ))}
++      </section>
++
++      <SpecSection run={run} />
++
++      <Link
++        to={`/audit-log?q=${encodeURIComponent(run.id)}`}
++        className="inline-flex items-center gap-1.5 self-start text-sm text-link hover:underline"
++      >
++        <History className="size-4" aria-hidden />
++        {copy.pipeline.activity}
++      </Link>
++    </>
++  );
++}
++
++function RunBanner({ run }: { run: RunDetail }) {
++  const copy = useFactoryCopy();
++  let text: string | null = null;
++  let tone: "warning" | "error" | "success" = "warning";
++  if (run.state === "paused" && run.pausedReason) {
++    text = copy.pipeline.pausedBecause(run.pausedReason);
++  } else if (run.state === "failed") {
++    text = copy.pipeline.failedHelp;
++    tone = "error";
++  } else if (run.state === "done") {
++    text = copy.pipeline.doneHelp(run.integrationBranch, run.baseBranch);
++    tone = "success";
++  }
++  if (!text) return null;
++  return (
++    <p
++      role="status"
++      data-testid="factory-run-banner"
++      className={cn(
++        "rounded-lg border bg-surface px-3 py-2 text-sm text-foreground",
++        tone === "warning" && "border-warning",
++        tone === "error" && "border-feedback-error",
++        tone === "success" && "border-success",
++      )}
++    >
++      {text}
++    </p>
++  );
++}
++
++function StageLanes({ run }: { run: RunDetail }) {
++  const copy = useFactoryCopy();
++  const current = STAGES.indexOf(currentStage(run));
++  const inLane = (stage: Stage) =>
++    run.workOrders.filter((w) => LANE[w.state] === stage).length;
++  const waiting =
++    run.state === "awaiting_spec_approval" ||
++    run.state === "awaiting_answers" ||
++    run.state === "awaiting_plan_approval" ||
++    run.state === "paused";
++
++  return (
++    <ol
++      aria-label={copy.pipeline.labels.pipeline}
++      className="grid grid-cols-3 gap-2 md:grid-cols-6"
++    >
++      {STAGES.map((stage, i) => {
++        const count = i >= 2 ? inLane(stage) : 0;
++        const passed =
++          i < current || (stage === "done" && run.state === "done");
++        const here =
++          i === current &&
++          run.state !== "done" &&
++          !FINISHED_RUN_STATES.has(run.state);
++        // During the build, every work-order lane with work in it is live.
++        const live = run.state === "building" && i >= 2 && i <= 4 && count > 0;
++        return (
++          <li
++            key={stage}
++            aria-current={here ? "step" : undefined}
++            className={cn(
++              "flex flex-col gap-1 rounded-lg border px-3 py-2",
++              here || live
++                ? waiting && here
++                  ? "border-warning bg-surface"
++                  : "border-primary bg-surface"
++                : passed
++                  ? "border-border-subtle bg-surface"
++                  : "border-dashed border-border-subtle",
++            )}
++          >
++            <span className="flex items-center gap-1.5 text-xs font-medium text-foreground">
++              {passed && !live ? (
++                <CircleCheck className="size-3.5 text-success" aria-hidden />
++              ) : null}
++              {copy.pipeline.stages[stage]}
++            </span>
++            <span className="text-xs tabular-nums text-muted">
++              {/* A passed lane with nothing in it stays quiet. */}
++              {i >= 2 &&
++              run.workOrders.length > 0 &&
++              (count > 0 || here || live)
++                ? copy.pipeline.stageCount(count)
++                : " "}
++            </span>
++          </li>
++        );
++      })}
++    </ol>
++  );
++}
++
++function WorkOrderCard({
++  wo,
++  href,
++  selected,
++}: {
++  wo: AutopilotWorkOrder;
++  href: string;
++  selected: boolean;
++}) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const needsYou =
++    wo.state === "awaiting_merge_approval" || wo.state === "needs_attention";
++  return (
++    <Link
++      to={href}
++      data-testid={`factory-pipeline-${wo.key}`}
++      aria-current={selected ? "true" : undefined}
++      className={cn(
++        "flex h-full flex-col gap-2 rounded-xl border bg-surface px-3 py-2.5 hover:bg-surface-raised focus:outline-none focus-visible:ring-2 focus-visible:ring-focus",
++        selected
++          ? "border-primary"
++          : needsYou
++            ? "border-warning"
++            : "border-border-subtle",
++      )}
++    >
++      <span className="flex items-baseline gap-2">
++        <span className="font-mono text-xs text-muted">{wo.key}</span>
++        <span className="min-w-0 flex-1 text-sm font-medium text-foreground">
++          {wo.title}
++        </span>
++      </span>
++      <span className="flex flex-wrap items-center gap-2">
++        <WorkOrderStatePill state={wo.state} />
++        <RiskChip risk={wo.risk} />
++      </span>
++      <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
++        {wo.attempts ? (
++          <span>{copy.pipeline.attempt(wo.attempts, wo.round)}</span>
++        ) : null}
++        {wo.costUsd ? (
++          <span className="tabular-nums">
++            {formatMoney(wo.costUsd, i18n.language)}
++          </span>
++        ) : null}
++        {wo.dependsOn.length && wo.state === "pending" ? (
++          <span>
++            {copy.pipeline.dependsOn(
++              wo.dependsOn.map((d) => `WO-${d}`).join(", "),
++            )}
++          </span>
++        ) : null}
++        {wo.mergedBy ? (
++          <span className="text-success">
++            {copy.pipeline.mergedBy(approverName(wo.mergedBy))}
++          </span>
++        ) : null}
++      </span>
++    </Link>
++  );
++}
++
++function SpecSection({ run }: { run: RunDetail }) {
++  const copy = useFactoryCopy();
++  const attempts = run.attempts.filter((a) => a.workOrderId === null);
++  const checks = run.checks.filter((c) => c.stage === "spec");
++  return (
++    <section aria-labelledby="factory-spec" className="flex flex-col gap-2">
++      <h2 id="factory-spec" className="text-sm font-semibold text-foreground">
++        {copy.pipeline.specStage}
++      </h2>
++      {attempts.length === 0 ? (
++        <p className="text-sm text-muted">{copy.pipeline.noSpecYet}</p>
++      ) : (
++        <AttemptList attempts={attempts} />
++      )}
++      {checks.length ? <CheckList checks={checks} /> : null}
++    </section>
++  );
++}
++
++function AttemptList({ attempts }: { attempts: Attempt[] }) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const n = new Map<string, number>();
++  return (
++    <ul className="flex flex-col gap-1">
++      {attempts.map((a) => {
++        const index = (n.get(a.role) ?? 0) + 1;
++        n.set(a.role, index);
++        return (
++          <li
++            key={a.id}
++            className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm"
++          >
++            <span className="text-foreground">
++              {`${copy.pipeline.roles[a.role] ?? a.role} ${index}`}
++            </span>
++            <span className="text-xs text-muted">
++              {copy.pipeline.attemptStates[a.state] ?? a.state}
++            </span>
++            <span className="text-xs text-muted">
++              {copy.pipeline.turns(a.turns)}
++            </span>
++            <span className="text-xs tabular-nums text-muted">
++              {formatMoney(a.costUsd, i18n.language)}
++            </span>
++            <Link
++              to={`/conversations/${a.conversationId}`}
++              className="inline-flex items-center gap-1 text-xs text-link hover:underline"
++            >
++              <MessageSquare className="size-3.5" aria-hidden />
++              {copy.pipeline.detail.openConversation}
++            </Link>
++          </li>
++        );
++      })}
++    </ul>
++  );
++}
++
++function CheckList({ checks }: { checks: Check[] }) {
++  const copy = useFactoryCopy();
++  return (
++    <ul className="flex flex-col gap-1">
++      {checks.map((c) => (
++        <li key={c.id} className="text-sm">
++          <details className="group">
++            <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 [&::-webkit-details-marker]:hidden">
++              <ChevronRight
++                className="size-3.5 shrink-0 text-muted transition-transform group-open:rotate-90"
++                aria-hidden
++              />
++              {c.ok ? (
++                <CircleCheck
++                  className="size-4 shrink-0 text-success"
++                  aria-label={copy.pipeline.labels.passed}
++                />
++              ) : (
++                <CircleX
++                  className="size-4 shrink-0 text-feedback-error"
++                  aria-label={copy.pipeline.labels.failed}
++                />
++              )}
++              <span className="font-mono text-foreground">{c.name}</span>
++              <span className="text-xs text-muted">
++                {copy.pipeline.stagesOfCheck[c.stage] ?? c.stage}
++              </span>
++              {c.durationMs !== null ? (
++                <span className="text-xs tabular-nums text-muted">
++                  {formatDuration(c.durationMs)}
++                </span>
++              ) : null}
++            </summary>
++            {c.output ? (
++              <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-lg border border-border-subtle bg-surface-deep px-3 py-2 font-mono text-xs text-foreground custom-scrollbar">
++                {c.output}
++              </pre>
++            ) : null}
++          </details>
++        </li>
++      ))}
++    </ul>
++  );
++}
++
++function WorkOrderPanel({
++  run,
++  wo,
++  onClose,
++}: {
++  run: RunDetail;
++  wo: AutopilotWorkOrder;
++  onClose: () => void;
++}) {
++  const copy = useFactoryCopy();
++  const attempts = run.attempts.filter((a) => a.workOrderId === wo.id);
++  const checks = run.checks.filter((c) => c.workOrderId === wo.id);
++  const items = run.inbox.filter((i) => i.workOrderId === wo.id);
++  const showFindings =
++    wo.findings?.length &&
++    !["merged", "skipped", "cancelled"].includes(wo.state);
++
++  return (
++    <aside
++      data-testid="factory-pipeline-detail"
++      aria-label={`${wo.key} ${wo.title}`}
++      className="flex w-104 shrink-0 flex-col overflow-y-auto border-l border-border-subtle bg-base-secondary custom-scrollbar"
++    >
++      <div className="flex items-center gap-3 border-b border-border-subtle px-5 py-3">
++        <span className="font-mono text-sm text-muted">{wo.key}</span>
++        <WorkOrderStatePill state={wo.state} />
++        <button
++          type="button"
++          onClick={onClose}
++          aria-label={copy.pipeline.detail.close}
++          className="ml-auto inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-interactive-hover hover:text-contrast"
++        >
++          <X className="size-4" aria-hidden />
++        </button>
++      </div>
++      <div className="flex flex-col gap-5 px-5 py-4">
++        <div className="flex flex-col gap-2">
++          <h2 className="text-base font-semibold text-foreground">
++            {wo.title}
++          </h2>
++          <span className="flex flex-wrap items-center gap-2">
++            <RiskChip risk={wo.risk} />
++            {wo.mergedBy ? (
++              <span className="text-xs text-success">
++                {copy.pipeline.mergedBy(approverName(wo.mergedBy))}
++              </span>
++            ) : null}
++          </span>
++        </div>
++
++        {items
++          .filter((i) => i.state === "open")
++          .map((item) => (
++            <DecisionCard key={item.id} item={item} showRun={false} />
++          ))}
++
++        {showFindings ? (
++          <Section title={copy.pipeline.detail.findings}>
++            <ul className="flex flex-col gap-2">
++              {wo.findings!.map((f, i) => (
++                <li
++                  key={`${f.title}-${i}`}
++                  className="rounded-lg border border-border-subtle bg-surface px-3 py-2 text-sm"
++                >
++                  <p className="text-foreground">
++                    <span className="mr-1.5 text-xs uppercase text-muted">
++                      {f.severity}
++                    </span>
++                    {f.title}
++                  </p>
++                  {f.detail ? (
++                    <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap font-mono text-xs text-muted custom-scrollbar">
++                      {f.detail}
++                    </pre>
++                  ) : null}
++                </li>
++              ))}
++            </ul>
++          </Section>
++        ) : null}
++
++        <Section title={copy.pipeline.detail.acceptance}>
++          <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm">
++            {wo.acceptance.map((a) => (
++              <li key={a}>
++                <FactoryMarkdown text={a} className="min-w-0" />
++              </li>
++            ))}
++          </ol>
++        </Section>
++
++        {wo.controls.length ? (
++          <Section title={copy.pipeline.detail.controls}>
++            <span className="flex flex-wrap gap-1">
++              {wo.controls.map((c) => (
++                <span
++                  key={c}
++                  className="inline-flex items-center gap-1 rounded-md border border-border-subtle px-1.5 py-0.5 font-mono text-xs text-foreground"
++                >
++                  <Shield className="size-3 text-muted" aria-hidden />
++                  {c}
++                </span>
++              ))}
++            </span>
++          </Section>
++        ) : null}
++
++        <Section title={copy.pipeline.detail.agents}>
++          {attempts.length ? (
++            <AttemptList attempts={attempts} />
++          ) : (
++            <p className="text-sm text-muted">{copy.pipeline.noAgents}</p>
++          )}
++        </Section>
++
++        <Section title={copy.pipeline.detail.checks}>
++          {checks.length ? (
++            <CheckList checks={checks} />
++          ) : (
++            <p className="text-sm text-muted">
++              {copy.pipeline.detail.noChecks}
++            </p>
++          )}
++        </Section>
++
++        {wo.branch ? (
++          <Section title={copy.pipeline.detail.branch}>
++            <code className="break-all font-mono text-xs text-muted">
++              {wo.branch}
++            </code>
++          </Section>
++        ) : null}
++      </div>
++    </aside>
++  );
++}
++
++function Section({
++  title,
++  children,
++}: {
++  title: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <section className="flex flex-col gap-1.5">
++      <h3 className="text-xs font-medium text-muted">{title}</h3>
++      {children}
++    </section>
++  );
++}
+diff --git a/src/factory/routes/autopilot.tsx b/src/factory/routes/autopilot.tsx
+new file mode 100644
+index 0000000..893d209
+--- /dev/null
++++ b/src/factory/routes/autopilot.tsx
+@@ -0,0 +1,357 @@
++import React from "react";
++import { useTranslation } from "react-i18next";
++import { Link, useNavigate } from "react-router";
++import {
++  CircleAlert,
++  CircleCheck,
++  GitBranch,
++  Inbox,
++  Rocket,
++  Server,
++  ShieldCheck,
++} from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { cn } from "#/utils/utils";
++import {
++  AUTONOMY_LEVELS,
++  type Autonomy,
++  type AutopilotStatus,
++  type RunSummary,
++} from "../api";
++import { useFactoryCopy } from "../copy";
++import {
++  useAutopilotStatus,
++  useCreateRun,
++  useFactoryHealth,
++  useRuns,
++} from "../hooks";
++import {
++  FactoryError,
++  FactoryLoading,
++  FactoryPage,
++} from "../components/factory-page";
++import { formatWhen } from "../components/factory-badges";
++import {
++  RunStatePill,
++  WAITING_RUN_STATES,
++  formatMoney,
++} from "../components/autopilot-badges";
++import { factoryFieldClassName } from "../components/start-agent-modal";
++
++export default function FactoryAutopilotRoute() {
++  const copy = useFactoryCopy();
++  const health = useFactoryHealth();
++  const status = useAutopilotStatus();
++  const runs = useRuns();
++
++  return (
++    <FactoryPage
++      testId="factory-autopilot"
++      title={copy.autopilot.title}
++      subtitle={
++        health.data
++          ? copy.autopilot.subtitle(health.data.workspace.name)
++          : undefined
++      }
++      error={runs.error ?? status.error}
++      onRetry={() => {
++        void runs.refetch();
++        void status.refetch();
++      }}
++    >
++      <div className="mx-auto flex max-w-5xl flex-col gap-8 px-6 py-6">
++        <div className="grid gap-6 lg:grid-cols-3">
++          <div className="min-w-0 lg:col-span-2">
++            <GoalForm status={status.data} />
++          </div>
++          <SetupStatus status={status.data} />
++        </div>
++        <section aria-labelledby="factory-runs-heading">
++          <h2
++            id="factory-runs-heading"
++            className="mb-2 text-sm font-semibold text-foreground"
++          >
++            {copy.autopilot.runs}
++          </h2>
++          {runs.isLoading ? <FactoryLoading /> : null}
++          {runs.data?.length === 0 ? (
++            <p className="text-sm text-muted">{copy.autopilot.noRuns}</p>
++          ) : null}
++          <ul className="flex flex-col gap-2">
++            {(runs.data ?? []).map((run) => (
++              <li key={run.id}>
++                <RunRow run={run} />
++              </li>
++            ))}
++          </ul>
++        </section>
++      </div>
++    </FactoryPage>
++  );
++}
++
++function GoalForm({ status }: { status: AutopilotStatus | undefined }) {
++  const copy = useFactoryCopy();
++  const navigate = useNavigate();
++  const create = useCreateRun();
++  const [goal, setGoal] = React.useState("");
++  const [budget, setBudget] = React.useState("");
++  const [picked, setPicked] = React.useState<Autonomy | null>(null);
++  const caps = status?.policy.autonomy;
++  const autonomy = picked ?? caps?.default ?? "supervised";
++  const max = caps ? AUTONOMY_LEVELS.indexOf(caps.max) : 2;
++  const blocked = Boolean(status?.policy.error);
++  const budgetUsd = budget.trim() ? Number(budget) : null;
++  const budgetInvalid =
++    budgetUsd !== null && !(Number.isFinite(budgetUsd) && budgetUsd > 0);
++
++  const submit = (event: React.FormEvent) => {
++    event.preventDefault();
++    if (!goal.trim() || budgetInvalid) return;
++    create.mutate(
++      { goal: goal.trim(), autonomy, budgetUsd },
++      { onSuccess: (run) => navigate(`/autopilot/runs/${run.id}`) },
++    );
++  };
++
++  return (
++    <form
++      onSubmit={submit}
++      className="flex flex-col gap-4"
++      aria-label={copy.autopilot.goalLabel}
++    >
++      <div className="flex flex-col gap-1.5">
++        <label
++          htmlFor="factory-goal"
++          className="text-base font-semibold text-foreground"
++        >
++          {copy.autopilot.goalLabel}
++        </label>
++        <textarea
++          id="factory-goal"
++          data-testid="factory-goal"
++          className={cn(factoryFieldClassName, "min-h-28 text-base")}
++          placeholder={copy.autopilot.goalPlaceholder}
++          value={goal}
++          maxLength={4000}
++          onChange={(e) => setGoal(e.target.value)}
++          aria-describedby="factory-goal-help"
++          disabled={create.isPending}
++        />
++        <p id="factory-goal-help" className="text-xs text-muted">
++          {copy.autopilot.goalHelp}
++        </p>
++      </div>
++
++      <fieldset className="flex flex-col gap-2">
++        <legend className="mb-1.5 text-sm font-medium text-foreground">
++          {copy.autopilot.autonomyLabel}
++        </legend>
++        <div className="grid gap-2 sm:grid-cols-3">
++          {AUTONOMY_LEVELS.map((level, i) => {
++            const text = copy.autopilot.autonomy[level];
++            const disabled = i > max;
++            return (
++              <label
++                key={level}
++                className={cn(
++                  "flex cursor-pointer flex-col gap-1 rounded-xl border px-3 py-2.5",
++                  autonomy === level
++                    ? "border-primary bg-interactive-selected"
++                    : "border-border-subtle bg-surface hover:bg-surface-raised",
++                  disabled && "cursor-not-allowed opacity-50",
++                )}
++              >
++                <span className="flex items-center gap-2 text-sm font-medium text-foreground">
++                  <input
++                    type="radio"
++                    name="factory-autonomy"
++                    value={level}
++                    checked={autonomy === level}
++                    disabled={disabled || create.isPending}
++                    onChange={() => setPicked(level)}
++                    className="accent-primary"
++                  />
++                  {text?.label ?? level}
++                </span>
++                <span className="text-xs text-muted">{text?.help}</span>
++              </label>
++            );
++          })}
++        </div>
++        {caps && max < 2 ? (
++          <p className="text-xs text-muted">
++            {copy.autopilot.autonomyCapped(
++              copy.autopilot.autonomy[caps.max]?.label ?? caps.max,
++            )}
++          </p>
++        ) : null}
++      </fieldset>
++
++      <div className="flex flex-wrap items-end gap-4">
++        <div className="flex w-48 flex-col gap-1.5">
++          <label
++            htmlFor="factory-budget"
++            className="text-sm font-medium text-foreground"
++          >
++            {copy.autopilot.budgetLabel}
++          </label>
++          <input
++            id="factory-budget"
++            data-testid="factory-budget"
++            type="number"
++            min="0.01"
++            step="any"
++            inputMode="decimal"
++            className={factoryFieldClassName}
++            value={budget}
++            onChange={(e) => setBudget(e.target.value)}
++            aria-invalid={budgetInvalid || undefined}
++            aria-describedby="factory-budget-help"
++            disabled={create.isPending}
++          />
++        </div>
++        <p id="factory-budget-help" className="pb-2 text-xs text-muted">
++          {copy.autopilot.budgetHelp}
++        </p>
++        <BrandButton
++          testId="factory-start-run"
++          type="submit"
++          variant="primary"
++          className="ml-auto"
++          isDisabled={
++            !goal.trim() || budgetInvalid || blocked || create.isPending
++          }
++          startContent={<Rocket className="size-4" aria-hidden />}
++        >
++          {create.isPending ? copy.autopilot.starting : copy.autopilot.start}
++        </BrandButton>
++      </div>
++      <FactoryError error={create.error} />
++    </form>
++  );
++}
++
++function SetupStatus({ status }: { status: AutopilotStatus | undefined }) {
++  const copy = useFactoryCopy();
++  if (!status) return null;
++  const { agentServer, workspace, policy } = status;
++  return (
++    <aside
++      aria-label={copy.autopilot.setup}
++      className="flex flex-col gap-3 self-start rounded-xl border border-border-subtle bg-surface px-4 py-3.5 text-sm"
++    >
++      <h2 className="text-xs font-medium text-muted">{copy.autopilot.setup}</h2>
++      <SetupLine
++        ok={agentServer.reachable}
++        icon={<Server className="size-4" aria-hidden />}
++        text={
++          agentServer.reachable
++            ? copy.autopilot.agentServerOk(agentServer.profiles.length)
++            : copy.autopilot.agentServerDown
++        }
++        hint={
++          agentServer.reachable
++            ? undefined
++            : `${copy.autopilot.agentServerHint} (${agentServer.url})`
++        }
++      />
++      <SetupLine
++        ok
++        icon={<GitBranch className="size-4" aria-hidden />}
++        text={
++          workspace.isRepo && workspace.branch
++            ? copy.autopilot.workspaceRepo(workspace.branch)
++            : copy.autopilot.workspaceNotRepo
++        }
++        hint={workspace.path}
++      />
++      <SetupLine
++        ok={!policy.error}
++        icon={<ShieldCheck className="size-4" aria-hidden />}
++        text={
++          policy.error
++            ? copy.autopilot.policyError
++            : policy.source === "defaults"
++              ? copy.autopilot.policyDefaults(policy.hash)
++              : copy.autopilot.policyFile(policy.source, policy.hash)
++        }
++        hint={policy.error ?? undefined}
++      />
++    </aside>
++  );
++}
++
++function SetupLine({
++  ok,
++  icon,
++  text,
++  hint,
++}: {
++  ok: boolean;
++  icon: React.ReactNode;
++  text: string;
++  hint?: string;
++}) {
++  return (
++    <div className="flex items-start gap-2">
++      <span className={cn("mt-0.5", ok ? "text-muted" : "text-warning")}>
++        {ok ? icon : <CircleAlert className="size-4" aria-hidden />}
++      </span>
++      <div className="min-w-0">
++        <p className="text-foreground">{text}</p>
++        {hint ? (
++          <p className="break-all font-mono text-xs text-muted">{hint}</p>
++        ) : null}
++      </div>
++    </div>
++  );
++}
++
++function RunRow({ run }: { run: RunSummary }) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const money = (usd: number) => formatMoney(usd, i18n.language);
++  const waiting = WAITING_RUN_STATES.has(run.state) || run.openInbox > 0;
++  return (
++    <Link
++      to={`/autopilot/runs/${run.id}`}
++      data-testid={`factory-run-${run.id}`}
++      className={cn(
++        "flex flex-col gap-1.5 rounded-xl border bg-surface px-4 py-3 hover:bg-surface-raised focus:outline-none focus-visible:ring-2 focus-visible:ring-focus",
++        waiting ? "border-warning" : "border-border-subtle",
++      )}
++    >
++      <span className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
++        <span className="min-w-0 flex-1 text-sm font-medium text-foreground">
++          {run.goal}
++        </span>
++        <RunStatePill state={run.state} />
++      </span>
++      <span className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
++        <span className="font-mono">{run.change}</span>
++        {run.counts.total ? (
++          <span className="inline-flex items-center gap-1 tabular-nums">
++            <CircleCheck className="size-3.5" aria-hidden />
++            {copy.autopilot.progress(run.counts.merged, run.counts.total)}
++          </span>
++        ) : null}
++        <span className="tabular-nums">
++          {copy.autopilot.cost(
++            money(run.costUsd),
++            run.budgetUsd === null ? null : money(run.budgetUsd),
++          )}
++        </span>
++        {run.openInbox ? (
++          <span className="inline-flex items-center gap-1 text-foreground">
++            <Inbox className="size-3.5 text-warning" aria-hidden />
++            {copy.autopilot.needsYou(run.openInbox)}
++          </span>
++        ) : null}
++        <span className="ml-auto">
++          {formatWhen(run.createdAt, i18n.language)}
++        </span>
++      </span>
++    </Link>
++  );
++}
+diff --git a/src/factory/routes/inbox.tsx b/src/factory/routes/inbox.tsx
+new file mode 100644
+index 0000000..2fd3a80
+--- /dev/null
++++ b/src/factory/routes/inbox.tsx
+@@ -0,0 +1,73 @@
++import { useSearchParams } from "react-router";
++import { cn } from "#/utils/utils";
++import { useFactoryCopy } from "../copy";
++import { useInbox } from "../hooks";
++import { FactoryLoading, FactoryPage } from "../components/factory-page";
++import { DecisionCard } from "../components/decision-card";
++
++type Tab = "open" | "decided";
++const TABS: Tab[] = ["open", "decided"];
++
++export default function FactoryInboxRoute() {
++  const copy = useFactoryCopy();
++  const [searchParams, setSearchParams] = useSearchParams();
++  const tab: Tab = searchParams.get("show") === "decided" ? "decided" : "open";
++  // "all" for the decided tab: it includes items closed by a cancelled run.
++  const inbox = useInbox(tab === "open" ? "open" : "all");
++  // Waiting items oldest first (the API sends newest first); decided ones by when they were decided, latest first.
++  const items =
++    tab === "open"
++      ? (inbox.data ?? []).filter((i) => i.state === "open").reverse()
++      : (inbox.data ?? [])
++          .filter((i) => i.state !== "open")
++          .sort((a, b) =>
++            (b.decidedAt ?? b.createdAt).localeCompare(
++              a.decidedAt ?? a.createdAt,
++            ),
++          );
++
++  return (
++    <FactoryPage
++      testId="factory-inbox"
++      title={copy.inbox.title}
++      subtitle={copy.inbox.subtitle}
++      error={inbox.error}
++      onRetry={() => void inbox.refetch()}
++    >
++      <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 py-5">
++        <div
++          role="tablist"
++          className="flex gap-1 self-start rounded-lg border border-border-subtle p-0.5"
++        >
++          {TABS.map((t) => (
++            <button
++              key={t}
++              type="button"
++              role="tab"
++              aria-selected={tab === t}
++              data-testid={`factory-inbox-tab-${t}`}
++              onClick={() => setSearchParams(t === "open" ? {} : { show: t })}
++              className={cn(
++                "rounded-md px-3 py-1 text-sm",
++                tab === t
++                  ? "bg-interactive-selected text-foreground"
++                  : "text-muted hover:text-foreground",
++              )}
++            >
++              {t === "open" ? copy.inbox.open : copy.inbox.decided}
++            </button>
++          ))}
++        </div>
++        {inbox.isLoading ? <FactoryLoading /> : null}
++        {inbox.data && items.length === 0 ? (
++          <p className="text-sm text-muted" data-testid="factory-inbox-empty">
++            {tab === "open" ? copy.inbox.empty : copy.inbox.emptyDecided}
++          </p>
++        ) : null}
++        {items.map((item) => (
++          <DecisionCard key={item.id} item={item} />
++        ))}
 +      </div>
 +    </FactoryPage>
 +  );
@@ -2780,17 +5276,22 @@ index 0000000..79de68c
 +  );
 +}
 diff --git a/src/routes.ts b/src/routes.ts
-index 4e50cac..151a78e 100644
+index 4e50cac..35afa3f 100644
 --- a/src/routes.ts
 +++ b/src/routes.ts
-@@ -40,6 +40,10 @@ export default [
+@@ -4,6 +4,7 @@ import {
+   index,
+   route,
+ } from "@react-router/dev/routes";
++import { factoryRoutes } from "./factory/factory-routes";
+ 
+ export default [
+   layout("routes/root-layout.tsx", [
+@@ -40,6 +41,7 @@ export default [
      route("automations/new/:automationId", "routes/automation-setup-route.tsx"),
      route("automations/setup", "routes/automation-setup-new.tsx"),
      route("automations/:automationId", "routes/automation-detail.tsx"),
-+    // Software Factory (src/factory): requirements, work orders, audit log.
-+    route("requirements/:changeId?", "factory/routes/requirements.tsx"),
-+    route("work-orders/:workOrderId?", "factory/routes/work-orders.tsx"),
-+    route("audit-log", "factory/routes/audit-log.tsx"),
++    ...factoryRoutes, // Software Factory pages (src/factory/factory-routes.ts)
      // Unknown URLs (including /settings/<x>) render inside the app shell.
      route("*", "routes/not-found.tsx"),
    ]),
