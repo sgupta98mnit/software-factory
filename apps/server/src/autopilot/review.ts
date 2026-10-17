@@ -11,7 +11,7 @@ export interface ReviewVerdict {
   unreadable?: boolean;
 }
 
-/** Findings that stop a merge unless policy.yml says otherwise (C7: review.blocking). */
+/** Findings that stop a work order unless policy.yml says otherwise (review.blocking). */
 export const BLOCKING: Severity[] = ["critical", "high"];
 const SEVERITIES = new Set<string>(["critical", "high", "medium", "low"]);
 const ORDER: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3 };

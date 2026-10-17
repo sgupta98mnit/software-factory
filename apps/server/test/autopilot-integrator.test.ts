@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { addWorktree, commitAll, ensureRepo, git, headSha, isClean } from "../src/autopilot/git.js";
-import { mergeAndTest, mergeDecision } from "../src/autopilot/integrator.js";
+import { mergeAndTest } from "../src/autopilot/integrator.js";
 
 const PKG = JSON.stringify({ name: "demo", private: true, type: "module", scripts: { test: "node --test" } });
 const passing = (name: string) => `import { test } from "node:test";\ntest("${name}", () => {});\n`;
@@ -32,12 +32,6 @@ async function setup() {
   const merges = async (since: string) => Number((await git(integration, ["rev-list", "--merges", "--count", `${since}..HEAD`])).stdout.trim());
   return { integration, branch, merges };
 }
-
-test("mergeDecision: suggest waits for a person; supervised and autonomous merge by policy", () => {
-  assert.deepEqual(mergeDecision("suggest"), { auto: false, reasons: ["Autonomy is suggest: a person approves every merge."] });
-  assert.equal(mergeDecision("supervised").auto, true);
-  assert.equal(mergeDecision("autonomous").auto, true);
-});
 
 test("mergeAndTest: passing gates keep the merge; failing ones reset the integration branch to the sha before it", async () => {
   const t = await setup();

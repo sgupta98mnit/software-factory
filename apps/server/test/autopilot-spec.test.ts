@@ -276,7 +276,8 @@ test("spec stage: an invalid change gets a follow-up listing the issues; autonom
 
     await flushAudit();
     const approved = listAudit().find((e) => e.subject === run.id && e.action === "autopilot.plan_approved");
-    assert.equal(approved?.actor, "policy@default");
+    assert.match(t.ledger.getRun(run.id)?.policyHash ?? "", /^[0-9a-f]{12}$/);
+    assert.equal(approved?.actor, `policy@${t.ledger.getRun(run.id)?.policyHash}`);
     assert.equal(approved.data.critic, "pass");
   } finally {
     await t.close();

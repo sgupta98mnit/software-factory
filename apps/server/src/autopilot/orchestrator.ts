@@ -35,7 +35,7 @@ import {
   removeWorktree,
   resetHard,
 } from "./git.js";
-import { mergeAndTest, mergeDecision } from "./integrator.js";
+import { mergeAndTest } from "./integrator.js";
 import type {
   Attempt,
   AttemptRole,
@@ -64,7 +64,8 @@ import {
   validateFollowUp,
   verdictReminder,
 } from "./prompts.js";
-import { clusterFindings, parseVerdict, passed } from "./review.js";
+import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash } from "./policy.js";
+import { clusterFindings, parseVerdict, passed, type ReviewVerdict } from "./review.js";
 import {
   assumptionsOf,
   changeNameFor,
@@ -90,18 +91,12 @@ export interface OrchestratorDeps {
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
 const TERMINAL = new Set<RunState>(["done", "failed", "cancelled"]);
 const ACTIVE = new Set<string>(["starting", "running"]); // attempts the scheduler starts or polls
-const BUSY_WO = new Set<WorkOrderState>(["building", "verifying", "reviewing"]); // count against PARALLEL
+const BUSY_WO = new Set<WorkOrderState>(["building", "verifying", "reviewing"]); // count against policy.parallel
 const DONE_WO = new Set<WorkOrderState>(["merged", "skipped"]); // what dependents wait for
 const SYSTEM = "autopilot";
-// Defaults until .factory/policy.yml is read (policy.ts).
-const POLICY_ACTOR = "policy@default";
-const SPEC_VALIDATE_TRIES = 3;
-const CRITIC_ROUNDS = 2;
-const REPAIR_SAME_CONVERSATION = 2; // follow-ups to a builder before a fresh one takes over
-const REPAIR_FRESH = 1; // fresh builders after the first, before a person is asked
 const FAILING_TO_PAUSE = 3; // work orders needing attention that pause their run
-/** Work orders of one run in building, verifying or reviewing at once. */
-export const PARALLEL = 3;
+/** Who approves what a run's pinned policy allows: "policy@<hash>". */
+const policyActor = (run: Run) => `policy@${run.policyHash ?? "default"}`;
 
 const APPROVAL: InboxOption[] = [
   { id: "approve", label: "Approve", tone: "primary" },
@@ -255,15 +250,21 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return a;
   }
 
-  /** A critic or reviewer should be another vendor than the agent whose work it checks, when the agent server has one. */
-  async function otherVendorThan(profileRef: string | null | undefined) {
+  /**
+   * The profile the policy names for a critic or reviewer; with none named,
+   * another vendor than the agent whose work it checks, when the agent server has one.
+   */
+  async function checkerProfile(named: string | null, profileRef: string | null | undefined) {
+    if (named) return client.resolveProfile(named);
     const other = profileRef ? await client.resolveProfile(profileRef).catch(() => null) : null;
     return client.resolveProfile(null, { avoidServerOf: other?.server });
   }
 
   /** Records a new attempt before asking the agent server for it (write-ahead), then starts it. */
   async function startAgent(run: Run, role: "spec" | "critic") {
-    const profile = role === "spec" ? await client.resolveProfile(null) : await otherVendorThan(latest(run.id, "spec")?.agentProfile);
+    const { agents } = pinnedPolicy(run);
+    const profile =
+      role === "spec" ? await client.resolveProfile(agents.spec) : await checkerProfile(agents.critic, latest(run.id, "spec")?.agentProfile);
     const attempt = ledger.transaction(() => {
       const a = ledger.addAttempt({ runId: run.id, role, conversationId: randomUUID(), agentProfile: profile.id });
       if (role === "spec") ledger.updateRun(run.id, { specConversation: a.conversationId });
@@ -275,7 +276,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** The first message of an attempt, rebuilt from the ledger so a restart sends the same one. */
   function briefFor(run: Run, a: Attempt, wo: WorkOrder | undefined): string {
-    if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo }) : builderBrief({ change: run.change, wo });
+    if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo }) : builderBrief({ change: run.change, wo, gates: pinnedPolicy(run).gates });
     if (a.role === "critic") return criticBrief({ change: run.change });
     // A spec agent started after one that failed (or whose tasks.md couldn't be planned) hears why.
     const before = ledger.listAttempts({ runId: run.id, role: "spec" }).filter((x) => x.id < a.id).at(-1);
@@ -375,11 +376,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const check = await checkChange(run.change, dir);
     const tries = check.ok ? 0 : invalidStreak(run, a) + 1;
     // Sent before the check is recorded: if sending fails, the next tick validates and sends again.
-    if (!check.ok && tries < SPEC_VALIDATE_TRIES) await sendFollowUp(a, validateFollowUp(run.change, check.output), "validate");
+    const { validateTries } = pinnedPolicy(run).spec;
+    if (!check.ok && tries < validateTries) await sendFollowUp(a, validateFollowUp(run.change, check.output), "validate");
     ledger.addCheck({ runId: run.id, stage: "spec", name: "openspec-validate", ok: check.ok, exitCode: check.ok ? 0 : 1, durationMs: check.durationMs, output: check.output });
     changed(run.id);
     if (!check.ok) {
-      if (tries >= SPEC_VALIDATE_TRIES) specFailed(run, a, `\`openspec validate ${run.change} --strict\` still fails after ${tries} tries:\n\n${check.output}`);
+      if (tries >= validateTries) specFailed(run, a, `\`openspec validate ${run.change} --strict\` still fails after ${tries} tries:\n\n${check.output}`);
       return;
     }
 
@@ -421,7 +423,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const reviewed = (x: Attempt) => !!(x.result as CriticVerdict | null)?.verdict && !(x.result as CriticVerdict).unreadable;
     const rounds = 1 + ledger.listAttempts({ runId: run.id, role: "critic" }).filter((x) => x.id !== c.id && reviewed(x)).length;
     const serious = verdict.findings.some((f) => f.severity !== "low");
-    if (verdict.verdict === "revise" && serious && rounds < CRITIC_ROUNDS) {
+    if (verdict.verdict === "revise" && serious && rounds < pinnedPolicy(run).spec.criticRounds) {
       await sendFollowUp(specAttempt(run), criticFollowUp(verdict.findings), "critic");
       ledger.transaction(() => {
         markHandled(c, verdict);
@@ -477,7 +479,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       return moveRun(run, "awaiting_spec_approval");
     }
     if (run.autonomy === "supervised") return askPlanApproval(run);
-    return approvePlan(run, POLICY_ACTOR);
+    return approvePlan(run, policyActor(run));
   }
 
   function askPlanApproval(run: Run) {
@@ -572,7 +574,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // Pending work orders whose dependencies are merged or skipped, in wave order, while there's room.
     const wos = ledger.listWorkOrders(run.id);
     const stateOf = new Map(wos.map((w) => [w.seq, w.state]));
-    let room = PARALLEL - wos.filter((w) => BUSY_WO.has(w.state)).length;
+    let room = pinnedPolicy(run).parallel - wos.filter((w) => BUSY_WO.has(w.state)).length;
     for (const wo of wos) {
       if (room <= 0) break;
       if (wo.state !== "pending" || !wo.dependsOn.every((d) => DONE_WO.has(stateOf.get(d) ?? "pending"))) continue;
@@ -594,7 +596,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * conversation with the same id. `findings` go into the brief.
    */
   async function dispatch(run: Run, wo: WorkOrder, findings = wo.findings) {
-    const profile = await client.resolveProfile(null);
+    const profile = await client.resolveProfile(pinnedPolicy(run).agents.builder);
     const dir = path.join(worktrees, run.id, `wo-${wo.seq}`);
     // Not autopilot/<change>/wo-N: git can't have that next to the branch autopilot/<change>.
     const branch = `${run.integrationBranch}--wo-${wo.seq}`;
@@ -644,7 +646,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** The factory's own checks on the committed work: pass -> a reviewer, fail -> a repair round. */
   async function verify(run: Run, wo: WorkOrder) {
     const dir = wo.worktree as string;
-    const { ok, results } = await runGates(dir, detectGates(dir));
+    const { ok, results } = await runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir));
     recordGates(run, wo, "build", results);
     if (!ok) return repair(run, wo, gateFindings(results));
     await discardChanges(dir); // what the gates left (build output), so anything left after the review is the reviewer's
@@ -670,7 +672,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** Write-ahead like dispatch: the attempt and the move to reviewing, then the agent server. */
   async function startReviewer(run: Run, wo: WorkOrder) {
-    const profile = await otherVendorThan(builders(wo).at(-1)?.agentProfile);
+    const profile = await checkerProfile(pinnedPolicy(run).agents.reviewer, builders(wo).at(-1)?.agentProfile);
     const attempt = ledger.transaction(() => {
       const a = ledger.addAttempt({ runId: run.id, workOrderId: wo.id, role: "reviewer", conversationId: randomUUID(), agentProfile: profile.id });
       if (wo.state !== "reviewing") moveWorkOrder(wo, "reviewing", { data: { attempt: a.id } });
@@ -705,7 +707,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: "reviewer-edits-discarded", ok: false, output: "The reviewer left changes in the worktree. They were thrown away." });
       record(SYSTEM, "autopilot.edits_discarded", run.id, { role: "reviewer", workOrder: `WO-${wo.seq}`, attempt: r.id, committed, switchedBranch: !onBranch });
     }
-    const ok = passed(verdict);
+    const ok = passed(verdict, pinnedPolicy(run).review.blocking);
     record(SYSTEM, "autopilot.review_verdict", run.id, {
       workOrder: `WO-${wo.seq}`,
       attempt: r.id,
@@ -740,8 +742,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const all = builders(wo);
     const last = all.at(-1);
     const data = { workOrder: `WO-${wo.seq}`, findings: findings.length };
+    const limits = pinnedPolicy(run).repair;
     // A conversation that never started, or is gone from the agent server, can't take a follow-up.
-    if (last && !(last.result as { error?: string } | null)?.error && last.turns < 1 + REPAIR_SAME_CONVERSATION) {
+    if (last && !(last.result as { error?: string } | null)?.error && last.turns < 1 + limits.sameConversation) {
       await sendFollowUp(last, repairMessage(findings), "repair");
       moveWorkOrder(wo, "building", { patch: { findings }, action: "autopilot.repair_requested", data: { ...data, builder: all.length, turn: last.turns + 1 } });
       return;
@@ -749,7 +752,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const retries = ledger
       .listInbox({ state: "decided", runId: run.id })
       .filter((i) => i.workOrderId === wo.id && i.kind === "work_order_failed" && i.decision === "retry").length;
-    if (all.length < 1 + REPAIR_FRESH + retries) {
+    if (all.length < 1 + limits.fresh + retries) {
       record(SYSTEM, "autopilot.repair_requested", run.id, { ...data, builder: all.length + 1, turn: 1 });
       return dispatch(run, wo, findings);
     }
@@ -815,30 +818,66 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * When every work order is merged or skipped, the run is done.
    */
   async function integrateStep(run: Run) {
-    const { auto, reasons } = mergeDecision(run.autonomy);
+    // Ready work orders: what the policy allows queues to merge (one at a time), the rest go to a person.
+    let queued = ledger.listWorkOrders(run.id).some((w) => w.state === "merging");
+    for (const wo of ledger.listWorkOrders(run.id)) {
+      if (wo.state !== "ready") continue;
+      try {
+        const check = await mergeCheck(run, wo);
+        if (!check.auto) await askMergeApproval(run, wo, check);
+        else if (!queued) {
+          moveWorkOrder(wo, "merging", { actor: policyActor(run), patch: { preMergeSha: null } });
+          queued = true;
+        }
+      } catch (err) {
+        workOrderError(run, wo, err); // resumes in ready: a retry decides again
+        if (ledger.getRun(run.id)?.state !== "building") return;
+      }
+    }
+    // A merge a restart interrupted first, then the next one queued.
     const wos = ledger.listWorkOrders(run.id);
-    if (!auto) for (const wo of wos) if (wo.state === "ready") await askMergeApproval(run, wo, reasons);
-    // A merge a restart interrupted first, then one already approved, then (by policy) the next ready one.
-    const ready = wos.find((w) => w.state === "ready");
-    const next =
-      wos.find((w) => w.state === "merging" && w.preMergeSha) ??
-      wos.find((w) => w.state === "merging") ??
-      (auto && ready ? moveWorkOrder(ready, "merging", { actor: POLICY_ACTOR, patch: { preMergeSha: null }, data: { reasons } }) : undefined);
+    const next = wos.find((w) => w.state === "merging" && w.preMergeSha) ?? wos.find((w) => w.state === "merging");
     if (next) await integrate(run, next).catch((err) => integrateFailed(run, next, err));
     for (const wo of ledger.listWorkOrders(run.id)) if (wo.state === "merged" && wo.worktree) await cleanUp(run, wo);
     if (ledger.getRun(run.id)?.state === "building" && ledger.listWorkOrders(run.id).every((w) => DONE_WO.has(w.state))) await finish(run);
   }
 
-  /** Suggest mode: a person sees what a work order changes before it merges. */
-  async function askMergeApproval(run: Run, wo: WorkOrder, reasons: string[]) {
-    const { files, linesChanged } = await diffStat(workspace, run.integrationBranch, wo.branch as string);
+  /**
+   * The pinned policy's merge decision for a work order, from what its branch
+   * changes since base_sha (the integration sha it last started from) and
+   * the dependencies it adds. The same answer for as long as its branch
+   * doesn't change, wherever the integration branch has moved since.
+   */
+  async function mergeCheck(run: Run, wo: WorkOrder) {
+    const policy = pinnedPolicy(run);
+    const base = wo.baseSha ?? run.integrationBranch;
+    const head = wo.branch as string;
+    const stat = await diffStat(workspace, base, head);
+    const files = stat.files.map((f) => f.path);
+    const review = reviewers(wo).at(-1)?.result as ReviewVerdict | null | undefined;
+    const decision = evaluateMerge(policy, {
+      autonomy: run.autonomy,
+      gatesOk: true, // a work order is ready only once its gates have passed (verify)
+      hiddenTestsOk: null, // not run yet (C11)
+      reviewPassed: !!review?.verdict && passed(review, policy.review.blocking),
+      secretFindings: 0, // no secret scan yet (C10)
+      files,
+      linesChanged: stat.linesChanged,
+      newDependencies: await newDependencies(workspace, base, head, files),
+    });
+    return { ...decision, stat };
+  }
+
+  /** A person sees why the policy didn't merge it, and what it changes. */
+  async function askMergeApproval(run: Run, wo: WorkOrder, check: { reasons: string[]; stat: Awaited<ReturnType<typeof diffStat>> }) {
+    const { files, linesChanged } = check.stat;
     const list = files.slice(0, 30).map((f) => `- \`${f.path}\` (+${f.added} -${f.deleted})`);
     if (files.length > 30) list.push(`- and ${files.length - 30} more`);
     const body = [
       `**WO-${wo.seq}: ${wo.title}** passed its gates and review. Merging brings \`${wo.branch}\` into \`${run.integrationBranch}\`, where the gates run again.`,
       "",
       "### Why it needs you",
-      bullets(reasons),
+      bullets(check.reasons),
       "",
       `### ${files.length} file(s), ${linesChanged} line(s) changed`,
       ...list,
@@ -851,14 +890,19 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
   }
 
-  /** Who lets a work order merge: the policy, or the person who approved it. Never merged without one on record. */
-  function mergeActor(run: Run, wo: WorkOrder): string {
-    if (mergeDecision(run.autonomy).auto) return POLICY_ACTOR;
+  /**
+   * Who lets a work order merge, and why a person had to: the policy (asked
+   * again, with the same answer for the same branch), or the person who
+   * approved it last. Never merged without one on record.
+   */
+  async function mergeActor(run: Run, wo: WorkOrder): Promise<{ actor: string; reasons: string[] }> {
+    const { auto, reasons } = await mergeCheck(run, wo);
+    if (auto) return { actor: policyActor(run), reasons };
     const approval = ledger
       .listInbox({ state: "decided", runId: run.id })
       .find((i) => i.workOrderId === wo.id && i.kind === "merge_approval" && i.decision === "merge");
     if (!approval?.decidedBy) throw new Error(`WO-${wo.seq} has no merge approval on record.`);
-    return approval.decidedBy;
+    return { actor: approval.decidedBy, reasons };
   }
 
   /**
@@ -869,7 +913,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    */
   async function integrate(run: Run, wo: WorkOrder) {
     const dir = run.integrationDir as string;
-    const actor = mergeActor(run, wo);
+    const { actor, reasons } = await mergeActor(run, wo);
     const key = `WO-${wo.seq}`;
     // Saved before merging, so a restart (or a failure) knows where the integration branch was.
     let pre = wo.preMergeSha;
@@ -877,14 +921,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       pre = await headSha(dir);
       ledger.updateWorkOrder(wo.id, { preMergeSha: pre });
     }
-    const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre);
+    const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre, pinnedPolicy(run).gates);
     if (r.results.length) recordGates(run, wo, "integrate", r.results);
     if (r.outcome === "merged") {
       moveWorkOrder(wo, "merged", {
         actor,
         patch: { mergedBy: actor },
         action: "autopilot.work_order_merged",
-        data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons: mergeDecision(run.autonomy).reasons },
+        data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons },
       });
       return;
     }
@@ -968,10 +1012,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   // ---- what people do ----
 
-  function clampAutonomy(requested: Autonomy): Autonomy {
-    const cap = process.env.SF_AUTONOMY_CAP as Autonomy | undefined;
-    if (!cap || !AUTONOMY.includes(cap)) return requested;
-    return AUTONOMY[Math.min(AUTONOMY.indexOf(requested), AUTONOMY.indexOf(cap))] ?? requested;
+  /** The lowest of what was asked for, the policy's autonomy.max and the org-wide SF_AUTONOMY_CAP. */
+  function clampAutonomy(requested: Autonomy, max: Autonomy): Autonomy {
+    const env = process.env.SF_AUTONOMY_CAP as Autonomy | undefined;
+    const caps = [max, ...(env && AUTONOMY.includes(env) ? [env] : [])];
+    return AUTONOMY[Math.min(AUTONOMY.indexOf(requested), ...caps.map((c) => AUTONOMY.indexOf(c)))] ?? requested;
   }
 
   // One run is created at a time: two at once (a double-click) would both init the repo or pick the same change name.
@@ -985,19 +1030,21 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function createRunNow(input: { goal: string; autonomy?: Autonomy; budgetUsd?: number | null; actor: string }): Promise<Run> {
     const goal = typeof input.goal === "string" ? input.goal.trim() : "";
     if (!goal || goal.length > 4000) throw new Error("The goal must be 1 to 4000 characters.");
-    const requested = input.autonomy ?? "supervised";
-    if (!AUTONOMY.includes(requested)) throw new Error(`Autonomy must be one of: ${AUTONOMY.join(", ")}.`);
+    if (input.autonomy !== undefined && !AUTONOMY.includes(input.autonomy)) throw new Error(`Autonomy must be one of: ${AUTONOMY.join(", ")}.`);
     const budgetUsd = input.budgetUsd ?? null;
     if (budgetUsd !== null && !(typeof budgetUsd === "number" && Number.isFinite(budgetUsd) && budgetUsd > 0)) {
       throw new Error("The budget must be a positive number of dollars.");
     }
     if (!existsSync(workspace)) throw new Error(`The workspace ${workspace} doesn't exist.`);
-    const autonomy = clampAutonomy(requested);
 
     if ((await ensureRepo(workspace)).initialized) {
       record(input.actor, "autopilot.workspace_initialized", path.basename(workspace), { path: workspace });
     }
     const baseBranch = (await currentBranch(workspace)) ?? "main";
+    // The rules this run keeps to the end, from the base branch: an invalid policy.yml stops it here.
+    const { policy, hash, source } = await loadPolicy(workspace, baseBranch);
+    const requested = input.autonomy ?? policy.autonomy.default;
+    const autonomy = clampAutonomy(requested, policy.autonomy.max);
     const taken = await takenChangeNames(workspace, baseBranch);
     for (const r of ledger.listRuns()) taken.add(r.change);
     const change = changeNameFor(goal, taken);
@@ -1006,7 +1053,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const integrationBranch = `autopilot/${change}`;
     await addWorktree(workspace, integrationDir, integrationBranch, baseBranch);
 
-    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, createdBy: input.actor });
+    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, policy, policyHash: hash, createdBy: input.actor });
     record(input.actor, "autopilot.run_created", id, {
       change,
       autonomy,
@@ -1014,7 +1061,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       goalSummary: clip(goal),
       goalSha256: sha256(goal),
       budgetUsd,
+      policyHash: hash,
     });
+    record(SYSTEM, "autopilot.policy_loaded", id, { hash, source, policy });
     changed(id);
     return run;
   }
@@ -1198,10 +1247,18 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       (err: unknown) => ({ reachable: false, error: errorText(err), profiles: [], activeProfileId: null }),
     );
     const isRepo = await isRepoRoot(workspace).catch(() => false);
+    const branch = isRepo ? await currentBranch(workspace) : null;
+    // The policy a run started now would pin; an invalid policy.yml shows here before anyone starts one.
+    const policy = branch
+      ? await loadPolicy(workspace, branch).then(
+          (p) => ({ source: p.source, hash: p.hash, error: null as string | null }),
+          (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err) }),
+        )
+      : { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null };
     return {
       agentServer: { url: client.baseUrl, ...agent },
-      workspace: { path: workspace, isRepo, branch: isRepo ? await currentBranch(workspace) : null },
-      policy: { source: "defaults", hash: "default", error: null as string | null },
+      workspace: { path: workspace, isRepo, branch },
+      policy,
       openInbox: ledger.openInboxCount(),
       activeRuns: ledger.listRuns().filter((r) => !TERMINAL.has(r.state)).length,
     };

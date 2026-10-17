@@ -7,7 +7,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { OUTPUT_LIMIT, type Finding } from "./ledger.js";
 
-/** The shape policy.yml's `gates` list will use (C7). `cwd` is relative to the worktree. */
+/** One gate, as policy.yml's `gates` list gives it. `cwd` is relative to the worktree. */
 export interface Gate {
   name: string;
   run: string;

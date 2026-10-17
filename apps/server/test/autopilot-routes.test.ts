@@ -16,6 +16,7 @@ const { createOrchestrator } = await import("../src/autopilot/orchestrator.js");
 const { openLedger } = await import("../src/autopilot/ledger.js");
 const { OpenHandsClient } = await import("../src/autopilot/openhands.js");
 const { branchExists } = await import("../src/autopilot/git.js");
+const { DEFAULT_POLICY, policyHash } = await import("../src/autopilot/policy.js");
 
 type Json = Record<string, any>;
 
@@ -87,7 +88,7 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
       integrationBranch: "autopilot/add-a-status-page",
       costUsd: 0,
       budgetUsd: 12.5,
-      policyHash: null,
+      policyHash: policyHash(DEFAULT_POLICY), // no policy.yml: the defaults, pinned
       createdBy: "user:tester",
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -222,7 +223,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
         activeProfileId: "00000000-0000-4000-8000-000000000001",
       },
       workspace: { path: workspace, isRepo: false, branch: null },
-      policy: { source: "defaults", hash: "default", error: null },
+      policy: { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null },
       openInbox: 0,
       activeRuns: 0,
     });

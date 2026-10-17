@@ -2,6 +2,7 @@
 // follow-ups the orchestrator sends back. Pure functions of the run's data, so
 // a restart can rebuild a brief exactly. Briefs point at files rather than
 // pasting them, like briefs.ts does for hand-started work orders.
+import type { Gate } from "./gates.js";
 import type { Autonomy, Finding, WorkOrder } from "./ledger.js";
 import { clusterFindings } from "./review.js";
 
@@ -67,12 +68,16 @@ export function criticBrief(o: { change: string }): string {
   ].join("\n");
 }
 
-/** A builder's first message: one work order, built and tested in its own worktree. */
+/** A builder's first message: one work order, built and tested in its own worktree. `gates`: the policy's, when it lists them. */
 export function builderBrief(o: {
   change: string;
   wo: Pick<WorkOrder, "seq" | "title" | "acceptance" | "controls" | "branch" | "findings">;
+  gates?: Gate[] | null;
 }): string {
   const { wo } = o;
+  const checks = o.gates?.length
+    ? `When you finish, the factory runs these checks itself, in this order: ${o.gates.map((g) => `${g.name} (\`${g.run}\`${g.cwd ? ` in \`${g.cwd}/\`` : ""})`).join(", ")}. Make them pass.`
+    : "When you finish, the factory runs these checks itself: `npm run typecheck`, `npm run lint` and `npm run test` in every package (this folder and one folder down) that has those scripts, after installing dependencies where node_modules is missing. Make them pass. There must be at least one `test` script.";
   return [
     `You are a builder in a Software Factory Autopilot run. Build work order WO-${wo.seq}: ${wo.title}.`,
     "",
@@ -83,7 +88,7 @@ export function builderBrief(o: {
     ...(wo.controls.length ? ["", `Security controls this work order must meet, as design.md describes them: ${wo.controls.join(", ")}.`] : []),
     ...(wo.findings?.length ? ["", "A previous attempt at this work order failed:", "", clusterFindings(wo.findings), "", "Start from the code as it is now and avoid those problems."] : []),
     "",
-    "When you finish, the factory runs these checks itself: `npm run typecheck`, `npm run lint` and `npm run test` in every package (this folder and one folder down) that has those scripts, after installing dependencies where node_modules is missing. Make them pass. There must be at least one `test` script. Then a reviewer reads your diff against the acceptance criteria and the scenarios.",
+    `${checks} Then a reviewer reads your diff against the acceptance criteria and the scenarios.`,
     "",
     "Rules:",
     "- This folder is a git worktree made for this work order. Work only here.",

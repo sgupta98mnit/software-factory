@@ -91,6 +91,27 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 | `SF_AGENT_SERVER_KEY` | Canvas's saved key | The agent server's session key, if Canvas keeps it somewhere else |
 | `SF_AUTONOMY_CAP` | none | Highest Autopilot autonomy anyone can pick: `suggest`, `supervised` or `autonomous` |
 
+## Autopilot policy
+
+Each run reads `.factory/policy.yml` from the workspace's base branch when it starts and keeps it until the run ends. It never reads the file from a worktree or a work-order branch, so a change can't relax its own rules. Without the file, Autopilot uses these defaults. Set only the keys you want to change, and quote glob patterns:
+
+```yaml
+version: 1
+autonomy: { default: supervised, max: autonomous }   # the lower of max and SF_AUTONOMY_CAP wins
+agents: { spec: null, critic: null, builder: null, reviewer: null, validator: null }   # profile id or name; null = Canvas's active profile
+parallel: 3                                          # work orders building at once
+repair: { sameConversation: 2, fresh: 1 }
+spec: { validateTries: 3, criticRounds: 2 }
+review: { blocking: [critical, high] }
+gates: null                                          # null = npm typecheck/lint/test scripts; or [{ name, run, cwd?, timeoutSec? }]
+autoMerge:
+  maxChangedLines: 400
+  sensitivePaths: ["**/auth/**", "**/crypto/**", "infra/**", "**/*.tf", "Dockerfile", ".github/**", ".gitlab-ci.yml", ".factory/**", "AGENTS.md", "CLAUDE.md", "**/migrations/**"]
+  dependencyAllowlist: []
+```
+
+A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing`, `budget`, `hiddenTests` and `notify` are accepted for features still to come.
+
 ## Working on the Canvas side
 
 Factory UI code lives in `canvas\src\factory\`. Canvas is its own git repo on a `factory` branch, with OpenHands as the `upstream` remote.

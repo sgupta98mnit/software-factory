@@ -158,9 +158,10 @@ export async function resetHard(dir: string, sha: string): Promise<void> {
 
 /** Lines added and deleted per file between `base` and `head` (from their merge base). Binary files count 0. */
 export async function diffStat(dir: string, base: string, head = "HEAD") {
-  const out = (await git(dir, ["diff", "--numstat", "--no-renames", `${base}...${head}`])).stdout;
+  // -z: paths as they are. Without it git quotes one with a " or tab in it, and the policy's sensitive-path check would miss it.
+  const out = (await git(dir, ["diff", "--numstat", "-z", "--no-renames", `${base}...${head}`])).stdout;
   const files = out
-    .split("\n")
+    .split("\0")
     .filter(Boolean)
     .map((line) => {
       const [added = "0", deleted = "0", ...rest] = line.split("\t");

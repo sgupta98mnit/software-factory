@@ -7,9 +7,9 @@
 // from merging again once the builder has fixed them.
 import { rmSync } from "node:fs";
 import path from "node:path";
-import { detectGates, gateFindings, runGates, type GateResult } from "./gates.js";
+import { detectGates, gateFindings, runGates, type Gate, type GateResult } from "./gates.js";
 import { diffStat, discardChanges, headSha, isAncestor, merge, resetHard } from "./git.js";
-import type { Autonomy, Finding } from "./ledger.js";
+import type { Finding } from "./ledger.js";
 
 export type MergeResult =
   | { outcome: "merged"; sha: string; files: number; linesChanged: number; results: GateResult[] }
@@ -18,17 +18,6 @@ export type MergeResult =
 
 // A package whose manifest or lockfile a merge changed gets a fresh install (detectGates installs where node_modules is missing).
 const MANIFEST = /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json)$/;
-
-/**
- * Who decides a merge until .factory/policy.yml exists (C7: evaluateMerge).
- * Suggest: a person approves every merge. Otherwise work that passed its
- * gates and review merges, recorded as the policy's decision.
- */
-export function mergeDecision(autonomy: Autonomy): { auto: boolean; reasons: string[] } {
-  return autonomy === "suggest"
-    ? { auto: false, reasons: ["Autonomy is suggest: a person approves every merge."] }
-    : { auto: true, reasons: ["Its gates and review passed."] };
-}
 
 /** What the builder hears when its branch and the integration branch change the same lines. */
 export function conflictFinding(files: string[]): Finding {
@@ -46,13 +35,14 @@ export const integrationFindings = (results: GateResult[]): Finding[] =>
 
 /**
  * Merges `branch` into the integration worktree `dir` and runs the gates
- * there. `preMergeSha` is the integration sha before this merge, which the
- * caller has saved first, so this is safe to run again after a restart: a
- * merge left half done is thrown away and made again, and one already made
- * goes straight to the gates. A conflict leaves `dir` as it was; failing
- * gates reset it to `preMergeSha`.
+ * there: the policy's `gates`, or those detected once merged. `preMergeSha`
+ * is the integration sha before this merge, which the caller has saved
+ * first, so this is safe to run again after a restart: a merge left half
+ * done is thrown away and made again, and one already made goes straight to
+ * the gates. A conflict leaves `dir` as it was; failing gates reset it to
+ * `preMergeSha`.
  */
-export async function mergeAndTest(dir: string, branch: string, message: string, preMergeSha: string): Promise<MergeResult> {
+export async function mergeAndTest(dir: string, branch: string, message: string, preMergeSha: string, gates: Gate[] | null = null): Promise<MergeResult> {
   await discardChanges(dir); // also ends a merge that a restart interrupted
   if (!(await isAncestor(dir, branch, "HEAD"))) {
     const merged = await merge(dir, branch, message);
@@ -63,7 +53,7 @@ export async function mergeAndTest(dir: string, branch: string, message: string,
   const installed = stat.files.filter((f) => MANIFEST.test(f.path)).map((f) => path.join(dir, path.posix.dirname(f.path), "node_modules"));
   const uninstall = () => installed.forEach((d) => rmSync(d, { recursive: true, force: true, maxRetries: 3 }));
   uninstall();
-  const { ok, results } = await runGates(dir, detectGates(dir));
+  const { ok, results } = await runGates(dir, gates ?? detectGates(dir));
   await discardChanges(dir); // what the gates left behind (build output)
   if (!ok) {
     await resetHard(dir, preMergeSha);

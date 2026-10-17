@@ -5,7 +5,8 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { LOCAL_USER } from "../config.js";
 import type { Attempt, InboxItem, Run, WorkOrder } from "./ledger.js";
-import { PARALLEL, type Orchestrator } from "./orchestrator.js";
+import type { Orchestrator } from "./orchestrator.js";
+import { pinnedPolicy } from "./policy.js";
 
 // Work-order states that count as in progress.
 const ACTIVE_WO = new Set<string>(["building", "verifying", "reviewing", "ready", "awaiting_merge_approval", "merging"]);
@@ -15,7 +16,7 @@ const attemptView = ({ seenRunning: _s, lastSentAt: _l, ...a }: Attempt) => a;
 const inboxView = ({ notifiedAt: _n, ...item }: InboxItem) => item;
 
 /** median(dispatch -> merged) of merged work orders x the waves of work left; null until one has merged. */
-function etaMs(workOrders: WorkOrder[], attempts: Attempt[]): number | null {
+function etaMs(workOrders: WorkOrder[], attempts: Attempt[], parallel: number): number | null {
   const durations = workOrders
     .filter((w) => w.state === "merged")
     .map((w) => {
@@ -28,7 +29,7 @@ function etaMs(workOrders: WorkOrder[], attempts: Attempt[]): number | null {
   const mid = durations.length / 2;
   const median = durations.length % 2 ? (durations[Math.floor(mid)] ?? 0) : ((durations[mid - 1] ?? 0) + (durations[mid] ?? 0)) / 2;
   const remaining = workOrders.filter((w) => !FINISHED_WO.has(w.state)).length;
-  return median * Math.ceil(remaining / PARALLEL);
+  return median * Math.ceil(remaining / parallel);
 }
 
 export function createAutopilotRoutes(o: Orchestrator) {
@@ -126,7 +127,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       attempts: attempts.map(attemptView),
       checks: ledger.listChecks({ runId: run.id }),
       inbox: ledger.listInbox({ state: "all", runId: run.id }).map(inboxView),
-      etaMs: etaMs(workOrders, attempts),
+      etaMs: etaMs(workOrders, attempts, pinnedPolicy(run).parallel),
     });
   });
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -15,12 +15,12 @@ const { openLedger } = await import("../src/autopilot/ledger.js");
 const { OpenHandsClient } = await import("../src/autopilot/openhands.js");
 const { branchExists, fileAt, git, headSha } = await import("../src/autopilot/git.js");
 const { audit, listAudit } = await import("../src/audit.js");
+const { DEFAULT_POLICY, loadPolicy, policyHash } = await import("../src/autopilot/policy.js");
 
 // The demo workspace's OpenSpec folder, copied (never changed) into the full run's workspace.
 const FIXTURE = path.resolve(import.meta.dirname, "../../../workspaces/benefits-portal/openspec");
 const EXAMPLE = "add-claim-status-lookup";
 const PASS = 'Reviewed.\n\n```json\n{"verdict":"pass","findings":[]}\n```';
-const POLICY = "policy@default";
 // The same in every work order, so it merges cleanly.
 const PKG = JSON.stringify({ name: "demo", private: true, type: "module", scripts: { test: "node --test" } });
 
@@ -150,6 +150,8 @@ test("e2e, supervised: goal -> spec -> plan approval -> three work orders in two
   );
   try {
     const run = await t.o.createRun({ goal: "Add a sum and product report", autonomy: "supervised", actor: "user:test" });
+    const POLICY = `policy@${run.policyHash}`; // no policy.yml: the defaults
+    assert.equal(run.policyHash, policyHash(DEFAULT_POLICY));
     const approval = () => t.ledger.listInbox({ runId: run.id }).find((i) => i.kind === "plan_approval");
     await t.until(() => !!approval());
     assert.deepEqual(t.ledger.listWorkOrders(run.id).map((w) => [w.seq, w.wave]), [[1, 1], [2, 1], [3, 2]]);
@@ -308,6 +310,61 @@ test("e2e, suggest: nothing merges without a person; send back reaches the build
     const merged = await auditOf(run.id, "autopilot.work_order_merged");
     assert.deepEqual(merged.map((e) => [e.actor, e.data.reasons]), [["user:test", ["Autonomy is suggest: a person approves every merge."]]]);
     assert.deepEqual((await auditOf(run.id, "autopilot.run_completed")).map((e) => [e.data.merged, e.data.skipped]), [[1, 1]]);
+  } finally {
+    await t.close();
+  }
+});
+
+test("e2e, supervised with .factory/policy.yml on the base branch: a work order touching a sensitive path waits for a person while the next one merges as policy@<hash>, through the policy's own gates", async () => {
+  const t = await setup(
+    byRole({
+      builder: (conv) => {
+        if (conv.tags.sfwo === "1") {
+          mkdirSync(path.join(conv.workingDir, "secure"), { recursive: true });
+          writeFileSync(path.join(conv.workingDir, "secure", "keys.js"), "export const rotate = () => true;\n");
+        }
+        return build(conv);
+      },
+    }),
+  );
+  try {
+    mkdirSync(path.join(t.workspace, ".factory"));
+    writeFileSync(
+      path.join(t.workspace, ".factory", "policy.yml"),
+      ["# Anything under secure/ needs a person.", "autoMerge:", "  sensitivePaths: ['secure/**', '.factory/**']", "gates:", "  - { name: unit, run: node --test }", "parallel: 1", ""].join("\n"),
+    );
+    const run = await t.buildingRun(2); // createRun commits the workspace as it is, policy.yml included, and pins that
+    const { hash } = await loadPolicy(t.workspace, "main");
+    assert.equal(run.policyHash, hash);
+    assert.notEqual(hash, policyHash(DEFAULT_POLICY));
+    const policy = `policy@${hash}`;
+
+    let busy = 0; // the most work orders building, verifying or reviewing at once: the policy's parallel
+    await t.until(() => {
+      busy = Math.max(busy, t.ledger.listWorkOrders(run.id).filter((w) => ["building", "verifying", "reviewing"].includes(w.state)).length);
+      return t.states(run.id).join() === "1:awaiting_merge_approval,2:merged";
+    });
+    assert.equal(busy, 1);
+    assert.equal(t.wo(run.id, 2).mergedBy, policy);
+    // The policy's gates, not the detected npm ones, in the work order's worktree and on the integration branch.
+    assert.deepEqual(t.integrateChecks(run.id, 2), ["unit:ok"]);
+    assert.deepEqual(t.ledger.listChecks({ runId: run.id, workOrderId: `${run.id}/WO-1` }).map((c) => `${c.stage}:${c.name}`), ["build:unit"]);
+    assert.match(t.fake.conversations.get(t.builders(run.id, 1)[0]!.conversationId)?.messages[0] ?? "", /these checks itself, in this order: unit \(`node --test`\)/);
+    const item = t.item(run.id, "merge_approval", 1)!;
+    assert.match(item.body, /### Why it needs you\n- Changes sensitive paths: secure\/keys\.js \(secure\/\*\*\)\.\n/);
+
+    await t.o.decide(item.id, { choice: "merge" }, "user:test");
+    await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+    assert.equal(t.wo(run.id, 1).mergedBy, "user:test");
+    const merged = await auditOf(run.id, "autopilot.work_order_merged");
+    assert.deepEqual(
+      merged.map((e) => [e.data.workOrder, e.actor, e.data.reasons]),
+      [
+        ["WO-2", policy, []],
+        ["WO-1", "user:test", ["Changes sensitive paths: secure/keys.js (secure/**)."]],
+      ],
+    );
+    assert.deepEqual((await auditOf(run.id, "autopilot.policy_loaded")).map((e) => [e.data.hash, e.data.source]), [[hash, ".factory/policy.yml@main"]]);
   } finally {
     await t.close();
   }
