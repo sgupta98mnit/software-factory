@@ -88,6 +88,16 @@ export function createAutopilotRoutes(o: Orchestrator) {
     };
   }
 
+  /** The run's hidden acceptance tests and how each last ran (for people; builders never see this page). */
+  function hiddenView(runId: string) {
+    const checks = ledger.listChecks({ runId }).filter((c) => c.name.startsWith("hidden:"));
+    return ledger.listHiddenTests(runId).map((t) => {
+      const runs = checks.filter((c) => c.name === `hidden:${t.file}`);
+      const last = runs.at(-1);
+      return { file: t.file, scenario: t.scenario, requirement: t.requirement, requires: t.requires, sha256: t.sha256, runs: runs.length, lastOk: last ? last.ok : null, lastAt: last?.at ?? null };
+    });
+  }
+
   function workOrderView(wo: WorkOrder, attempts: Attempt[]) {
     const builds = attempts.filter((a) => a.workOrderId === wo.id && a.role === "builder");
     const last = builds.at(-1);
@@ -140,6 +150,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       attempts: attempts.map(attemptView),
       checks: ledger.listChecks({ runId: run.id }),
       inbox: ledger.listInbox({ state: "all", runId: run.id }).map(inboxView),
+      hiddenTests: hiddenView(run.id),
       etaMs: etaMs(run.state, workOrders, attempts, pinnedPolicy(run).parallel),
     });
   });

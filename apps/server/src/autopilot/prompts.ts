@@ -127,6 +127,38 @@ export function reviewerBrief(o: {
   ].join("\n");
 }
 
+/**
+ * The validator's first message: black-box acceptance tests, one per scenario,
+ * written before the code. Its folder holds a copy of the change (spec/) and
+ * the plan (plan.md); the tests it writes stay there, out of every builder's sight.
+ */
+export function validatorBrief(o: { change: string; workOrders: Pick<WorkOrder, "seq" | "title" | "acceptance">[]; run: string }): string {
+  return [
+    `You are the validator in a Software Factory Autopilot run. Write hidden acceptance tests for the OpenSpec change \`${o.change}\` before any of it is built.`,
+    "",
+    "This folder holds a copy of the change in `spec/` (proposal.md, design.md, specs/, tasks.md) and the plan in `plan.md`. Builders never see your tests: the factory runs them against each work order after its own checks pass, and tells the builder only which scenario failed and the first assertion line.",
+    "",
+    "Write one test file per `#### Scenario:` in spec/specs/, in `tests/`, named `<scenario-slug>.test.mjs`. Each file starts with this header, filled in:",
+    "",
+    "```js",
+    "// scenario: <the scenario's name, exactly as in the spec>",
+    "// requirement: <its requirement's name>",
+    "// requires: WO-2, WO-3   (the work orders whose code it needs; see plan.md)",
+    "```",
+    "",
+    "Rules:",
+    `- Black-box: test the behavior the scenario's WHEN/THEN lines and design.md describe (the module paths, function names, HTTP routes and messages they name), not how it's built. Each file is copied into \`.factory-hidden/\` at the root of the code under test and run from there with \`${o.run} <file>\`, so import application code as \`../<path from the repository root>\`.`,
+    "- Use node:test, node:assert and other node: built-ins only. No dependencies, no network.",
+    "- Assert what the scenario says, including its error cases. Never weaken a test to make it easier to pass.",
+    "- Don't write application code and don't change `spec/`.",
+    "",
+    "Plan:",
+    ...o.workOrders.map((w) => `- WO-${w.seq}: ${w.title} (${w.acceptance.join("; ")})`),
+    "",
+    "Finish with a list of the files you wrote and the scenario each covers.",
+  ].join("\n");
+}
+
 /** Sent to the same builder conversation when its work failed a gate or the review. */
 export function repairMessage(findings: Finding[]): string {
   return [

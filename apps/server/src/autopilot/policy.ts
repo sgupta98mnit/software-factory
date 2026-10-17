@@ -61,7 +61,8 @@ export const DEFAULT_POLICY: Policy = {
     dependencyAllowlist: [],
   },
   budget: { perWorkOrderUsd: 5, perChangeUsd: 30 },
-  hiddenTests: { enabled: true, run: "node --test" },
+  // Opt-in: one more agent per run, and specs concrete enough to test black-box.
+  hiddenTests: { enabled: false, run: "node --test" },
   notify: { digestHour: 17 },
 };
 
@@ -193,6 +194,7 @@ export interface MergeFacts {
   autonomy: Autonomy;
   gatesOk: boolean;
   hiddenTestsOk: boolean | null; // null: not run
+  hiddenTestsMissing?: boolean; // turned on, but the validator wrote none
   reviewPassed: boolean; // a pass verdict with no finding of a blocking severity
   secretFindings: number;
   dependencyFindings: string[]; // what the dependency scan flagged (unpinned, outside the registry, install scripts)
@@ -234,6 +236,7 @@ export function evaluateMerge(policy: Policy, facts: MergeFacts): { auto: boolea
   if (facts.autonomy === "suggest") reasons.push("Autonomy is suggest: a person approves every merge.");
   if (!facts.gatesOk) reasons.push("Not every gate passed.");
   if (facts.hiddenTestsOk === false) reasons.push("Hidden acceptance tests failed.");
+  if (facts.hiddenTestsMissing) reasons.push("Hidden acceptance tests are turned on, but the validator wrote none for this change.");
   if (!facts.reviewPassed) reasons.push(`The review didn't pass, or found something ${policy.review.blocking.join(" or ")}.`);
   if (facts.secretFindings > 0) reasons.push(`The secret scan found ${facts.secretFindings} possible secret(s) in the added lines.`);
   const unlisted = facts.newDependencies.filter((d) => !autoMerge.dependencyAllowlist.some((p) => p === d || path.posix.matchesGlob(d, p)));

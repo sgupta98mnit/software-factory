@@ -6,6 +6,7 @@
 // - spec: an OpenSpec change for the goal with three task groups (two
 //   independent, one that uses both), scenarios and a Controls table
 // - critic and reviewer: a pass verdict
+// - validator (when the policy turns hidden tests on): a black-box test per scenario
 // - builder: a small module and a node:test test per work order. The second
 //   work order's first try has a bug its test catches, so the repair loop
 //   shows; the third touches `src/auth/`, a sensitive path, so its merge waits
@@ -191,6 +192,17 @@ function builtFiles(cap: string, seq: number, buggy: boolean): Record<string, st
   }
 }
 
+/** The scripted validator's hidden tests: one per scenario of scriptedChange, against what the builders write. */
+function hiddenTestFiles(cap: string): Record<string, string> {
+  const head = (scenario: string, requirement: string, wo: number) =>
+    `// scenario: ${scenario}\n// requirement: ${requirement}\n// requires: WO-${wo}\nimport { test } from "node:test";\nimport assert from "node:assert/strict";\n`;
+  return {
+    "valid-request.test.mjs": `${head("Valid request", "Core behavior", 1)}import { handle } from "../src/${cap}/core.js";\ntest("a valid input gives ok", () => assert.equal(handle("claim AB-123456").ok, true));\n`,
+    "missing-input.test.mjs": `${head("Missing input", "Input validation", 2)}import { validate } from "../src/${cap}/validate.js";\ntest("an empty input is rejected with a message", () => {\n  const r = validate("");\n  assert.equal(r.ok, false);\n  assert.ok(r.message && r.message.length > 0);\n});\n`,
+    "request-is-audited.test.mjs": `${head("Request is audited", "Audit every request", 3)}import { audit, records } from "../src/${cap}/audit.js";\ntest("one record, without the raw input", () => {\n  audit("raw-input-7731", true);\n  assert.equal(records.length, 1);\n  assert.ok(!JSON.stringify(records).includes("raw-input-7731"));\n});\n`,
+  };
+}
+
 const PASS = (what: string) => `${what}\n\n\`\`\`json\n{ "verdict": "pass", "findings": [] }\n\`\`\``;
 
 /** One handler for every role, picked by the conversation's `sfrole` tag. */
@@ -207,6 +219,12 @@ export function scriptedAgents(opts: ScriptedOptions = {}): FakeHandler {
       return { response: `Wrote the OpenSpec change \`${change}\`: three task groups, five scenarios, three controls.`, cost: 0.42 };
     }
     if (role === "critic") return { response: PASS("The scenarios are testable and each control has a task."), cost: 0.08 };
+    if (role === "validator") {
+      const change = /OpenSpec change `([^`]+)`/.exec(conv.messages[0] ?? "")?.[1] ?? "demo-change";
+      const files = hiddenTestFiles(capabilityOf(change));
+      for (const [file, text] of Object.entries(files)) write(path.join(conv.workingDir, "tests", file), text);
+      return { response: `Wrote ${Object.keys(files).length} hidden acceptance tests: ${Object.keys(files).join(", ")}.`, cost: 0.21 };
+    }
     if (role === "reviewer") return { response: PASS("Every acceptance criterion has a test, and the error cases are covered."), cost: 0.11 };
     if (role === "builder") {
       const seq = Number(conv.tags.sfwo ?? "1");

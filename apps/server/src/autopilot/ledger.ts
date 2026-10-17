@@ -162,6 +162,16 @@ export interface InboxItem {
   notifiedAt: string | null;
 }
 
+export interface HiddenTestRow {
+  runId: string;
+  file: string;
+  scenario: string;
+  requirement: string | null;
+  requires: number[];
+  sha256: string;
+  createdAt: string;
+}
+
 export type NewRun = Pick<Run, "goal" | "change" | "autonomy" | "baseBranch" | "integrationBranch" | "createdBy"> &
   Partial<Omit<Run, "createdAt" | "updatedAt">>;
 export type NewWorkOrder = Pick<WorkOrder, "seq" | "title" | "acceptance" | "controls" | "dependsOn" | "wave" | "risk"> &
@@ -281,11 +291,25 @@ CREATE TABLE meta (
 );
 `;
 
-type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox";
-const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox"];
+// v5: the hidden acceptance tests a run's validator wrote, with the hash each must keep.
+const SCHEMA_V5 = `
+CREATE TABLE hidden_tests (
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  file TEXT NOT NULL,
+  scenario TEXT NOT NULL,
+  requirement TEXT,
+  requires TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, file)
+);
+`;
+
+type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
+const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
-const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options"]);
+const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "requires"]);
 const FLAG_COLUMNS = new Set(["seen_running", "ok"]);
 const toColumn = (field: string) => field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toField = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -339,6 +363,7 @@ export function openLedger(file: string) {
   if (version < 2) transaction(() => db.exec(`${SCHEMA_V2}\nPRAGMA user_version = 2;`));
   if (version < 3) transaction(() => db.exec(`${SCHEMA_V3}\nPRAGMA user_version = 3;`));
   if (version < 4) transaction(() => db.exec(`${SCHEMA_V4}\nPRAGMA user_version = 4;`));
+  if (version < 5) transaction(() => db.exec(`${SCHEMA_V5}\nPRAGMA user_version = 5;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),
@@ -544,6 +569,20 @@ export function openLedger(file: string) {
     return count("SELECT COUNT(*) AS n FROM inbox WHERE state = 'open'", {});
   }
 
+  // Hidden acceptance tests (written once per run by its validator)
+
+  function setHiddenTests(runId: string, tests: Omit<HiddenTestRow, "runId" | "createdAt">[]) {
+    const at = now();
+    transaction(() => {
+      db.prepare("DELETE FROM hidden_tests WHERE run_id = $runId").run({ runId });
+      for (const t of tests) insert("hidden_tests", { ...t, runId, createdAt: at });
+    });
+  }
+
+  function listHiddenTests(runId: string): HiddenTestRow[] {
+    return all<HiddenTestRow>("SELECT * FROM hidden_tests WHERE run_id = $runId ORDER BY file", { runId });
+  }
+
   // Meta (key -> text)
 
   function getMeta(key: string): string | null {
@@ -591,6 +630,8 @@ export function openLedger(file: string) {
     decideInbox,
     dismissInbox,
     markNotified,
+    setHiddenTests,
+    listHiddenTests,
     openInboxCount,
     getMeta,
     setMeta,

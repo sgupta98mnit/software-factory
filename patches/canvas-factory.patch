@@ -91,10 +91,10 @@ index 0000000..cfc572e
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..12415f8
+index 0000000..c039abe
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,476 @@
+@@ -0,0 +1,489 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -411,11 +411,24 @@ index 0000000..12415f8
 +  workOrderKey: string | null;
 +}
 +
++/** A hidden acceptance test the run's validator wrote, and how it last ran. */
++export interface HiddenTestView {
++  file: string;
++  scenario: string;
++  requirement: string | null;
++  requires: number[];
++  sha256: string;
++  runs: number;
++  lastOk: boolean | null;
++  lastAt: string | null;
++}
++
 +export interface RunDetail extends RunSummary {
 +  workOrders: AutopilotWorkOrder[];
 +  attempts: Attempt[];
 +  checks: Check[];
 +  inbox: InboxItem[];
++  hiddenTests: HiddenTestView[];
 +  /** null until a work order has merged. */
 +  etaMs: number | null;
 +}
@@ -1618,10 +1631,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..d9e9a1f
+index 0000000..66fad9c
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,875 @@
+@@ -0,0 +1,893 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1825,6 +1838,12 @@ index 0000000..d9e9a1f
 +    specStage: "Spec",
 +    noSpecYet: "The spec agent is starting.",
 +    activity: "History in the audit log",
++    hidden: "Hidden acceptance tests",
++    hiddenHelp:
++      "Written by the validator from the scenarios before any code, and kept out of the builders' sight. A builder hears only which scenario failed.",
++    hiddenNeeds: (keys: string) => `Needs ${keys}`,
++    hiddenNotRun: "Not run yet",
++    hiddenRuns: (n: number) => (n === 1 ? "ran once" : `ran ${n} times`),
 +    detail: {
 +      close: "Close details",
 +      acceptance: "Acceptance criteria",
@@ -2056,6 +2075,8 @@ index 0000000..d9e9a1f
 +      "autopilot.integration_restored": "Put the integration branch back",
 +      "autopilot.secrets_found": "The secret scan found something",
 +      "autopilot.notification_sent": "Told the team",
++      "autopilot.hidden_tests_written": "The validator wrote hidden tests",
++      "autopilot.hidden_tests_missing": "The validator wrote no hidden tests",
 +    } as Record<string, string>,
 +  },
 +};
@@ -2253,6 +2274,13 @@ index 0000000..d9e9a1f
 +    specStage: "Especificación",
 +    noSpecYet: "El agente de especificación está empezando.",
 +    activity: "Historial en el registro de auditoría",
++    hidden: "Pruebas de aceptación ocultas",
++    hiddenHelp:
++      "Las escribe el validador a partir de los escenarios antes del código, fuera de la vista de los constructores. Un constructor solo sabe qué escenario falló.",
++    hiddenNeeds: (keys) => `Necesita ${keys}`,
++    hiddenNotRun: "Aún no se ha ejecutado",
++    hiddenRuns: (n) =>
++      n === 1 ? "se ejecutó una vez" : `se ejecutó ${n} veces`,
 +    detail: {
 +      close: "Cerrar detalles",
 +      acceptance: "Criterios de aceptación",
@@ -2485,6 +2513,9 @@ index 0000000..d9e9a1f
 +      "autopilot.integration_restored": "Restauró la rama de integración",
 +      "autopilot.secrets_found": "El análisis de secretos encontró algo",
 +      "autopilot.notification_sent": "Avisó al equipo",
++      "autopilot.hidden_tests_written": "El validador escribió pruebas ocultas",
++      "autopilot.hidden_tests_missing":
++        "El validador no escribió pruebas ocultas",
 +    },
 +  },
 +};
@@ -3133,10 +3164,10 @@ index 0000000..380b38f
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..3d195a4
+index 0000000..176d801
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,757 @@
+@@ -0,0 +1,813 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -3144,6 +3175,7 @@ index 0000000..3d195a4
 +  ArrowLeft,
 +  ChevronRight,
 +  CircleCheck,
++  CircleDashed,
 +  CircleX,
 +  GitBranch,
 +  History,
@@ -3472,6 +3504,7 @@ index 0000000..3d195a4
 +      </section>
 +
 +      <SpecSection run={run} />
++      {run.hiddenTests.length ? <HiddenTests run={run} /> : null}
 +
 +      <Link
 +        to={`/audit-log?q=${encodeURIComponent(run.id)}`}
@@ -3654,6 +3687,60 @@ index 0000000..3d195a4
 +        <AttemptList attempts={attempts} />
 +      )}
 +      {checks.length ? <CheckList checks={checks} /> : null}
++    </section>
++  );
++}
++
++function HiddenTests({ run }: { run: RunDetail }) {
++  const copy = useFactoryCopy();
++  return (
++    <section aria-labelledby="factory-hidden" className="flex flex-col gap-2">
++      <div>
++        <h2
++          id="factory-hidden"
++          className="text-sm font-semibold text-foreground"
++        >
++          {copy.pipeline.hidden}
++        </h2>
++        <p className="text-xs text-muted">{copy.pipeline.hiddenHelp}</p>
++      </div>
++      <ul className="flex flex-col gap-1">
++        {run.hiddenTests.map((t) => (
++          <li
++            key={t.file}
++            className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm"
++          >
++            {t.lastOk === null ? (
++              <CircleDashed
++                className="size-4 shrink-0 text-muted"
++                aria-label={copy.pipeline.hiddenNotRun}
++              />
++            ) : t.lastOk ? (
++              <CircleCheck
++                className="size-4 shrink-0 text-success"
++                aria-label={copy.pipeline.labels.passed}
++              />
++            ) : (
++              <CircleX
++                className="size-4 shrink-0 text-feedback-error"
++                aria-label={copy.pipeline.labels.failed}
++              />
++            )}
++            <span className="text-foreground">{t.scenario}</span>
++            <span className="text-xs text-muted">
++              {copy.pipeline.hiddenNeeds(
++                t.requires.map((r) => `WO-${r}`).join(", "),
++              )}
++            </span>
++            <span className="text-xs text-muted">
++              {t.runs
++                ? copy.pipeline.hiddenRuns(t.runs)
++                : copy.pipeline.hiddenNotRun}
++            </span>
++            <span className="font-mono text-xs text-muted">{t.file}</span>
++          </li>
++        ))}
++      </ul>
 +    </section>
 +  );
 +}

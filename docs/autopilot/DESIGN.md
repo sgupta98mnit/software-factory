@@ -39,6 +39,7 @@ Goal ─▶ spec agent ─▶ openspec validate --strict ─▶ commit ─▶ cr
 | `prompts.ts` | Every brief and follow-up, rebuilt from the ledger |
 | `scan.ts` | Secret scan of added lines, dependency scan of package.json changes |
 | `notify.ts` | Slack/Teams webhook alerts: one alert, then a daily digest |
+| `hidden.ts` | Hidden acceptance tests: headers, selection, running, findings by scenario |
 | `routes.ts` | HTTP API under `/sf-api/autopilot` (§5) |
 | `../demo/` | Fake agent server and scripted agents (tests, `pnpm demo`) |
 
@@ -179,7 +180,26 @@ inbox titles and a link to the Inbox (`SF_PUBLIC_URL`), never goals, notes or
 the URL; each send is audited as `autopilot.notification_sent`. The markers
 live in the ledger's `meta` table (schema v4); a failed send is retried.
 
-## 10. Changes since the first build
+## 10. Hidden acceptance tests (opt-in: `hiddenTests.enabled`)
+
+- When a run starts building, the validator (role `validator`, profile
+  `agents.validator`) works in `data/hidden-tests/<runId>/`: a copy of the
+  change in `spec/`, the plan in `plan.md`, its tests in `tests/`, one per
+  scenario with a `// scenario / requirement / requires: WO-n` header.
+- When it finishes, each file's SHA-256 goes into `hidden_tests` (schema v5);
+  a file that changes later fails as tampered instead of running.
+- A work order's gate job runs its gates, then the tests it can satisfy (all
+  it `requires` is it or merged), copied into `<worktree>/.factory-hidden/`
+  for the run and removed after. A merge's job runs everything merged so far.
+  Work orders wait in `verifying` until the validator has finished.
+- Failures reach the builder as `Scenario "X": A hidden acceptance test fails:
+  <first assertion line>`; the output is a check for people.
+- No tests written (the validator failed or wrote none) puts every merge in
+  front of a person (`hiddenTestsMissing`).
+- `GET /runs/:id` includes `hiddenTests` (file, scenario, requires, sha256,
+  runs, lastOk); the Pipeline lists them.
+
+## 11. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

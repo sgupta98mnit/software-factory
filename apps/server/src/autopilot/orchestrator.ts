@@ -13,7 +13,7 @@
 // One run is handled by one thing at a time: the scheduler's step for it, or
 // a person's decision, pause or cancel, which wait for that step to finish.
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { audit, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
@@ -42,7 +42,8 @@ import {
   squash,
 } from "./git.js";
 import { describeFindings, scanDependencies, scanSecrets, type ScanFinding } from "./scan.js";
-import { prepareMerge, settleMerge, type MergeResult, type Prepared } from "./integrator.js";
+import { hiddenFindings, listHiddenTests as listHiddenTestFiles, runHiddenTests, testsAfterMerge, testsFor, type HiddenTest } from "./hidden.js";
+import { integrationFindings, prepareMerge, settleMerge, type MergeResult, type Prepared } from "./integrator.js";
 import type {
   Attempt,
   AttemptRole,
@@ -70,6 +71,7 @@ import {
   reviseFollowUp,
   specBrief,
   validateFollowUp,
+  validatorBrief,
   verdictReminder,
 } from "./prompts.js";
 import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash, type Policy } from "./policy.js";
@@ -407,9 +409,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /** Records a new attempt before asking the agent server for it (write-ahead), then starts it. */
-  async function startAgent(run: Run, role: "spec" | "critic") {
+  async function startAgent(run: Run, role: "spec" | "critic" | "validator") {
     const { agents } = pinnedPolicy(run);
-    const who = role === "spec" ? await profile(agents.spec) : await checkerProfile(agents.critic, latest(run.id, "spec")?.agentProfile);
+    const who =
+      role === "spec" ? await profile(agents.spec) : role === "validator" ? await profile(agents.validator) : await checkerProfile(agents.critic, latest(run.id, "spec")?.agentProfile);
     const attempt = ledger.transaction(() => {
       const a = ledger.addAttempt({ runId: run.id, role, conversationId: randomUUID(), agentProfile: who.id });
       if (role === "spec") ledger.updateRun(run.id, { specConversation: a.conversationId });
@@ -423,6 +426,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   function briefFor(run: Run, a: Attempt, wo: WorkOrder | undefined): string {
     if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo }) : builderBrief({ change: run.change, wo, gates: pinnedPolicy(run).gates });
     if (a.role === "critic") return criticBrief({ change: run.change });
+    if (a.role === "validator") return validatorBrief({ change: run.change, workOrders: ledger.listWorkOrders(run.id), run: pinnedPolicy(run).hiddenTests.run });
     // A spec agent started after one that failed (or whose tasks.md couldn't be planned) hears why.
     const before = ledger.listAttempts({ runId: run.id, role: "spec" }).filter((x) => x.id < a.id).at(-1);
     const problem = (before?.result as { reason?: string } | null)?.reason ?? null;
@@ -433,7 +437,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function startConversation(a: Attempt) {
     const run = ledger.getRun(a.runId);
     const wo = a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined;
-    const dir = wo ? wo.worktree : run?.integrationDir; // builders and reviewers work in their work order's worktree
+    // Builders and reviewers work in their work order's worktree; the validator in the hidden-tests folder.
+    const dir = wo ? wo.worktree : a.role === "validator" && run ? hiddenDir(run) : run?.integrationDir;
     if (!run || !dir || !a.agentProfile) throw new Error(`Attempt ${a.id} has no worktree or agent profile to start with`);
     try {
       const snap = await client.start({
@@ -722,6 +727,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    */
   async function buildStep(run: Run) {
     if (!(await guardIntegration(run))) return;
+    await validatorStep(run);
     for (const wo of ledger.listWorkOrders(run.id)) {
       try {
         if (wo.state === "building") await builderStep(run, wo);
@@ -824,12 +830,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const outcome = takeJob(key);
     if (outcome === "running") return;
     if (!outcome || outcome.aborted) {
-      startJob(run.id, key, (signal) => runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal }));
+      if (hiddenState(run) === "waiting") return; // its hidden tests aren't written yet
+      const tests = testsFor(hiddenTests(run), wo.seq, mergedSeqs(run));
+      startJob(run.id, key, (signal) => gatesThenHidden(run, dir, tests, signal));
       return;
     }
     const { ok, results } = outcome;
     recordGates(run, wo, "build", results);
-    if (!ok) return repair(run, wo, gateFindings(results));
+    if (!ok) return repair(run, wo, splitFindings(run, results, "work order"));
     // The factory's own scans of what the work order adds: a secret goes back to the builder; dependency
     // findings are recorded here and decided at merge time by the policy (or a person).
     const base = wo.baseSha as string;
@@ -843,6 +851,76 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: "dependency-scan", ok: !deps.length, exitCode: deps.length ? 1 : 0, output: deps.length ? `A person decides these at merge time:\n${describeFindings(deps)}` : "No dependency changes to look at." });
     await discardChanges(dir); // what the gates left (build output), so anything left after the review is the reviewer's
     await startReviewer(run, wo);
+  }
+
+  // ---- hidden acceptance tests ----
+
+  const hiddenDir = (run: Run) => path.join(deps.dataDir, "hidden-tests", run.id);
+  const testsDir = (run: Run) => path.join(hiddenDir(run), "tests");
+  const hiddenTests = (run: Run): HiddenTest[] => ledger.listHiddenTests(run.id);
+  const mergedSeqs = (run: Run) => new Set(ledger.listWorkOrders(run.id).filter((w) => w.state === "merged").map((w) => w.seq));
+
+  /** off (the policy doesn't ask), waiting (the validator is writing), ready (there are tests), missing (it wrote none). */
+  function hiddenState(run: Run): "off" | "waiting" | "ready" | "missing" {
+    if (!pinnedPolicy(run).hiddenTests.enabled) return "off";
+    const v = latest(run.id, "validator");
+    if (!v || !handled(v)) return "waiting";
+    return hiddenTests(run).length ? "ready" : "missing";
+  }
+
+  /**
+   * The validator: started when the run starts building, in a folder of its
+   * own with a copy of the change and the plan. Builders start at the same
+   * time; a work order's checks wait for its tests. What it wrote is hashed
+   * into the ledger, so a test that changes afterwards isn't run.
+   */
+  async function validatorStep(run: Run) {
+    if (!pinnedPolicy(run).hiddenTests.enabled) return;
+    const v = latest(run.id, "validator");
+    if (!v) {
+      const dir = hiddenDir(run);
+      mkdirSync(path.join(dir, "tests"), { recursive: true });
+      const change = path.join(run.integrationDir as string, "openspec", "changes", run.change);
+      if (existsSync(change)) cpSync(change, path.join(dir, "spec"), { recursive: true });
+      const plan = ledger.listWorkOrders(run.id).map((w) =>
+        [`## WO-${w.seq}: ${w.title}`, `Wave ${w.wave}${w.dependsOn.length ? `, after ${w.dependsOn.map((d) => `WO-${d}`).join(", ")}` : ""}`, ...w.acceptance.map((x) => `- ${x}`), ""].join("\n"),
+      );
+      writeFileSync(path.join(dir, "plan.md"), `# Plan for ${run.change}\n\n${plan.join("\n")}`);
+      return startAgent(run, "validator");
+    }
+    if (ACTIVE.has(v.state) || v.state === "paused" || handled(v)) return;
+    const tests = v.state === "finished" ? listHiddenTestFiles(testsDir(run)) : [];
+    ledger.transaction(() => {
+      ledger.setHiddenTests(run.id, tests.map(({ file, scenario, requirement, requires, sha256 }) => ({ file, scenario, requirement, requires, sha256 })));
+      markHandled(v, { outcome: tests.length ? "written" : "none", tests: tests.length });
+    });
+    record(SYSTEM, tests.length ? "autopilot.hidden_tests_written" : "autopilot.hidden_tests_missing", run.id, {
+      tests: tests.length,
+      scenarios: tests.map((t) => t.scenario).slice(0, 50),
+      ...(v.state === "finished" ? {} : { validator: v.state }),
+    });
+    changed(run.id);
+  }
+
+  /** The gates, then (when they pass) the hidden tests in `tests`, as one outcome. */
+  async function gatesThenHidden(run: Run, dir: string, tests: HiddenTest[], signal: AbortSignal): Promise<GatesOutcome> {
+    const gates = await runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal });
+    if (!gates.ok || !tests.length) return gates;
+    const manifest = new Map(tests.map((t) => [t.file, t.sha256]));
+    const hidden = await runHiddenTests(dir, testsDir(run), tests, pinnedPolicy(run).hiddenTests.run, manifest, signal);
+    const results = [...gates.results, ...hidden.map((h) => h.result)];
+    return { ok: !signal.aborted && results.every((r) => r.ok), results, aborted: signal.aborted };
+  }
+
+  /** Gate failures with their output; hidden-test failures by scenario and first assertion only. */
+  function splitFindings(run: Run, results: GateResult[], where: "work order" | "integration"): Finding[] {
+    const byFile = new Map(hiddenTests(run).map((t) => [`hidden:${t.file}`, t]));
+    const gates = results.filter((r) => !byFile.has(r.name));
+    const hidden = results.flatMap((r) => {
+      const test = byFile.get(r.name);
+      return test ? [{ test, result: r }] : [];
+    });
+    return [...(where === "integration" ? integrationFindings(gates) : gateFindings(gates)), ...hiddenFindings(hidden, where)];
   }
 
   /** What the builder hears about secrets: where and what kind, never the value. */
@@ -1145,7 +1223,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const decision = evaluateMerge(policy, {
       autonomy: run.autonomy,
       gatesOk: true, // a work order is ready only once its gates have passed (verify)
-      hiddenTestsOk: null, // not run yet (C11)
+      hiddenTestsOk: hiddenResult(run, wo),
+      hiddenTestsMissing: hiddenState(run) === "missing",
       reviewPassed: !!review?.verdict && passed(review, policy.review.blocking),
       // Scanned again here, on the branch as it will merge (verify scanned the worktree).
       secretFindings: scanSecrets(await addedLines(workspace, base, head)).length,
@@ -1155,6 +1234,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       newDependencies: await newDependencies(workspace, base, head, files),
     });
     return { ...decision, stat };
+  }
+
+  /** Did the hidden tests the work order was held to pass at its last verification? null when none applied. */
+  function hiddenResult(run: Run, wo: WorkOrder): boolean | null {
+    const lastBuild = builders(wo).at(-1);
+    const hidden = ledger
+      .listChecks({ runId: run.id, workOrderId: wo.id })
+      .filter((c) => c.stage === "build" && c.name.startsWith("hidden:") && (!lastBuild || c.at >= lastBuild.startedAt));
+    return hidden.length ? hidden.every((c) => c.ok) : null;
   }
 
   /** A person sees why the policy didn't merge it, and what it changes. */
@@ -1224,11 +1312,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (merge.outcome === "ready") {
         ledger.updateWorkOrder(wo.id, { mergeSha: merge.sha }); // the one tip besides integrationSha the guard accepts
         prepared.set(jobKey, merge);
-        startJob(run.id, jobKey, (signal) => runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal }));
+        const tests = testsAfterMerge(hiddenTests(run), wo.seq, mergedSeqs(run));
+        startJob(run.id, jobKey, (signal) => gatesThenHidden(run, dir, tests, signal));
         return;
       }
       r = merge;
     }
+    // Hidden tests on the integration branch reach the builder by scenario only.
+    if (r.outcome === "reverted") r = { ...r, findings: splitFindings(run, r.results, "integration") };
     if (r.results.length) recordGates(run, wo, "integrate", r.results);
     if (r.outcome === "merged") {
       ledger.transaction(() => {
