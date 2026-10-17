@@ -91,10 +91,10 @@ index 0000000..cfc572e
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..7c78882
+index 0000000..c3499e3
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,471 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -388,6 +388,7 @@ index 0000000..7c78882
 +  | "budget_reached"
 +  | "run_paused"
 +  | "error"
++  | "integration_moved"
 +  | "release";
 +
 +export interface InboxItem {
@@ -1612,10 +1613,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..bde40f0
+index 0000000..ec1f3ef
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,853 @@
+@@ -0,0 +1,857 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1884,6 +1885,7 @@ index 0000000..bde40f0
 +      budget_reached: "Budget reached",
 +      run_paused: "Run paused",
 +      error: "Stopped on an error",
++      integration_moved: "Integration branch moved",
 +      release: "Release",
 +    } as Record<string, string>,
 +    decidedToast: "Decision recorded",
@@ -2037,6 +2039,7 @@ index 0000000..bde40f0
 +      "autopilot.inbox_opened": "Asked a person",
 +      "autopilot.inbox_decided": "Decided",
 +      "autopilot.workspace_initialized": "Made the workspace a git repo",
++      "autopilot.integration_restored": "Put the integration branch back",
 +    } as Record<string, string>,
 +  },
 +};
@@ -2303,6 +2306,7 @@ index 0000000..bde40f0
 +      budget_reached: "Presupuesto alcanzado",
 +      run_paused: "Ejecución en pausa",
 +      error: "Detenida por un error",
++      integration_moved: "La rama de integración cambió",
 +      release: "Publicación",
 +    },
 +    decidedToast: "Decisión registrada",
@@ -2457,6 +2461,7 @@ index 0000000..bde40f0
 +      "autopilot.inbox_decided": "Decidió",
 +      "autopilot.workspace_initialized":
 +        "Convirtió el espacio de trabajo en repositorio git",
++      "autopilot.integration_restored": "Restauró la rama de integración",
 +    },
 +  },
 +};

@@ -318,14 +318,16 @@ test("a dispatch that throws stops only its work order, with an error item whose
   try {
     const run = await t.buildingRun();
     const tip = await headSha(t.workspace, run.integrationBranch);
-    await git(t.workspace, ["update-ref", "-d", `refs/heads/${run.integrationBranch}`]); // nothing to branch from
+    // A ref in the way of the work order's branch name (git can't have both x and x/y): its worktree can't be made.
+    const blocker = `refs/heads/${run.integrationBranch}--wo-1/blocker`;
+    await git(t.workspace, ["update-ref", blocker, tip]);
     await t.until(() => t.wo(run.id).state === "needs_attention");
     assert.equal(t.ledger.getRun(run.id)?.state, "building");
     const item = t.ledger.listInbox({ runId: run.id }).find((i) => i.kind === "error" && i.workOrderId === `${run.id}/WO-1`)!;
     assert.deepEqual(item.options.map((o) => o.id), ["retry", "skip", "cancel"]);
     assert.equal(t.wo(run.id).resumeState, "pending");
 
-    await git(t.workspace, ["update-ref", `refs/heads/${run.integrationBranch}`, tip]);
+    await git(t.workspace, ["update-ref", "-d", blocker]);
     await t.o.decide(item.id, { choice: "retry" }, "user:test");
     await t.until(() => t.wo(run.id).state === PASSED);
   } finally {

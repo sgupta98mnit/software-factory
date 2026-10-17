@@ -112,6 +112,7 @@ or its work orders move.
 | `error` (work order) | retry (from where it threw), skip, cancel |
 | `merge_approval` | merge, send_back (note), skip |
 | `run_paused` | resume, cancel |
+| `integration_moved` | restore (put the branch back where the factory left it), cancel |
 
 `budget_reached` and `release` are reserved kinds (see OPEN-ISSUES.md for status).
 
@@ -123,7 +124,14 @@ or its work orders move.
   fixed conversation id, so a restart can start the same conversation again.
 - An end state right after a follow-up counts only once the conversation was
   seen running or 20 s passed (`classify`).
-- The reviewer and critic only read: whatever they change is thrown away and recorded.
+- The reviewer and critic only read: whatever they change or commit is thrown away and recorded.
+- The integration branch is the factory's alone. The run keeps the sha it last
+  wrote (`integrationSha`: branch creation, the spec commit, each tested merge);
+  before every build step and before delivering, a branch that moved (or a
+  worktree switched to another branch) pauses the run with an
+  `integration_moved` item whose `restore` puts it back.
+- The spec commit holds `openspec/changes/<change>/` only; anything else the
+  spec agent wrote or committed is discarded and recorded (`spec-edits-discarded`).
 - A merge whose gates fail is reset (not reverted) so the fixed branch can merge again.
 - An exception in one work order's step, or a conversation of its that the
   agent server can't start or report on, stays with that work order: the step

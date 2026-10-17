@@ -21,7 +21,9 @@ import { tools } from "../tools.js";
 import { detectGates, gateFindings, runGates, type GateResult } from "./gates.js";
 import {
   addWorktree,
+  changedFiles,
   commitAll,
+  commitPaths,
   currentBranch,
   deleteBranch,
   diffStat,
@@ -126,6 +128,10 @@ const MERGE: InboxOption[] = [
   { id: "merge", label: "Merge", tone: "primary" },
   { id: "send_back", label: "Send back to the builder", needsNote: true },
   { id: "skip", label: "Skip this work order" },
+];
+const INTEGRATION_MOVED: InboxOption[] = [
+  { id: "restore", label: "Put it back and go on", tone: "primary" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
 ];
 const RUN_PAUSED: InboxOption[] = [
   { id: "resume", label: "Resume", tone: "primary" },
@@ -404,12 +410,28 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       return;
     }
 
+    // The spec commit holds the change folder and nothing else: code, policy.yml or AGENTS.md the
+    // spec agent wrote (or committed itself) never reaches the integration branch this way.
+    const expected = run.integrationSha ?? (await headSha(dir));
+    if ((await currentBranch(dir)) !== run.integrationBranch || (await headSha(dir)) !== expected) {
+      // Back on the integration branch at the factory's last commit, keeping the agent's files to sort below.
+      await git(dir, ["symbolic-ref", "HEAD", `refs/heads/${run.integrationBranch}`]);
+      await git(dir, ["reset", "-q", "--mixed", expected]);
+    }
     const title = proposalTitle(readProposal(dir, run.change)) ?? run.goal;
-    const sha = await commitAll(dir, `spec(${run.change}): ${clip(title, 72)}`);
+    const sha = await commitPaths(dir, [`openspec/changes/${run.change}`], `spec(${run.change}): ${clip(title, 72)}`);
     if (sha) record(SYSTEM, "autopilot.spec_committed", run.id, { change: run.change, branch: run.integrationBranch, sha });
+    const extra = await changedFiles(dir);
+    if (extra.length) {
+      await discardChanges(dir);
+      ledger.addCheck({ runId: run.id, stage: "spec", name: "spec-edits-discarded", ok: false, output: `The spec agent changed files outside openspec/changes/${run.change}/. They were thrown away:\n${extra.map((f) => `- ${f}`).join("\n")}` });
+      record(SYSTEM, "autopilot.edits_discarded", run.id, { role: "spec", attempt: a.id, files: extra.length });
+    }
+    const tip = await headSha(dir);
     ledger.transaction(() => {
       markHandled(a, { outcome: "valid", sha });
-      moveRun(run, "critic");
+      ledger.updateRun(run.id, { integrationSha: tip });
+      moveRun(ledger.getRun(run.id) ?? run, "critic");
     });
   }
 
@@ -425,7 +447,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
     const dir = run.integrationDir as string;
     const verdict = parseCriticVerdict(await client.finalResponse(c.conversationId));
-    if (!(await isClean(dir))) {
+    const committed = !!run.integrationSha && (await headSha(dir)) !== run.integrationSha;
+    if (committed || !(await isClean(dir))) {
+      if (committed) await git(dir, ["checkout", "-q", "-f", "-B", run.integrationBranch, run.integrationSha as string]);
       await discardChanges(dir);
       ledger.addCheck({ runId: run.id, stage: "spec", name: "critic-edits-discarded", ok: false, output: "The critic edited files. Its edits were thrown away." });
       record(SYSTEM, "autopilot.edits_discarded", run.id, { role: "critic", attempt: c.id });
@@ -573,6 +597,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * that throws stops only its work order, which goes to a person.
    */
   async function buildStep(run: Run) {
+    if (!(await guardIntegration(run))) return;
     // ponytail: one work order's gates and one merge's integration gates per step, so polling and a person's action wait for two gate runs at most; give gates their own task if suites get slow.
     let gated = false;
     for (const wo of ledger.listWorkOrders(run.id)) {
@@ -831,6 +856,68 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
   }
 
+  // ---- the integration branch is the factory's alone ----
+
+  const short = (sha: string | null) => (sha ? sha.slice(0, 10) : "nothing");
+
+  /**
+   * Why the integration branch isn't where the factory left it, or null.
+   * Agents run with full permissions, so a builder can move any ref from its
+   * worktree; anything the factory didn't write never gets built on, merged
+   * onto or delivered. A merge a restart interrupted (the tip is that work
+   * order's merge commit on top of the expected sha) is the factory's own.
+   */
+  async function integrationMoved(run: Run): Promise<string | null> {
+    const tip = await headSha(workspace, run.integrationBranch).catch(() => null);
+    if (!tip) return `\`${run.integrationBranch}\` no longer exists.`;
+    if (!run.integrationSha) {
+      ledger.updateRun(run.id, { integrationSha: tip }); // a run from before this check: trust what's there now
+      return null;
+    }
+    if (tip !== run.integrationSha) {
+      const merging = ledger.listWorkOrders(run.id).find((w) => w.state === "merging" && w.preMergeSha === run.integrationSha && w.branch);
+      const parents = (await git(workspace, ["rev-list", "--parents", "-n", "1", tip])).stdout.trim().split(" ").slice(1);
+      const own = merging && parents.length === 2 && parents[0] === run.integrationSha && parents[1] === (await headSha(workspace, merging.branch as string).catch(() => ""));
+      if (!own) return `\`${run.integrationBranch}\` is at ${short(tip)}, but the factory left it at ${short(run.integrationSha)}.`;
+    }
+    if (run.integrationDir && existsSync(run.integrationDir)) {
+      const branch = await currentBranch(run.integrationDir);
+      if (branch !== run.integrationBranch) return `The integration worktree has ${branch ? `\`${branch}\`` : "a detached HEAD"} checked out instead of \`${run.integrationBranch}\`.`;
+    }
+    return null;
+  }
+
+  /** Stops the run for a person when the integration branch moved: nothing is built on it until it's put back. */
+  async function guardIntegration(run: Run): Promise<boolean> {
+    const why = await integrationMoved(run);
+    if (!why) return true;
+    ledger.transaction(() => {
+      openItem(
+        run,
+        "integration_moved",
+        `The integration branch of ${run.change} moved outside the factory`,
+        `${why}\n\nOnly the factory writes to it: the spec commit, then one tested merge per work order. Something else (an agent, or a person) changed it, so Autopilot stopped before building on, merging onto or delivering anything that wasn't checked.\n\n**Put it back** resets the branch to ${short(run.integrationSha)} and goes on; whatever was added stays reachable in git's reflog. Or cancel the run.`,
+        INTEGRATION_MOVED,
+      );
+      moveRun(run, "paused", {
+        patch: { resumeState: run.state, pausedReason: "The integration branch moved outside the factory" },
+        action: "autopilot.run_paused",
+        data: { reason: "integration_moved" },
+      });
+    });
+    return false;
+  }
+
+  /** Back to where the factory left it, on its branch, with nothing else in the worktree. */
+  async function restoreIntegration(run: Run, actor: string) {
+    const dir = run.integrationDir as string;
+    const sha = run.integrationSha as string;
+    const tip = await headSha(workspace, run.integrationBranch).catch(() => null);
+    await git(dir, ["checkout", "-f", "-B", run.integrationBranch, sha]);
+    await discardChanges(dir);
+    record(actor, "autopilot.integration_restored", run.id, { branch: run.integrationBranch, from: tip, to: sha });
+  }
+
   // ---- integrate stage: one merge at a time ----
 
   /**
@@ -945,11 +1032,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre, pinnedPolicy(run).gates);
     if (r.results.length) recordGates(run, wo, "integrate", r.results);
     if (r.outcome === "merged") {
-      moveWorkOrder(wo, "merged", {
-        actor,
-        patch: { mergedBy: actor },
-        action: "autopilot.work_order_merged",
-        data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons },
+      ledger.transaction(() => {
+        ledger.updateRun(run.id, { integrationSha: r.sha });
+        moveWorkOrder(wo, "merged", {
+          actor,
+          patch: { mergedBy: actor },
+          action: "autopilot.work_order_merged",
+          data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons },
+        });
       });
       return;
     }
@@ -996,6 +1086,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * (every work order skipped) there's nothing to deliver, and the run failed.
    */
   async function finish(run: Run) {
+    if (!(await guardIntegration(ledger.getRun(run.id) ?? run))) return;
     const wos = ledger.listWorkOrders(run.id);
     const merged = wos.filter((w) => w.state === "merged").length;
     const sha = await headSha(workspace, run.integrationBranch);
@@ -1109,8 +1200,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const integrationDir = path.join(worktrees, id, "integration");
     const integrationBranch = `autopilot/${change}`;
     await addWorktree(workspace, integrationDir, integrationBranch, baseBranch);
+    const integrationSha = await headSha(integrationDir);
 
-    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, policy, policyHash: hash, createdBy: input.actor });
+    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, integrationSha, policy, policyHash: hash, createdBy: input.actor });
     record(input.actor, "autopilot.run_created", id, {
       change,
       autonomy,
@@ -1241,6 +1333,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       case "run_paused:resume":
         if (run.state === "paused") await unpause(run, actor);
         return;
+      case "integration_moved:restore":
+        await restoreIntegration(run, actor);
+        if (run.state === "paused") await unpause(run, actor);
+        return;
       case "work_order_failed:retry":
         // Back in the queue: dispatch gives it a fresh worktree, and wo.findings go into the new brief.
         moveWorkOrder(workOrderOf(item), "pending", { actor, patch: { resumeState: null } });
@@ -1277,7 +1373,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const note = input.note?.trim() || null;
       if (option.needsNote && !note) throw new Error(`"${option.label}" needs a note.`);
       const run = mustRun(item.runId);
-      if (run.state === "paused" && item.kind !== "error" && item.kind !== "run_paused" && input.choice !== "cancel") {
+      if (run.state === "paused" && !["error", "run_paused", "integration_moved"].includes(item.kind) && input.choice !== "cancel") {
         throw new Error("The run is paused. Resume it first.");
       }
 

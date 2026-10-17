@@ -47,6 +47,7 @@ export type InboxKind =
   | "budget_reached"
   | "run_paused"
   | "error"
+  | "integration_moved"
   | "release";
 export type Risk = "low" | "medium" | "high";
 export type Severity = "critical" | "high" | "medium" | "low";
@@ -78,6 +79,7 @@ export interface Run {
   baseBranch: string;
   integrationBranch: string; // "autopilot/<change>"
   integrationDir: string | null; // worktree of the integration branch
+  integrationSha: string | null; // where the factory last left the integration branch; anything else moved it
   state: RunState;
   resumeState: RunState | null; // where to go back to after "paused"
   pausedReason: string | null;
@@ -260,6 +262,11 @@ CREATE TABLE inbox (
 );
 `;
 
+// v2: the integration tip the factory last wrote, to catch anything else moving the branch.
+const SCHEMA_V2 = `
+ALTER TABLE runs ADD COLUMN integration_sha TEXT;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox"];
 
@@ -312,9 +319,10 @@ export function openLedger(file: string) {
     }
   }
 
-  // Schema version in PRAGMA user_version. A later change adds `if (version < 2)` with ALTER TABLE.
+  // Schema version in PRAGMA user_version; each step upgrades one version, in order.
   const { user_version: version } = db.prepare("PRAGMA user_version").get() as { user_version: number };
   if (version < 1) transaction(() => db.exec(`${SCHEMA_V1}\nPRAGMA user_version = 1;`));
+  if (version < 2) transaction(() => db.exec(`${SCHEMA_V2}\nPRAGMA user_version = 2;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

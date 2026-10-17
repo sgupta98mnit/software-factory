@@ -141,6 +141,25 @@ export async function commitAll(dir: string, message: string): Promise<string | 
   return headSha(dir);
 }
 
+/** Commits only `paths` (and nothing else that's staged). null when they had nothing to commit. */
+export async function commitPaths(dir: string, paths: string[], message: string): Promise<string | null> {
+  await git(dir, ["reset", "-q"]); // unstage anything else
+  await git(dir, ["add", "-A", "--", ...paths]);
+  if ((await git(dir, ["diff", "--cached", "--quiet"], { allowFail: true })).code === 0) return null;
+  await git(dir, ["commit", "-m", message]);
+  return headSha(dir);
+}
+
+/** Files with uncommitted changes (new, changed or deleted), installed packages left out. */
+export async function changedFiles(dir: string): Promise<string[]> {
+  const out = (await git(dir, ["status", "--porcelain", "-z", "--untracked-files=all", "--", ".", ":(exclude,glob)**/node_modules/**"])).stdout;
+  return out
+    .split("\0")
+    .filter(Boolean)
+    .filter((entry) => /^.. /.test(entry)) // the second path of a rename has no status prefix
+    .map((entry) => entry.slice(3));
+}
+
 /** No uncommitted changes. Installed packages don't count: they're never part of the work. */
 export async function isClean(dir: string): Promise<boolean> {
   return (await git(dir, ["status", "--porcelain", "--", ".", ":(exclude,glob)**/node_modules/**"])).stdout.trim() === "";
