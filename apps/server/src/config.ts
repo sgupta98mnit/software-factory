@@ -27,8 +27,17 @@ export const WORKSPACE = path.resolve(
  */
 export const AGENT_WORKSPACE = process.env.SF_AGENT_WORKSPACE ?? WORKSPACE;
 
-/** Local state: the audit log. Git-ignored. */
+/** Local state: the audit log and Autopilot's ledger, worktrees and hidden tests. Git-ignored. */
 export const DATA_DIR = path.resolve(process.env.SF_DATA_DIR ?? path.join(ROOT, "data"));
+
+/** Autopilot's run ledger (SQLite): runs, work orders, agent attempts, checks, inbox. */
+export const AUTOPILOT_DB = path.join(DATA_DIR, "autopilot.db");
+
+/** Git worktrees Autopilot creates: one per run for the integration branch, one per work order. */
+export const WORKTREES_DIR = path.join(DATA_DIR, "worktrees");
+
+/** Hidden acceptance tests, kept outside every worktree so builders never see them. */
+export const HIDDEN_TESTS_DIR = path.join(DATA_DIR, "hidden-tests");
 
 export const PORT = Number(process.env.SF_PORT ?? 4317);
 
