@@ -92,8 +92,11 @@ test("worktrees: added on a new branch, replaced when added again, removed with 
   assert.equal(await branchExists(r, "autopilot/demo"), false);
 });
 
-test("discardChanges throws away edits and new files", async () => {
+test("discardChanges throws away edits and new files but keeps installed packages, which don't make a tree dirty", async () => {
   const r = await repo();
+  mkdirSync(path.join(r, "pkg", "node_modules", "dep"), { recursive: true });
+  writeFileSync(path.join(r, "pkg", "node_modules", "dep", "index.js"), "x\n");
+  assert.equal(await isClean(r), true);
   writeFileSync(path.join(r, "a.txt"), "edited\n");
   writeFileSync(path.join(r, "stray.txt"), "x\n");
   assert.equal(await isClean(r), false);
@@ -101,6 +104,7 @@ test("discardChanges throws away edits and new files", async () => {
   assert.equal(await isClean(r), true);
   assert.equal(readFileSync(path.join(r, "a.txt"), "utf8"), "one\ntwo\nthree\n");
   assert.equal(existsSync(path.join(r, "stray.txt")), false);
+  assert.equal(existsSync(path.join(r, "pkg", "node_modules", "dep", "index.js")), true);
 });
 
 test("merge: clean merges commit, conflicts abort and list the files; mergeInto leaves the markers", async () => {

@@ -1,7 +1,9 @@
 // Autopilot's state machine and scheduler. A run goes goal -> spec agent ->
 // strict validation -> commit -> critic -> plan (work orders in waves) ->
 // approval (by autonomy) -> building: one builder per work order, each in its
-// own worktree and branch from the integration tip, a few at a time.
+// own worktree and branch from the integration tip, a few at a time. Built
+// work goes through the factory's gates and a reviewer; what fails goes back
+// to the builder (repair), then to a fresh builder, then to a person.
 // Every step reads its state from the ledger, does one side effect (an agent
 // call, git, openspec) and writes the new state, so the factory can stop at
 // any point and carry on after a restart.
@@ -14,6 +16,7 @@ import path from "node:path";
 import { audit, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
+import { detectGates, gateFindings, runGates } from "./gates.js";
 import {
   addWorktree,
   commitAll,
@@ -21,10 +24,12 @@ import {
   deleteBranch,
   discardChanges,
   ensureRepo,
+  git,
   headSha,
   isClean,
   isRepoRoot,
   removeWorktree,
+  resetHard,
 } from "./git.js";
 import type {
   Attempt,
@@ -47,11 +52,14 @@ import {
   criticBrief,
   criticFollowUp,
   findingList,
+  repairMessage,
+  reviewerBrief,
   reviseFollowUp,
   specBrief,
   validateFollowUp,
   verdictReminder,
 } from "./prompts.js";
+import { clusterFindings, parseVerdict, passed } from "./review.js";
 import {
   assumptionsOf,
   changeNameFor,
@@ -84,6 +92,9 @@ const SYSTEM = "autopilot";
 const POLICY_ACTOR = "policy@default";
 const SPEC_VALIDATE_TRIES = 3;
 const CRITIC_ROUNDS = 2;
+const REPAIR_SAME_CONVERSATION = 2; // follow-ups to a builder before a fresh one takes over
+const REPAIR_FRESH = 1; // fresh builders after the first, before a person is asked
+const FAILING_TO_PAUSE = 3; // work orders needing attention that pause their run
 /** Work orders of one run in building, verifying or reviewing at once. */
 export const PARALLEL = 3;
 
@@ -104,6 +115,15 @@ const RETRY: InboxOption[] = [
 const WO_FAILED: InboxOption[] = [
   { id: "retry", label: "Retry with a fresh agent", tone: "primary" },
   { id: "skip", label: "Skip this work order" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const WO_ERROR: InboxOption[] = [
+  { id: "retry", label: "Retry", tone: "primary" },
+  { id: "skip", label: "Skip this work order" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const RUN_PAUSED: InboxOption[] = [
+  { id: "resume", label: "Resume", tone: "primary" },
   { id: "cancel", label: "Cancel run", tone: "danger" },
 ];
 
@@ -225,16 +245,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return a;
   }
 
-  /** The critic should be another vendor than the spec agent when the agent server has one. */
-  async function criticProfile(run: Run) {
-    const ref = latest(run.id, "spec")?.agentProfile;
-    const spec = ref ? await client.resolveProfile(ref).catch(() => null) : null;
-    return client.resolveProfile(null, { avoidServerOf: spec?.server });
+  /** A critic or reviewer should be another vendor than the agent whose work it checks, when the agent server has one. */
+  async function otherVendorThan(profileRef: string | null | undefined) {
+    const other = profileRef ? await client.resolveProfile(profileRef).catch(() => null) : null;
+    return client.resolveProfile(null, { avoidServerOf: other?.server });
   }
 
   /** Records a new attempt before asking the agent server for it (write-ahead), then starts it. */
   async function startAgent(run: Run, role: "spec" | "critic") {
-    const profile = role === "spec" ? await client.resolveProfile(null) : await criticProfile(run);
+    const profile = role === "spec" ? await client.resolveProfile(null) : await otherVendorThan(latest(run.id, "spec")?.agentProfile);
     const attempt = ledger.transaction(() => {
       const a = ledger.addAttempt({ runId: run.id, role, conversationId: randomUUID(), agentProfile: profile.id });
       if (role === "spec") ledger.updateRun(run.id, { specConversation: a.conversationId });
@@ -246,7 +265,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** The first message of an attempt, rebuilt from the ledger so a restart sends the same one. */
   function briefFor(run: Run, a: Attempt, wo: WorkOrder | undefined): string {
-    if (wo) return builderBrief({ change: run.change, wo });
+    if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo }) : builderBrief({ change: run.change, wo });
     if (a.role === "critic") return criticBrief({ change: run.change });
     // A spec agent started after one that failed (or whose tasks.md couldn't be planned) hears why.
     const before = ledger.listAttempts({ runId: run.id, role: "spec" }).filter((x) => x.id < a.id).at(-1);
@@ -258,7 +277,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function startConversation(a: Attempt) {
     const run = ledger.getRun(a.runId);
     const wo = a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined;
-    const dir = wo ? wo.worktree : run?.integrationDir; // builders work in their work order's worktree
+    const dir = wo ? wo.worktree : run?.integrationDir; // builders and reviewers work in their work order's worktree
     if (!run || !dir || !a.agentProfile) throw new Error(`Attempt ${a.id} has no worktree or agent profile to start with`);
     try {
       const snap = await client.start({
@@ -506,9 +525,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     ].join("\n");
   }
 
-  // ---- build stage ----
+  // ---- build stage: dispatch, gates, review, repair ----
 
   const builders = (wo: WorkOrder) => ledger.listAttempts({ runId: wo.runId, workOrderId: wo.id, role: "builder" });
+  const reviewers = (wo: WorkOrder) => ledger.listAttempts({ runId: wo.runId, workOrderId: wo.id, role: "reviewer" });
 
   function workOrderOf(item: InboxItem): WorkOrder {
     const wo = item.workOrderId ? ledger.getWorkOrder(item.workOrderId) : undefined;
@@ -516,14 +536,26 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return wo;
   }
 
-  /** Acts on builders that stopped, then dispatches what's ready. */
+  /**
+   * Moves each work order one step (builder stopped -> gates -> reviewer ->
+   * ready, or a repair), then dispatches what's ready. A step that throws
+   * stops only its work order, which goes to a person.
+   */
   async function buildStep(run: Run) {
+    // ponytail: one work order's gates per step, so polling and a person's action wait for one gate run at most; give gates their own task if suites get slow.
+    let gated = false;
     for (const wo of ledger.listWorkOrders(run.id)) {
-      if (wo.state !== "building") continue;
-      const a = builders(wo).at(-1);
-      if (!a || ACTIVE.has(a.state) || a.state === "paused" || handled(a)) continue;
-      if (a.state === "finished") await built(wo, a);
-      else await builderFailed(run, wo, a);
+      try {
+        if (wo.state === "building") await builderStep(run, wo);
+        else if (wo.state === "reviewing") await reviewStep(run, wo);
+        else if (wo.state === "verifying" && !gated) {
+          gated = true;
+          await verify(run, wo);
+        }
+      } catch (err) {
+        if (!unreachable(err)) workOrderError(run, wo, err);
+      }
+      if (ledger.getRun(run.id)?.state !== "building") return; // too many failures paused it
     }
     // Pending work orders whose dependencies are merged or skipped, in wave order, while there's room.
     const wos = ledger.listWorkOrders(run.id);
@@ -532,8 +564,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     for (const wo of wos) {
       if (room <= 0) break;
       if (wo.state !== "pending" || !wo.dependsOn.every((d) => DONE_WO.has(stateOf.get(d) ?? "pending"))) continue;
-      await dispatch(run, wo);
-      room--;
+      try {
+        await dispatch(run, wo);
+        room--;
+      } catch (err) {
+        if (unreachable(err)) return;
+        workOrderError(run, wo, err); // resumes in pending: a retry dispatches it again
+        if (ledger.getRun(run.id)?.state !== "building") return;
+      }
     }
   }
 
@@ -541,9 +579,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * A builder in a fresh worktree on the work order's own branch from the
    * integration tip. Git first, then the attempt (write-ahead), then the
    * agent server: a restart in between redoes the worktree or restarts the
-   * conversation with the same id.
+   * conversation with the same id. `findings` go into the brief.
    */
-  async function dispatch(run: Run, wo: WorkOrder) {
+  async function dispatch(run: Run, wo: WorkOrder, findings = wo.findings) {
     const profile = await client.resolveProfile(null);
     const dir = path.join(worktrees, run.id, `wo-${wo.seq}`);
     // Not autopilot/<change>/wo-N: git can't have that next to the branch autopilot/<change>.
@@ -554,7 +592,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const attempt = ledger.transaction(() => {
       const a = ledger.addAttempt({ runId: run.id, workOrderId: wo.id, role: "builder", conversationId: randomUUID(), agentProfile: profile.id });
       moveWorkOrder(wo, "building", {
-        patch: { branch, worktree: dir, baseSha, resumeState: null },
+        patch: { branch, worktree: dir, baseSha, findings, resumeState: null },
         action: "autopilot.work_order_dispatched",
         data: { attempt: a.id, conversationId: a.conversationId, profile: profile.name, round, branch, baseSha },
       });
@@ -563,35 +601,186 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     await startConversation(attempt);
   }
 
-  /** The builder is done: commit what it left uncommitted. Gates and review come next. */
-  async function built(wo: WorkOrder, a: Attempt) {
+  async function builderStep(run: Run, wo: WorkOrder) {
+    const a = builders(wo).at(-1);
+    if (!a || ACTIVE.has(a.state) || a.state === "paused" || handled(a)) return;
+    if (a.state === "finished") return built(run, wo, a);
+    await repair(run, wo, [{ source: "agent", severity: "high", title: await whyStopped(a, "The builder"), detail: "" }]);
+  }
+
+  /**
+   * The builder is done. Its work must be on its own branch and go beyond
+   * where it started; what it left uncommitted is committed. Then the gates.
+   */
+  async function built(run: Run, wo: WorkOrder, a: Attempt) {
     const dir = wo.worktree as string;
+    const branch = await currentBranch(dir);
+    if (branch !== wo.branch) {
+      const where = branch ? `branch \`${branch}\`` : "a detached HEAD";
+      return repair(run, wo, [{ source: "agent", severity: "high", title: `The work is on ${where}, not on \`${wo.branch}\``, detail: `Bring your commits back to \`${wo.branch}\` and work only there.` }]);
+    }
     const sha = (await commitAll(dir, `WO-${wo.seq}: ${clip(wo.title, 72)}`)) ?? (await headSha(dir));
+    if (sha === wo.baseSha) {
+      return repair(run, wo, [{ source: "agent", severity: "high", title: "Nothing was built: the branch has no changes", detail: "Build the work order with its tests, then commit." }]);
+    }
     ledger.transaction(() => {
       markHandled(a, { outcome: "built", sha });
       moveWorkOrder(wo, "verifying", { data: { attempt: a.id, sha } });
     });
   }
 
-  /** The builder stopped with an error or got stuck: a person decides (repair rounds come with the gates). */
-  async function builderFailed(run: Run, wo: WorkOrder, a: Attempt) {
-    const why = await whyStopped(a, "The builder");
-    const findings: Finding[] = [{ source: "agent", severity: "high", title: why, detail: "" }];
+  /** The factory's own checks on the committed work: pass -> a reviewer, fail -> a repair round. */
+  async function verify(run: Run, wo: WorkOrder) {
+    const dir = wo.worktree as string;
+    const { ok, results } = await runGates(dir, detectGates(dir));
     ledger.transaction(() => {
-      markHandled(a, { outcome: "failed" });
-      moveWorkOrder(wo, "needs_attention", {
-        patch: { resumeState: "building", findings },
+      for (const r of results) {
+        ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: r.name, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, output: r.output });
+      }
+    });
+    record(SYSTEM, "autopilot.gates_run", run.id, { workOrder: `WO-${wo.seq}`, ok, gates: results.map((r) => r.name), failed: results.filter((r) => !r.ok).map((r) => r.name) });
+    changed(run.id);
+    if (!ok) return repair(run, wo, gateFindings(results));
+    await discardChanges(dir); // what the gates left (build output), so anything left after the review is the reviewer's
+    await startReviewer(run, wo);
+  }
+
+  /** Write-ahead like dispatch: the attempt and the move to reviewing, then the agent server. */
+  async function startReviewer(run: Run, wo: WorkOrder) {
+    const profile = await otherVendorThan(builders(wo).at(-1)?.agentProfile);
+    const attempt = ledger.transaction(() => {
+      const a = ledger.addAttempt({ runId: run.id, workOrderId: wo.id, role: "reviewer", conversationId: randomUUID(), agentProfile: profile.id });
+      if (wo.state !== "reviewing") moveWorkOrder(wo, "reviewing", { data: { attempt: a.id } });
+      return a;
+    });
+    record(SYSTEM, "autopilot.agent_started", run.id, { role: "reviewer", workOrder: `WO-${wo.seq}`, attempt: attempt.id, conversationId: attempt.conversationId, profile: profile.name });
+    await startConversation(attempt);
+  }
+
+  async function reviewStep(run: Run, wo: WorkOrder) {
+    const r = reviewers(wo).at(-1);
+    if (!r || handled(r)) return startReviewer(run, wo); // a person's retry after the last reviewer failed
+    if (ACTIVE.has(r.state) || r.state === "paused") return;
+    if (r.state !== "finished") {
+      const why = await whyStopped(r, "The reviewer");
+      markHandled(r, { outcome: "failed" });
+      throw new Error(why);
+    }
+
+    const dir = wo.worktree as string;
+    const verdict = parseVerdict(await client.finalResponse(r.conversationId));
+    // The reviewer only reads: whatever it changed or committed is thrown away.
+    const builtSha = (builders(wo).at(-1)?.result as { sha?: string } | null)?.sha;
+    const onBranch = (await currentBranch(dir)) === wo.branch;
+    // Back on the work order's branch first, so the reset below undoes a commit made there.
+    if (!onBranch && wo.branch) await git(dir, ["checkout", "-f", wo.branch]);
+    const head = await headSha(dir);
+    const committed = !!builtSha && head !== builtSha;
+    if (!onBranch || committed || !(await isClean(dir))) {
+      await resetHard(dir, builtSha ?? head);
+      await discardChanges(dir);
+      ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: "reviewer-edits-discarded", ok: false, output: "The reviewer left changes in the worktree. They were thrown away." });
+      record(SYSTEM, "autopilot.edits_discarded", run.id, { role: "reviewer", workOrder: `WO-${wo.seq}`, attempt: r.id, committed, switchedBranch: !onBranch });
+    }
+    const ok = passed(verdict);
+    record(SYSTEM, "autopilot.review_verdict", run.id, {
+      workOrder: `WO-${wo.seq}`,
+      attempt: r.id,
+      verdict: verdict.verdict,
+      findings: verdict.findings.length,
+      passed: ok,
+      unreadable: !!verdict.unreadable,
+    });
+    // No verdict to act on: ask the reviewer once more, then a person.
+    if (verdict.unreadable) {
+      if (r.turns < 2) return sendFollowUp(r, verdictReminder(), "unreadable_verdict");
+      markHandled(r, verdict);
+      throw new Error("The reviewer's reply had no readable verdict, even when asked again.");
+    }
+    if (!ok) {
+      await repair(run, wo, verdict.findings);
+      markHandled(r, verdict);
+      return;
+    }
+    ledger.transaction(() => {
+      markHandled(r, verdict);
+      moveWorkOrder(wo, "ready", { data: { attempt: r.id, findings: verdict.findings.length } });
+    });
+  }
+
+  /**
+   * A failed round (gates, review, or the builder stopped). The findings go
+   * back to the same builder twice, then to one fresh builder in a new
+   * worktree, then to a person, whose retry allows one more fresh builder.
+   */
+  async function repair(run: Run, wo: WorkOrder, findings: Finding[]) {
+    const all = builders(wo);
+    const last = all.at(-1);
+    const data = { workOrder: `WO-${wo.seq}`, findings: findings.length };
+    // A conversation that never started, or is gone from the agent server, can't take a follow-up.
+    if (last && !(last.result as { error?: string } | null)?.error && last.turns < 1 + REPAIR_SAME_CONVERSATION) {
+      await sendFollowUp(last, repairMessage(findings), "repair");
+      moveWorkOrder(wo, "building", { patch: { findings }, action: "autopilot.repair_requested", data: { ...data, builder: all.length, turn: last.turns + 1 } });
+      return;
+    }
+    const retries = ledger
+      .listInbox({ state: "decided", runId: run.id })
+      .filter((i) => i.workOrderId === wo.id && i.kind === "work_order_failed" && i.decision === "retry").length;
+    if (all.length < 1 + REPAIR_FRESH + retries) {
+      record(SYSTEM, "autopilot.repair_requested", run.id, { ...data, builder: all.length + 1, turn: 1 });
+      return dispatch(run, wo, findings);
+    }
+    needsAttention(
+      run,
+      wo,
+      "work_order_failed",
+      `WO-${wo.seq} of ${run.change} failed: ${wo.title}`,
+      `After ${all.length} builder conversation(s) it still fails:\n\n${clusterFindings(findings)}\n\nRetry gives it to one more fresh agent in a new worktree from the integration branch, told what went wrong. Skip lets the work orders that depend on it go ahead without it.`,
+      WO_FAILED,
+      findings,
+    );
+  }
+
+  /** A step for this work order threw: it waits for a person, and the rest of the run goes on. */
+  function workOrderError(run: Run, wo: WorkOrder, err: unknown) {
+    console.error(`[autopilot] ${run.id} WO-${wo.seq}:`, err);
+    const state = ledger.getWorkOrder(wo.id)?.state ?? wo.state;
+    const body = `While in **${state}**:\n\n${errorText(err)}\n\nRetry picks up from there. Skip lets the work orders that depend on it go ahead without it.`;
+    needsAttention(run, wo, "error", `WO-${wo.seq} of ${run.change} stopped: ${wo.title}`, body, WO_ERROR);
+  }
+
+  /** A work order a person has to look at. The third one in a run pauses the run. */
+  function needsAttention(
+    run: Run,
+    wo: WorkOrder,
+    kind: "work_order_failed" | "error",
+    title: string,
+    body: string,
+    options: InboxOption[],
+    findings?: Finding[],
+  ) {
+    ledger.transaction(() => {
+      const current = ledger.getWorkOrder(wo.id) ?? wo; // the step may have moved it
+      moveWorkOrder(current, "needs_attention", {
+        patch: { resumeState: current.state, ...(findings ? { findings } : {}) },
         action: "autopilot.work_order_failed",
-        data: { attempt: a.id, state: a.state },
+        data: { kind },
       });
+      openItem(run, kind, title, body, options, wo.id);
+      const failing = ledger.listWorkOrders(run.id).filter((w) => w.state === "needs_attention");
+      if (failing.length < FAILING_TO_PAUSE) return;
       openItem(
         run,
-        "work_order_failed",
-        `WO-${wo.seq} of ${run.change} failed: ${wo.title}`,
-        `${why}\n\nRetry gives it to a fresh agent in a new worktree from the integration branch, told what went wrong. Skip lets the work orders that depend on it go ahead without it.`,
-        WO_FAILED,
-        wo.id,
+        "run_paused",
+        `${run.change} paused: ${failing.length} work orders need attention`,
+        `${bullets(failing.map((w) => `WO-${w.seq}: ${w.title}`))}\n\nThat many failures usually share a cause (the spec, the plan or the workspace). Resume lets the other work orders go on; decide these work orders' own items once the run is going again.`,
+        RUN_PAUSED,
       );
+      moveRun(ledger.getRun(run.id) ?? run, "paused", {
+        patch: { resumeState: "building", pausedReason: `${failing.length} work orders need attention` },
+        action: "autopilot.run_paused",
+        data: { failing: failing.length },
+      });
     });
   }
 
@@ -737,9 +926,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return locked(runId, async () => {
       const run = mustRun(runId);
       if (run.state !== "paused") throw new Error(`The run isn't paused (it's ${run.state}).`);
-      // Resuming answers any error the pause came with.
-      for (const item of ledger.listInbox({ runId }).filter((i) => i.kind === "error")) {
-        ledger.decideInbox(item.id, { decision: "retry", note: "Resumed from the pipeline", by: opts.actor });
+      // Resuming answers the item the pause came with. A work order's own error item stays for its work order.
+      for (const item of ledger.listInbox({ runId })) {
+        const decision = item.kind === "run_paused" ? "resume" : item.kind === "error" && !item.workOrderId ? "retry" : null;
+        if (decision) ledger.decideInbox(item.id, { decision, note: "Resumed from the pipeline", by: opts.actor });
       }
       return unpause(run, opts.actor);
     });
@@ -775,12 +965,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         await startAgent(run, "spec");
         return;
       case "error:retry":
+        if (item.workOrderId) {
+          // The work order picks up where its step threw (a reviewer that failed is started again).
+          const wo = workOrderOf(item);
+          moveWorkOrder(wo, wo.resumeState ?? "pending", { actor, patch: { resumeState: null } });
+        } else if (run.state === "paused") await unpause(run, actor);
+        return;
+      case "run_paused:resume":
         if (run.state === "paused") await unpause(run, actor);
         return;
       case "work_order_failed:retry":
         // Back in the queue: dispatch gives it a fresh worktree, and wo.findings go into the new brief.
         moveWorkOrder(workOrderOf(item), "pending", { actor, patch: { resumeState: null } });
         return;
+      case "error:skip":
       case "work_order_failed:skip": {
         const wo = workOrderOf(item);
         if (wo.worktree) await removeWorktree(workspace, wo.worktree).catch(warn); // the branch keeps what it did
@@ -804,7 +1002,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const note = input.note?.trim() || null;
       if (option.needsNote && !note) throw new Error(`"${option.label}" needs a note.`);
       const run = mustRun(item.runId);
-      if (run.state === "paused" && item.kind !== "error" && input.choice !== "cancel") {
+      if (run.state === "paused" && item.kind !== "error" && item.kind !== "run_paused" && input.choice !== "cancel") {
         throw new Error("The run is paused. Resume it first.");
       }
 

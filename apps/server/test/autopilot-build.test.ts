@@ -48,8 +48,9 @@ function gate() {
   return { open, opened };
 }
 
+/** Handlers by the conversation's role tag; reviewers (and anyone else) pass unless told otherwise. */
 function byRole(roles: Partial<Record<string, FakeHandler>>): FakeHandler {
-  return (conv, text) => (roles[conv.tags.sfrole ?? ""] ?? (() => ({ response: "Done.", cost: 0.01 })))(conv, text);
+  return (conv, text) => (roles[conv.tags.sfrole ?? ""] ?? (() => ({ response: PASS, cost: 0.01 })))(conv, text);
 }
 
 /** Plays a spec agent: the fixture's example change under the requested name, with `tasks` as its tasks.md. */
@@ -60,9 +61,11 @@ function writeChange(conv: FakeConversation, tasks?: string) {
   if (tasks) writeFileSync(path.join(dir, "tasks.md"), tasks);
 }
 
-/** Plays a builder: writes wo-<seq>.txt and leaves the commit to the factory. */
+/** Plays a builder: writes wo-<seq>.txt and a package whose test passes, and leaves the commit to the factory. */
 function build(conv: FakeConversation) {
   writeFileSync(path.join(conv.workingDir, `wo-${conv.tags.sfwo}.txt`), `built by ${conv.id}\n`);
+  writeFileSync(path.join(conv.workingDir, "package.json"), JSON.stringify({ name: "wo", private: true, scripts: { test: "node --test" } }));
+  writeFileSync(path.join(conv.workingDir, "wo.test.mjs"), 'import { test } from "node:test";\ntest("works", () => {});\n');
   return { response: "Built it and tested it.", cost: 0.1 };
 }
 
@@ -93,6 +96,16 @@ async function setup(handler: FakeHandler, opts: { fixture?: boolean } = {}) {
         await o.idle();
         await fake.settled();
         if (done()) return;
+      }
+      assert.fail("the run didn't get there");
+    },
+    /** Like until, while some agents are held at a gate (so the fake never settles). */
+    async stepUntil(done: () => boolean, max = 200) {
+      for (let i = 0; i < max; i++) {
+        await o.tick();
+        await o.idle();
+        if (done()) return;
+        await new Promise((resolve) => setTimeout(resolve, 10)); // let the released agents finish their turns
       }
       assert.fail("the run didn't get there");
     },
@@ -177,8 +190,8 @@ test("plan and dispatch: tasks.md becomes waves; three builders start at once in
     assert.equal(t.ledger.listAttempts({ runId: run.id, role: "builder" }).length, 3);
 
     builders.open();
-    await t.until(() => states(t, run.id).filter((s) => s.endsWith(":verifying")).length === 3);
-    assert.deepEqual(states(t, run.id), ["1:verifying", "2:verifying", "3:verifying", "4:pending"]);
+    await t.until(() => states(t, run.id).filter((s) => s.endsWith(":ready")).length === 3);
+    assert.deepEqual(states(t, run.id), ["1:ready", "2:ready", "3:ready", "4:pending"]);
     for (const seq of [1, 2, 3]) {
       const wo = t.ledger.getWorkOrder(`${run.id}/WO-${seq}`)!;
       const subject = (await git(t.workspace, ["log", "-1", "--format=%s", wo.branch!])).stdout.trim();
@@ -193,7 +206,7 @@ test("plan and dispatch: tasks.md becomes waves; three builders start at once in
     assert.equal(t.ledger.getWorkOrder(`${run.id}/WO-4`)?.state, "pending");
     t.ledger.updateWorkOrder(`${run.id}/WO-2`, { state: "skipped" });
     t.ledger.updateWorkOrder(`${run.id}/WO-3`, { state: "merged" });
-    await t.until(() => t.ledger.getWorkOrder(`${run.id}/WO-4`)?.state === "verifying");
+    await t.until(() => t.ledger.getWorkOrder(`${run.id}/WO-4`)?.state === "ready");
 
     await flushAudit();
     const events = listAudit().filter((e) => e.subject === run.id);
@@ -208,11 +221,16 @@ test("plan and dispatch: tasks.md becomes waves; three builders start at once in
 
 test("dispatch: with five independent work orders only three build at once; the next starts when one leaves; cancel cleans up", async () => {
   const builders = gate();
+  const reviewers = gate();
   const t = await setup(
     byRole({
       builder: async (conv) => {
         await builders.opened;
         return build(conv);
+      },
+      reviewer: async () => {
+        await reviewers.opened;
+        return { response: PASS };
       },
     }),
   );
@@ -223,13 +241,13 @@ test("dispatch: with five independent work orders only three build at once; the 
     assert.equal(t.fake.conversations.size, 3);
 
     builders.open();
-    await t.until(() => states(t, run.id).filter((s) => s.endsWith(":verifying")).length === 3);
-    // Verifying still counts against the limit.
-    assert.deepEqual(states(t, run.id), ["1:verifying", "2:verifying", "3:verifying", "4:pending", "5:pending"]);
+    await t.stepUntil(() => states(t, run.id).filter((s) => s.endsWith(":reviewing")).length === 3);
+    // Verifying and reviewing still count against the limit.
+    assert.deepEqual(states(t, run.id), ["1:reviewing", "2:reviewing", "3:reviewing", "4:pending", "5:pending"]);
 
     // As if the integrator had merged WO-1: one slot opens.
     t.ledger.updateWorkOrder(`${run.id}/WO-1`, { state: "merged" });
-    await t.until(() => t.ledger.getWorkOrder(`${run.id}/WO-4`)?.state === "verifying");
+    await t.stepUntil(() => t.ledger.getWorkOrder(`${run.id}/WO-4`)?.state === "reviewing");
     assert.equal(t.ledger.getWorkOrder(`${run.id}/WO-5`)?.state, "pending");
 
     const wo2 = t.ledger.getWorkOrder(`${run.id}/WO-2`)!;
@@ -240,11 +258,12 @@ test("dispatch: with five independent work orders only three build at once; the 
     assert.equal(await branchExists(t.workspace, run.integrationBranch), true); // the deliverable stays
   } finally {
     builders.open();
+    reviewers.open();
     await t.close();
   }
 });
 
-test("a builder that fails goes to the inbox: retry gets a fresh agent told why, skip lets dependents go ahead", async () => {
+test("a builder that keeps failing goes to the inbox after its repair rounds: retry gets one more fresh agent told why, skip lets dependents go ahead", async () => {
   const t = await setup(
     byRole({
       builder: (conv) => {
@@ -269,15 +288,16 @@ test("a builder that fails goes to the inbox: retry gets a fresh agent told why,
     await t.o.decide(item.id, { choice: "retry" }, "user:test");
     assert.equal(t.ledger.getWorkOrder(`${run.id}/WO-1`)?.state, "pending");
     await t.until(() => !!failedItem());
+    // Two builders before the inbox (the repair rounds), one more for the retry.
     const attempts = t.ledger.listAttempts({ runId: run.id, role: "builder" });
-    assert.equal(attempts.length, 2);
-    assert.notEqual(attempts[1]?.conversationId, attempts[0]?.conversationId);
-    assert.match(t.fake.conversations.get(attempts[1]!.conversationId)?.messages[0] ?? "", /A previous attempt at this work order failed:\n\n- \(high\) The builder stopped .*Out of credits/);
+    assert.deepEqual(attempts.map((a) => a.turns), [3, 3, 3]);
+    assert.equal(new Set(attempts.map((a) => a.conversationId)).size, 3);
+    assert.match(t.fake.conversations.get(attempts[2]!.conversationId)?.messages[0] ?? "", /A previous attempt at this work order failed:\n\n- \(high\) The builder stopped .*Out of credits/);
 
     await t.o.decide(failedItem()!.id, { choice: "skip" }, "user:test");
     assert.equal(existsSync(first.worktree!), false);
-    await t.until(() => t.ledger.getWorkOrder(`${run.id}/WO-2`)?.state === "verifying");
-    assert.deepEqual(states(t, run.id), ["1:skipped", "2:verifying"]);
+    await t.until(() => t.ledger.getWorkOrder(`${run.id}/WO-2`)?.state === "ready");
+    assert.deepEqual(states(t, run.id), ["1:skipped", "2:ready"]);
     await flushAudit();
     const decided = listAudit().filter((e) => e.subject === run.id && e.action === "autopilot.work_order_state_changed" && e.actor === "user:test");
     assert.deepEqual(decided.map((e) => e.data.to).reverse(), ["pending", "skipped"]);

@@ -141,14 +141,15 @@ export async function commitAll(dir: string, message: string): Promise<string | 
   return headSha(dir);
 }
 
+/** No uncommitted changes. Installed packages don't count: they're never part of the work. */
 export async function isClean(dir: string): Promise<boolean> {
-  return (await git(dir, ["status", "--porcelain"])).stdout.trim() === "";
+  return (await git(dir, ["status", "--porcelain", "--", ".", ":(exclude,glob)**/node_modules/**"])).stdout.trim() === "";
 }
 
-/** Throws away uncommitted edits and new files (a critic or reviewer that edited when it shouldn't have). */
+/** Throws away uncommitted edits and new files (a critic or reviewer that edited when it shouldn't have), keeping installed packages. */
 export async function discardChanges(dir: string): Promise<void> {
   await git(dir, ["reset", "--hard"]);
-  await git(dir, ["clean", "-fd"]);
+  await git(dir, ["clean", "-fd", "-e", "node_modules"]);
 }
 
 export async function resetHard(dir: string, sha: string): Promise<void> {

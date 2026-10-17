@@ -3,6 +3,7 @@
 // a restart can rebuild a brief exactly. Briefs point at files rather than
 // pasting them, like briefs.ts does for hand-started work orders.
 import type { Autonomy, Finding, WorkOrder } from "./ledger.js";
+import { clusterFindings } from "./review.js";
 
 /** `problem`: why the previous spec agent of this run stopped (a retry), so this one can fix it. */
 export function specBrief(o: { goal: string; change: string; autonomy: Autonomy; openspecVersion: string; problem?: string | null }): string {
@@ -80,9 +81,9 @@ export function builderBrief(o: {
     "Acceptance criteria (write tests for each one):",
     ...wo.acceptance.map((a, i) => `${i + 1}. ${a}`),
     ...(wo.controls.length ? ["", `Security controls this work order must meet, as design.md describes them: ${wo.controls.join(", ")}.`] : []),
-    ...(wo.findings?.length ? ["", "A previous attempt at this work order failed:", "", findingList(wo.findings), "", "Start from the code as it is now and avoid those problems."] : []),
+    ...(wo.findings?.length ? ["", "A previous attempt at this work order failed:", "", clusterFindings(wo.findings), "", "Start from the code as it is now and avoid those problems."] : []),
     "",
-    "When you finish, the factory runs these checks itself in this folder: `npm run typecheck`, `npm run lint` and `npm run test` in every package that has those scripts, after installing dependencies where node_modules is missing. Make them pass.",
+    "When you finish, the factory runs these checks itself: `npm run typecheck`, `npm run lint` and `npm run test` in every package (this folder and one folder down) that has those scripts, after installing dependencies where node_modules is missing. Make them pass. There must be at least one `test` script. Then a reviewer reads your diff against the acceptance criteria and the scenarios.",
     "",
     "Rules:",
     "- This folder is a git worktree made for this work order. Work only here.",
@@ -91,6 +92,44 @@ export function builderBrief(o: {
     "- Don't change `openspec/`, `.factory/` or `backlog/`. This is an Autopilot work order: don't use Backlog.md for it.",
     "",
     "Finish with a short summary of what you changed and how you tested it.",
+  ].join("\n");
+}
+
+/** A reviewer's first message: one work order's diff, after the gates passed. Another vendor than the builder when there is one. */
+export function reviewerBrief(o: {
+  change: string;
+  wo: Pick<WorkOrder, "seq" | "title" | "acceptance" | "controls" | "branch" | "baseSha">;
+}): string {
+  const { wo } = o;
+  return [
+    `You are the reviewer in a Software Factory Autopilot run. Review work order WO-${wo.seq}: ${wo.title}.`,
+    "",
+    `A builder's work is committed in this folder${wo.branch ? ` on \`${wo.branch}\`` : ""}. Read it with \`git diff ${wo.baseSha ?? "HEAD~1"}...HEAD\`. It comes from the OpenSpec change in \`openspec/changes/${o.change}/\`: the scenarios are in specs/, and this is task group ${wo.seq} in tasks.md.`,
+    "",
+    "Acceptance criteria:",
+    ...wo.acceptance.map((a, i) => `${i + 1}. ${a}`),
+    ...(wo.controls.length ? ["", `Security controls it must meet, as design.md describes them: ${wo.controls.join(", ")}.`] : []),
+    "",
+    "The factory's checks (install, typecheck, lint, tests) already pass. Check that the work meets every criterion and the scenarios it covers, handles their error cases, and has tests that would catch it breaking.",
+    "Stick to correctness and requirements: no style nits, and don't ask for scope this work order doesn't have.",
+    "Don't edit or commit anything. The builder makes the fixes.",
+    "",
+    "End your reply with exactly one fenced json block:",
+    "```json",
+    '{ "verdict": "pass" | "fail", "findings": [{ "severity": "critical" | "high" | "medium" | "low", "criterion": <number from the list above> | null, "scenario": "<scenario name from specs/>" | null, "file": "<path>" | null, "issue": "what is wrong", "fix": "how to fix it" }] }',
+    "```",
+    'Say "fail" when something must be fixed before this work can merge.',
+  ].join("\n");
+}
+
+/** Sent to the same builder conversation when its work failed a gate or the review. */
+export function repairMessage(findings: Finding[]): string {
+  return [
+    "The factory checked your work on this work order. It isn't done yet:",
+    "",
+    clusterFindings(findings),
+    "",
+    "Fix these here, keep every check passing, and commit on the current branch. Finish with a short summary of what you changed.",
   ].join("\n");
 }
 
