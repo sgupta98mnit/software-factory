@@ -411,7 +411,7 @@ test("spec stage: open questions in autonomous mode go to the inbox, and the ans
   }
 });
 
-test("a step that fails pauses the run with an error item; retry picks up from there", async () => {
+test("a step that fails twice pauses the run with an error item (the first time, the critic is restarted); retry picks up from there", async () => {
   let critiques = 0;
   const t = await setup(
     byRole({
@@ -420,9 +420,9 @@ test("a step that fails pauses the run with an error item; retry picks up from t
         return { response: "Done." };
       },
       critic: () => {
-        if (++critiques === 1) throw new Error("The model provider is overloaded");
-        // The critic that crashed didn't use up a round: this revise still goes to the spec agent.
-        if (critiques === 2) return { response: verdict({ verdict: "revise", findings: [{ severity: "high", issue: "No error case for unknown claims" }] }) };
+        if (++critiques <= 2) throw new Error("The model provider is overloaded");
+        // The critics that crashed didn't use up a round: this revise still goes to the spec agent.
+        if (critiques === 3) return { response: verdict({ verdict: "revise", findings: [{ severity: "high", issue: "No error case for unknown claims" }] }) };
         return { response: PASS };
       },
     }),
@@ -440,7 +440,9 @@ test("a step that fails pauses the run with an error item; retry picks up from t
     await t.o.decide(item.id, { choice: "retry" }, "user:test");
     assert.equal(t.ledger.getRun(run.id)?.state, "critic");
     await t.until(() => t.ledger.getRun(run.id)?.state === "awaiting_plan_approval");
-    assert.deepEqual(t.ledger.listAttempts({ runId: run.id, role: "critic" }).map((c) => c.state), ["error", "finished", "finished"]);
+    const critics = t.ledger.listAttempts({ runId: run.id, role: "critic" });
+    assert.deepEqual(critics.map((c) => c.state), ["error", "error", "finished", "finished"]);
+    assert.equal((critics[0]?.result as { outcome: string }).outcome, "restarted");
     const [spec] = t.ledger.listAttempts({ runId: run.id, role: "spec" });
     assert.match(t.fake.conversations.get(spec!.conversationId)?.messages[1] ?? "", /No error case for unknown claims/);
   } finally {

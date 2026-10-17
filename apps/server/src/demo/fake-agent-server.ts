@@ -17,6 +17,8 @@ export interface FakeConversation {
   cost: number;
   messages: string[];
   finalResponse: string;
+  /** What GET .../events/count answers: one per message and one per reply. A handler doing work can add to it. */
+  events: number;
 }
 
 export interface FakeProfile {
@@ -58,12 +60,14 @@ export async function startFakeOpenHands(
 
   function runTurn(conv: FakeConversation, text: string) {
     conv.messages.push(text);
+    conv.events++;
     conv.status = "running";
     const turn: Promise<void> = new Promise<void>((resolve) => setImmediate(resolve))
       .then(() => handler(conv, text))
       .then(
         (reply) => {
           conv.cost += reply?.cost ?? 0;
+          conv.events++;
           conv.finalResponse = reply?.response ?? conv.finalResponse;
           // A pause during the turn wins, like the real server.
           if (conv.status === "running") conv.status = reply?.status ?? "finished";
@@ -115,6 +119,7 @@ export async function startFakeOpenHands(
         cost: 0,
         messages: [],
         finalResponse: "",
+        events: 0,
       };
       conversations.set(conv.id, conv);
       const text = body.initial_message?.content?.[0]?.text;
@@ -122,7 +127,7 @@ export async function startFakeOpenHands(
       return [201, info(conv)];
     }
 
-    const m = /^\/api\/conversations\/([^/]+)(?:\/(events|pause|run|agent_final_response))?$/.exec(path);
+    const m = /^\/api\/conversations\/([^/]+)(?:\/(events|events\/count|pause|run|agent_final_response))?$/.exec(path);
     const conv = m ? conversations.get(decodeURIComponent(m[1]!)) : undefined;
     // The real server answers an unknown pause with a bare 400, everything else with 404.
     if (m && !conv && method === "POST" && m[2] === "pause") return [400, { detail: "Bad Request" }];
@@ -130,6 +135,7 @@ export async function startFakeOpenHands(
     const action = `${method} ${m[2] ?? ""}`;
     if (action === "GET ") return [200, info(conv)];
     if (action === "GET agent_final_response") return [200, { response: conv.finalResponse }];
+    if (action === "GET events/count") return [200, conv.events];
     if (action === "POST events") {
       const body = (await readJson(req)) as { content?: { text?: string }[] };
       runTurn(conv, body.content?.[0]?.text ?? "");

@@ -222,3 +222,13 @@ export function answerFollowUp(answer: string): string {
     "Update the change to match, remove the questions these settle from `## Open questions`, and run the strict validation again. Don't commit.",
   ].join("\n");
 }
+
+/** The watchdog's one nudge to an agent that has shown no progress for a while. */
+export function quietNudge(minutes: number): string {
+  return [
+    `Autopilot hasn't seen any progress from you in ${minutes} minute${minutes === 1 ? "" : "s"}.`,
+    "",
+    "If a command is hanging (a dev server, a watcher, an interactive prompt), stop it and don't start it again; run tests and builds so they exit on their own.",
+    "Then finish what you were asked to do. If something blocks you, say what it is in your reply and stop.",
+  ].join("\n");
+}

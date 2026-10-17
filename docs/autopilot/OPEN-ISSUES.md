@@ -46,11 +46,9 @@ run against the fake agent server), and the Phase 1 UI review.
 
 ## Plausible, not fixed yet (tracked for later phases)
 
-- **No watchdog.** An agent-server outage keeps attempts `starting` and the run
-  "Building" with no Inbox signal; a conversation paused by hand in Canvas stays
-  `running` in the ledger. (Phase 4: self-healing.)
-- **Cold starts.** `classify`'s 20 s grace could count an ACP conversation that
-  stays `idle` for 20 s after start as finished. (Phase 4: watchdog.)
+- **A conversation paused by hand in Canvas** stays `running` in the ledger, and
+  the watchdog leaves it alone (it only acts on `running` conversations). Nothing
+  tells the run's people it's waiting on that pause.
 - **Repo-level git config is still the agents' to write.** Hooks and fsmonitor
   are off for the factory's git, but a `filter.<name>.clean` driver set in
   `.git/config` with a matching `.gitattributes` runs on `git add`. Gates also

@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..1891875
+index 0000000..a7e5d8b
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,615 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -460,6 +460,8 @@ index 0000000..1891875
 +    error: string | null;
 +    profiles: AgentProfileSummary[];
 +    activeProfileId: string | null;
++    /** When runs started waiting for it (an outage); null while it answers. */
++    downSince: string | null;
 +  };
 +  workspace: { path: string; isRepo: boolean; branch: string | null };
 +  /** `autonomy`: what to preselect, and the most a run may use; null when the policy file is invalid. */
@@ -1759,10 +1761,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..342d6d3
+index 0000000..19bb718
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1069 @@
+@@ -0,0 +1,1073 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1876,6 +1878,8 @@ index 0000000..342d6d3
 +        ? "Agent server reachable, 1 agent profile"
 +        : `Agent server reachable, ${n} agent profiles`,
 +    agentServerDown: "Agent server not reachable",
++    agentServerDownSince: (when: string) =>
++      `Agent server not reachable since ${when}. Runs wait and go on by themselves when it's back.`,
 +    agentServerHint:
 +      "Autopilot's agents run there. Start Canvas (pnpm dev), or set SF_AGENT_SERVER_URL.",
 +    workspaceRepo: (branch: string) => `Workspace is a git repo on ${branch}`,
@@ -2403,6 +2407,8 @@ index 0000000..342d6d3
 +        ? "Servidor de agentes accesible, 1 perfil de agente"
 +        : `Servidor de agentes accesible, ${n} perfiles de agente`,
 +    agentServerDown: "El servidor de agentes no responde",
++    agentServerDownSince: (when) =>
++      `El servidor de agentes no responde desde ${when}. Las ejecuciones esperan y siguen solas cuando vuelva.`,
 +    agentServerHint:
 +      "Los agentes del piloto automático se ejecutan allí. Inicie Canvas (pnpm dev) o defina SF_AGENT_SERVER_URL.",
 +    workspaceRepo: (branch) =>
@@ -5008,10 +5014,10 @@ index 0000000..40e2574
 +}
 diff --git a/src/factory/routes/autopilot.tsx b/src/factory/routes/autopilot.tsx
 new file mode 100644
-index 0000000..5df27b9
+index 0000000..86635c7
 --- /dev/null
 +++ b/src/factory/routes/autopilot.tsx
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,377 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
@@ -5253,6 +5259,7 @@ index 0000000..5df27b9
 +
 +function SetupStatus({ status }: { status: AutopilotStatus | undefined }) {
 +  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
 +  if (!status) return null;
 +  const { agentServer, workspace, policy, notifications } = status;
 +  return (
@@ -5267,7 +5274,11 @@ index 0000000..5df27b9
 +        text={
 +          agentServer.reachable
 +            ? copy.autopilot.agentServerOk(agentServer.profiles.length)
-+            : copy.autopilot.agentServerDown
++            : agentServer.downSince
++              ? copy.autopilot.agentServerDownSince(
++                  formatWhen(agentServer.downSince, i18n.language),
++                )
++              : copy.autopilot.agentServerDown
 +        }
 +        hint={
 +          agentServer.reachable

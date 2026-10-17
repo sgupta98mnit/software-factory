@@ -38,6 +38,8 @@ export interface Policy {
   notify: { digestHour: number };
   /** Release into the base branch on its own (autonomous runs only). Off: a person's click, the default. */
   release: { auto: boolean };
+  /** The watchdog: minutes a working agent may show no progress (no new events or cost) before it's nudged; as long again and it's stopped. */
+  selfHealing: { quietMinutes: number };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -67,6 +69,7 @@ export const DEFAULT_POLICY: Policy = {
   hiddenTests: { enabled: false, run: "node --test" },
   notify: { digestHour: 17 },
   release: { auto: false },
+  selfHealing: { quietMinutes: 20 },
 };
 
 // ---- reading and checking policy.yml ----
@@ -127,6 +130,7 @@ const RULES: Record<string, Rule> = {
   "hiddenTests.run": text,
   "notify.digestHour": whole(0, 23),
   "release.auto": flag,
+  "selfHealing.quietMinutes": whole(1, 1440),
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */
@@ -188,8 +192,21 @@ export async function loadPolicy(workspace: string, baseBranch: string): Promise
   }
 }
 
-/** The policy a run pinned when it was created; runs from before policies get the defaults. */
-export const pinnedPolicy = (run: { policy: unknown }): Policy => (run.policy as Policy | null) ?? DEFAULT_POLICY;
+/**
+ * The policy a run pinned when it was created; runs from before policies get
+ * the defaults. A setting added since the run was pinned reads as its default
+ * (the hash the run pinned stays its own).
+ */
+export function pinnedPolicy(run: { policy: unknown }): Policy {
+  const pinned = run.policy as Record<string, unknown> | null;
+  if (!pinned) return DEFAULT_POLICY;
+  const out: Record<string, unknown> = { ...pinned };
+  for (const [key, value] of Object.entries(DEFAULT_POLICY)) {
+    if (!Object.hasOwn(pinned, key)) out[key] = value;
+    else if (isMapping(value) && isMapping(pinned[key])) out[key] = { ...value, ...(pinned[key] as Record<string, unknown>) };
+  }
+  return out as unknown as Policy;
+}
 
 // ---- the merge decision ----
 

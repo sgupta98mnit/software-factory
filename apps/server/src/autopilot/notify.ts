@@ -1,7 +1,8 @@
 // Tells people when Autopilot needs them, the way Factory does it: the first
 // decision that opens gets one alert right away; anything after that waits for
 // one daily digest at policy.notify.digestHour (local time). A digest resets
-// the rule, so the next decision alerts again.
+// the rule, so the next decision alerts again. Notices about the factory
+// itself (the agent server down, then back) go out at once, outside that rule.
 //
 // The webhook URL is a secret, so it comes from the environment
 // (SF_NOTIFY_WEBHOOK), never from policy.yml in the repo. Slack and Teams
@@ -76,7 +77,7 @@ export function createNotifier(deps: {
   const clock = deps.now ?? (() => new Date());
   let sending: Promise<unknown> = Promise.resolve();
 
-  async function post(cfg: NotifyConfig & { webhook: string }, kind: "alert" | "digest", title: string, lines: string[]): Promise<boolean> {
+  async function post(cfg: NotifyConfig & { webhook: string }, kind: "alert" | "digest" | "notice", title: string, lines: string[]): Promise<boolean> {
     const channel = channelOf(cfg.webhook);
     try {
       const res = await send(cfg.webhook, {
@@ -128,6 +129,12 @@ export function createNotifier(deps: {
     deps.ledger.setMeta(DIGESTED, at);
   }
 
+  /** About the factory itself, not a decision: sent now, whatever the alert rule says. */
+  async function notice(title: string, lines: string[]) {
+    const cfg = deps.config();
+    if (cfg.webhook) await post({ ...cfg, webhook: cfg.webhook }, "notice", title, lines);
+  }
+
   /** One send at a time, so two openings can't both alert. Never throws. */
   const serial = (fn: () => Promise<void>) => {
     const next = sending.then(fn, fn).catch(() => undefined);
@@ -138,6 +145,7 @@ export function createNotifier(deps: {
   return {
     opened: (item: InboxItem) => serial(() => opened(item)),
     tick: (now?: Date) => serial(() => digest(now)),
+    notice: (title: string, lines: string[]) => serial(() => notice(title, lines)),
     idle: () => sending,
   };
 }

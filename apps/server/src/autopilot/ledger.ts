@@ -132,6 +132,9 @@ export interface Attempt {
   seenRunning: boolean; // saw status "running" since the last message
   lastSentAt: string;
   costUsd: number; // the conversation's latest accumulated cost
+  progressAt: string | null; // the watchdog: when it last showed progress (new cost, events or status)
+  events: number | null; // the conversation's event count when last looked at
+  nudgedAt: string | null; // when the watchdog nudged it, since its last message
   result: unknown;
   startedAt: string;
   finishedAt: string | null;
@@ -317,6 +320,13 @@ ALTER TABLE runs ADD COLUMN released_sha TEXT;
 ALTER TABLE runs ADD COLUMN released_at TEXT;
 `;
 
+// v7: the watchdog's view of each agent.
+const SCHEMA_V7 = `
+ALTER TABLE attempts ADD COLUMN progress_at TEXT;
+ALTER TABLE attempts ADD COLUMN events INTEGER;
+ALTER TABLE attempts ADD COLUMN nudged_at TEXT;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
@@ -377,6 +387,7 @@ export function openLedger(file: string) {
   if (version < 4) transaction(() => db.exec(`${SCHEMA_V4}\nPRAGMA user_version = 4;`));
   if (version < 5) transaction(() => db.exec(`${SCHEMA_V5}\nPRAGMA user_version = 5;`));
   if (version < 6) transaction(() => db.exec(`${SCHEMA_V6}\nPRAGMA user_version = 6;`));
+  if (version < 7) transaction(() => db.exec(`${SCHEMA_V7}\nPRAGMA user_version = 7;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

@@ -239,6 +239,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
         error: null,
         profiles: [{ id: "00000000-0000-4000-8000-000000000001", name: "default", kind: "acp", server: "claude-code" }],
         activeProfileId: "00000000-0000-4000-8000-000000000001",
+        downSince: null,
       },
       workspace: { path: workspace, isRepo: false, branch: null },
       policy: { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null, autonomy: { default: "supervised", max: "autonomous" }, budget: { perWorkOrderUsd: 5, perChangeUsd: 30 } },

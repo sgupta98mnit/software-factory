@@ -75,6 +75,7 @@ import {
   specBrief,
   validateFollowUp,
   validatorBrief,
+  quietNudge,
   verdictReminder,
 } from "./prompts.js";
 import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash, type Policy } from "./policy.js";
@@ -101,6 +102,10 @@ export interface OrchestratorDeps {
   graceMs?: number;
   /** For tests: the webhook alerts post with (default: the global fetch). */
   notifyFetch?: typeof fetch;
+  /** For tests: overrides the policy's selfHealing.quietMinutes. */
+  quietMs?: number;
+  /** How long an agent server outage lasts before anyone is told (default 2 minutes). */
+  outageAlertMs?: number;
 }
 
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
@@ -278,6 +283,35 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     audit(actor, action, runId, data).catch(() => undefined); // audit.ts logs write failures
   };
 
+  // ---- the agent server going away ----
+  //
+  // While it's unreachable, runs wait: nothing fails, attempts stay where they
+  // are, and every tick tries again. Once an outage lasts outageAlertMs, people
+  // hear about it (once), and again when it's back. Conversations the agent
+  // server lost meanwhile come back as "gone": builders get a fresh agent that
+  // doesn't count against the repair limits, other agents are restarted once.
+  let outage: { since: string; alerted: boolean } | null = null;
+  const outageAlertMs = deps.outageAlertMs ?? 120_000;
+  function agentServerDown(err: unknown) {
+    if (!outage) {
+      outage = { since: now(), alerted: false };
+      audit(SYSTEM, "autopilot.agent_server_down", "agent-server", { url: client.baseUrl, error: clip(errorText(err)) }).catch(() => undefined);
+      broadcast({ type: "autopilot.changed" });
+    }
+    if (!outage.alerted && Date.now() - Date.parse(outage.since) >= outageAlertMs) {
+      outage.alerted = true;
+      void notifier.notice("Autopilot can't reach the agent server", [`Unreachable since ${outage.since} (${client.baseUrl}). Runs wait and go on by themselves when it's back.`]);
+    }
+  }
+  function agentServerUp() {
+    if (!outage) return;
+    const down = Math.round((Date.now() - Date.parse(outage.since)) / 1000);
+    audit(SYSTEM, "autopilot.agent_server_back", "agent-server", { downSeconds: down }).catch(() => undefined);
+    if (outage.alerted) void notifier.notice("The agent server is back", [`It was unreachable for ${Math.max(1, Math.round(down / 60))} min. Runs go on.`]);
+    outage = null;
+    broadcast({ type: "autopilot.changed" });
+  }
+
   // ---- one thing per run at a time ----
 
   function track(runId: string, work: Promise<unknown>) {
@@ -353,7 +387,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** A step failed: pause the run and its agents, and ask a person (retry or cancel). */
   async function failed(runId: string, err: unknown) {
-    if (unreachable(err)) return;
+    if (unreachable(err)) return agentServerDown(err);
     console.error(`[autopilot] ${runId}:`, err);
     const run = ledger.getRun(runId);
     if (!run || TERMINAL.has(run.state) || run.state === "paused") return;
@@ -384,6 +418,26 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (error) return error;
     const last = await client.finalResponse(a.conversationId).catch(() => "");
     return `${who} stopped with status "${a.state}".${last ? ` Its last message: ${clip(last, 500)}` : ""}`;
+  }
+
+  /**
+   * An agent that stopped without finishing (an error, the watchdog, a
+   * conversation the agent server lost) is started again once, fresh, before
+   * anyone is asked. Builders don't come here: their repair loop does this.
+   */
+  function restartable(a: Attempt): boolean {
+    if (a.state === "finished") return false;
+    const same = ledger.listAttempts({ runId: a.runId, role: a.role }).filter((x) => x.workOrderId === a.workOrderId);
+    return !same.some((x) => (x.result as { outcome?: string } | null)?.outcome === "restarted");
+  }
+
+  async function restart(run: Run, a: Attempt, why: string) {
+    markHandled(a, { outcome: "restarted", error: (a.result as { error?: string } | null)?.error });
+    record(SYSTEM, "autopilot.agent_restarted", run.id, { role: a.role, attempt: a.id, ...(a.workOrderId ? { workOrder: a.workOrderId } : {}), why: clip(why) });
+    if (a.role === "reviewer") {
+      const wo = ledger.getWorkOrder(a.workOrderId ?? "");
+      if (wo) await startReviewer(run, wo);
+    } else if (a.role !== "builder") await startAgent(run, a.role);
   }
 
   function specAttempt(run: Run): Attempt {
@@ -453,9 +507,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         role: a.role,
         seq: wo?.seq,
       });
-      ledger.updateAttempt(a.id, { state: "running", seenRunning: snap.status === "running", costUsd: snap.costUsd, lastSentAt: now() });
+      // The event count right after the brief: what "progress" is measured from (cold starts, the watchdog).
+      const events = await client.eventCount(a.conversationId).catch(() => null);
+      ledger.updateAttempt(a.id, { state: "running", seenRunning: snap.status === "running", costUsd: snap.costUsd, lastSentAt: now(), progressAt: now(), events, nudgedAt: null });
     } catch (err) {
-      if (unreachable(err)) return; // stays "starting": a later tick starts it again with the same id
+      if (unreachable(err)) return agentServerDown(err); // stays "starting": a later tick starts it again with the same id
       if (refused(err)) throw err; // the key, not this conversation: the run stops once
       ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: errorText(err) } });
       record(SYSTEM, "autopilot.agent_finished", run.id, { role: a.role, attempt: a.id, state: "error", error: clip(errorText(err)) });
@@ -466,17 +522,60 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function poll(a: Attempt) {
     const snap = await client.get(a.conversationId);
     if (!snap) {
-      ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: "The conversation is gone from the agent server." } });
-      record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state: "error" });
+      // `lost`: the agent server lost it (restarted, say), so it isn't held against the work order's repair limits.
+      ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: "The conversation is gone from the agent server.", lost: true } });
+      record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state: "error", lost: true });
       return changed(a.runId);
     }
     const seenRunning = a.seenRunning || snap.status === "running";
-    const outcome = classify(snap, { seenRunning, lastSentAt: a.lastSentAt }, new Date(), graceMs);
+    // Idle and never seen running: an agent that finished between two polls, or one still starting up. Its events tell.
+    let progressed: boolean | undefined;
+    if (snap.status === "idle" && !seenRunning && a.events !== null) {
+      const events = await client.eventCount(a.conversationId);
+      progressed = events === null ? undefined : events > a.events;
+    }
+    const outcome = classify(snap, { seenRunning, lastSentAt: a.lastSentAt, progressed }, new Date(), graceMs, graceMs ? 180_000 : 0);
     // "paused" means someone paused it in Canvas: keep polling until they resume it there.
     const state = outcome === "done" ? "finished" : outcome === "failed" ? (snap.status === "stuck" ? "stuck" : "error") : "running";
-    ledger.updateAttempt(a.id, { state, seenRunning, costUsd: snap.costUsd, finishedAt: state === "running" ? null : now() });
+    const progress = snap.costUsd !== a.costUsd || seenRunning !== a.seenRunning;
+    ledger.updateAttempt(a.id, { state, seenRunning, costUsd: snap.costUsd, finishedAt: state === "running" ? null : now(), ...(progress ? { progressAt: now() } : {}) });
     if (state !== "running") record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state, costUsd: snap.costUsd });
     if (state !== a.state || snap.costUsd !== a.costUsd) changed(a.runId);
+    if (state === "running" && snap.status === "running") await watch(ledger.getAttempt(a.id) ?? a);
+  }
+
+  /**
+   * The watchdog. A working agent with no progress (no new events, cost or
+   * status) for selfHealing.quietMinutes is nudged once; quiet as long again,
+   * it's paused and its attempt ends "stuck", which its step handles like any
+   * agent that stopped (a builder gets a fresh agent, a checker a restart).
+   * Event counts are fetched only once half the quiet time has passed.
+   */
+  async function watch(a: Attempt) {
+    const run = ledger.getRun(a.runId);
+    if (!run) return;
+    const quietMs = deps.quietMs ?? pinnedPolicy(run).selfHealing.quietMinutes * 60_000;
+    const quiet = Date.now() - Date.parse(a.progressAt ?? a.lastSentAt);
+    if (quiet < quietMs / 2) return;
+    const events = await client.eventCount(a.conversationId);
+    if (events === null) return; // the agent server can't say, so the watchdog can't either
+    if (a.events === null || events > a.events) {
+      ledger.updateAttempt(a.id, a.events === null ? { events } : { events, progressAt: now() });
+      return;
+    }
+    if (quiet < quietMs) return;
+    const minutes = Math.max(1, Math.round(quietMs / 60_000));
+    await client.pause(a.conversationId).catch(warn);
+    if (!a.nudgedAt) {
+      // Not a turn: the repair limits count the factory's findings, not this.
+      await client.send(a.conversationId, quietNudge(minutes));
+      ledger.updateAttempt(a.id, { nudgedAt: now(), progressAt: now(), seenRunning: false, lastSentAt: now(), events: await client.eventCount(a.conversationId).catch(() => events) });
+      record(SYSTEM, "autopilot.agent_nudged", a.runId, { role: a.role, attempt: a.id, quietMinutes: minutes });
+    } else {
+      ledger.updateAttempt(a.id, { state: "stuck", finishedAt: now(), result: { error: `No progress for ${minutes} minute${minutes === 1 ? "" : "s"}, even after a nudge, so Autopilot stopped it.`, watchdog: true } });
+      record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state: "stuck", reason: "watchdog", costUsd: a.costUsd });
+    }
+    changed(a.runId);
   }
 
   /** A follow-up message to an existing conversation; the agent starts on it right away. */
@@ -488,7 +587,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (!(err instanceof OpenHandsError && err.status === 429)) throw err;
       await client.resume(a.conversationId).catch(warn);
     }
-    ledger.updateAttempt(a.id, { state: "running", turns: a.turns + 1, seenRunning: false, lastSentAt: now(), finishedAt: null });
+    const events = await client.eventCount(a.conversationId).catch(() => null);
+    ledger.updateAttempt(a.id, { state: "running", turns: a.turns + 1, seenRunning: false, lastSentAt: now(), finishedAt: null, progressAt: now(), events, nudgedAt: null });
     record(SYSTEM, "autopilot.followup_sent", a.runId, { role: a.role, attempt: a.id, conversationId: a.conversationId, turn: a.turns + 1, reason });
     changed(a.runId);
   }
@@ -525,7 +625,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (!a) return startAgent(run, "spec");
     if (ACTIVE.has(a.state) || a.state === "paused" || handled(a)) return; // working, or waiting for a person
     const dir = run.integrationDir as string;
-    if (a.state !== "finished") return specFailed(run, a, await whyStopped(a, "The spec agent"));
+    if (a.state !== "finished") {
+      const why = await whyStopped(a, "The spec agent");
+      return restartable(a) ? restart(run, a, why) : specFailed(run, a, why);
+    }
 
     const check = await checkChange(run.change, dir);
     const tries = check.ok ? 0 : invalidStreak(run, a) + 1;
@@ -573,6 +676,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (ACTIVE.has(c.state) || c.state === "paused") return;
     if (c.state !== "finished") {
       const why = await whyStopped(c, "The spec critic");
+      if (restartable(c)) return restart(run, c, why);
       markHandled(c, { outcome: "failed" });
       throw new Error(why);
     }
@@ -909,6 +1013,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       return startAgent(run, "validator");
     }
     if (ACTIVE.has(v.state) || v.state === "paused" || handled(v)) return;
+    if (restartable(v)) return restart(run, v, await whyStopped(v, "The validator"));
     const tests = v.state === "finished" ? listHiddenTestFiles(testsDir(run)) : [];
     ledger.transaction(() => {
       ledger.setHiddenTests(run.id, tests.map(({ file, scenario, requirement, requires, sha256 }) => ({ file, scenario, requirement, requires, sha256 })));
@@ -988,6 +1093,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (ACTIVE.has(r.state) || r.state === "paused") return;
     if (r.state !== "finished") {
       const why = await whyStopped(r, "The reviewer");
+      if (restartable(r)) return restart(run, r, why);
       markHandled(r, { outcome: "failed" });
       throw new Error(why);
     }
@@ -1039,7 +1145,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * worktree, then to a person, whose retry allows one more fresh builder.
    */
   async function repair(run: Run, wo: WorkOrder, findings: Finding[]) {
-    const all = builders(wo);
+    // Builders whose conversation the agent server lost (an outage, a restart) aren't the work order's
+    // failures: up to two of them don't count, so an agent server that keeps losing them still runs out.
+    const everyone = builders(wo);
+    const forgiven = new Set(everyone.slice(0, -1).filter((b) => (b.result as { lost?: boolean } | null)?.lost).slice(0, 2));
+    const all = everyone.filter((b) => !forgiven.has(b));
     const last = all.at(-1);
     const data = { workOrder: `WO-${wo.seq}`, findings: findings.length };
     const limits = pinnedPolicy(run).repair;
@@ -1644,6 +1754,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       try {
         await (a.state === "starting" ? startConversation(a) : poll(a));
         pollErrors.delete(a.id);
+        if (ledger.getAttempt(a.id)?.state !== "starting") agentServerUp(); // it answered
       } catch (err) {
         // The agent server down or refusing the key, or the spec stage's own agents: the run waits or stops as a whole.
         if (unreachable(err) || runWide(err) || !a.workOrderId) throw err;
@@ -1964,7 +2075,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   async function status() {
     const agent = await client.listProfiles().then(
-      (r) => ({ reachable: true, error: null as string | null, profiles: r.profiles, activeProfileId: r.activeId }),
+      (r) => (agentServerUp(), { reachable: true, error: null as string | null, profiles: r.profiles, activeProfileId: r.activeId }),
       (err: unknown) => ({ reachable: false, error: errorText(err), profiles: [], activeProfileId: null }),
     );
     const isRepo = await isRepoRoot(workspace).catch(() => false);
@@ -1984,7 +2095,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       : await checked({ policy: DEFAULT_POLICY, hash: policyHash(DEFAULT_POLICY), source: "defaults" });
     const webhook = process.env.SF_NOTIFY_WEBHOOK?.trim();
     return {
-      agentServer: { url: client.baseUrl, ...agent },
+      // downSince: when runs started waiting for it (null while it answers).
+      agentServer: { url: client.baseUrl, ...agent, downSince: outage?.since ?? null },
       workspace: { path: workspace, isRepo, branch },
       policy,
       notifications: { channel: webhook ? channelOf(webhook) : null, digestHour },

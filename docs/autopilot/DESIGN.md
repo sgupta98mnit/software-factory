@@ -268,7 +268,38 @@ filename="evidence-<change>-<run>.json"` and records
 `autopilot.evidence_exported` (counts only). The Canvas page
 `/autopilot/runs/:id/evidence` shows the same JSON, linked from the Pipeline.
 
-## 15. Changes since the first build
+## 15. Self-healing
+
+- **Watchdog** (`watch`, policy `selfHealing.quietMinutes`, default 20).
+  Progress is a new event count (`GET /api/conversations/{id}/events/count`,
+  since cost stays 0 on subscription logins), new cost, or a status change; each
+  attempt keeps `progressAt`, `events` and `nudgedAt` (ledger v7). Event counts
+  are fetched only for a running agent quiet for half the time. When it's quiet
+  for the full time, the conversation is paused and sent `quietNudge` (not a
+  turn, so the repair limits don't move). Quiet as long again, it's paused and
+  the attempt ends `stuck` with `result.watchdog`. Audited as
+  `autopilot.agent_nudged` and `agent_finished` with reason `watchdog`.
+- **Restart once** (`restartable`, `restart`): a spec agent, critic, validator
+  or reviewer that stops without finishing (an error, the watchdog, a
+  conversation the agent server lost) is started fresh once per role and work
+  order, with the old attempt marked `outcome: restarted` and audited
+  `autopilot.agent_restarted`. A second stop takes the old path to a person.
+  Builders keep their repair loop.
+- **Outages**: a call that can't reach the agent server leaves everything as it
+  is (as before) and also opens an in-memory outage. `autopilot.agent_server_down`
+  is audited once, a `notice` goes to the webhook once it lasts `outageAlertMs`
+  (2 min), and on the first answer after it `agent_server_back` (with
+  `downSeconds`) plus a notice if one went out. `/status` has
+  `agentServer.downSince`; Home shows it. A conversation that's gone (404) ends
+  with `result.lost`; up to two lost builders per work order don't count
+  against `repair`.
+- **Cold starts**: `classify` takes `progressed` (events grew since the
+  message, read only for `idle` never seen running). `idle` with no new events
+  waits up to 3 minutes instead of the 20 s grace; `finished` is unchanged.
+- `pinnedPolicy` fills in settings added after a run was pinned with their
+  defaults, so older runs keep working as the policy grows.
+
+## 16. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

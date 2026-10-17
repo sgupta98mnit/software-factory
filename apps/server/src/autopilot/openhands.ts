@@ -233,6 +233,21 @@ export class OpenHandsClient {
     }
   }
 
+  /**
+   * How many events the conversation has (messages, actions, observations):
+   * the watchdog's sign of progress, which cost alone isn't (a subscription
+   * login reports no cost). null when the agent server can't say.
+   */
+  async eventCount(id: string): Promise<number | null> {
+    try {
+      const n = await this.request<unknown>("GET", `/conversations/${encodeURIComponent(id)}/events/count`);
+      return typeof n === "number" && Number.isFinite(n) ? n : null;
+    } catch (err) {
+      if (err instanceof OpenHandsError && err.status === 0) throw err; // unreachable: the caller waits, like any other call
+      return null;
+    }
+  }
+
   /** The agent's last finish message or reply; "" when there is none yet. */
   async finalResponse(id: string): Promise<string> {
     const body = await this.request<{ response?: string }>("GET", `/conversations/${encodeURIComponent(id)}/agent_final_response`);
@@ -253,18 +268,27 @@ export class OpenHandsClient {
  * What a polled conversation means for its attempt. Right after a message is
  * sent the server can still report the previous turn's end state, so an end
  * state counts only once the attempt has been seen running since that message
- * or the grace period has passed. ACP turns may end `idle` instead of `finished`.
+ * or the grace period has passed. ACP turns may end `idle` instead of
+ * `finished`, but an agent that hasn't started yet (a cold start can take
+ * minutes) is `idle` too: `progressed` says whether its events grew since the
+ * message. When they didn't, `idle` waits out the cold start; when nobody
+ * could tell (undefined), the grace period decides, as for `finished`.
  */
 export function classify(
   snapshot: Pick<ConversationSnapshot, "status">,
-  attempt: { seenRunning: boolean; lastSentAt: string },
+  attempt: { seenRunning: boolean; lastSentAt: string; progressed?: boolean },
   now: Date = new Date(),
   graceMs = 20_000,
+  coldStartMs = 180_000,
 ): "running" | "done" | "failed" | "paused" {
-  const settled = attempt.seenRunning || now.getTime() - Date.parse(attempt.lastSentAt) > graceMs;
+  const elapsed = now.getTime() - Date.parse(attempt.lastSentAt);
+  const settled = attempt.seenRunning || elapsed > graceMs;
   switch (snapshot.status) {
-    case "finished":
     case "idle":
+      if (attempt.seenRunning || attempt.progressed) return "done";
+      if (attempt.progressed === false) return elapsed > coldStartMs ? "done" : "running";
+      return settled ? "done" : "running";
+    case "finished":
       return settled ? "done" : "running";
     case "error":
     case "stuck":

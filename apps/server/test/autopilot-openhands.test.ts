@@ -255,6 +255,11 @@ test("classify: end states count only once seen running or after the grace perio
     assert.equal(classify({ status: status as never }, attempt, at(seconds)), expected, `${status} after ${seconds}s, seenRunning=${attempt.seenRunning}`);
   }
   assert.equal(classify({ status: "finished" }, fresh, at(5), 1000), "done", "custom grace");
+  // Cold starts: idle with no new events since the message is an agent that hasn't started, for up to three minutes.
+  assert.equal(classify({ status: "idle" }, { ...fresh, progressed: false }, at(60)), "running");
+  assert.equal(classify({ status: "idle" }, { ...fresh, progressed: false }, at(181)), "done");
+  assert.equal(classify({ status: "idle" }, { ...fresh, progressed: true }, at(1)), "done", "it ran between two polls");
+  assert.equal(classify({ status: "finished" }, { ...fresh, progressed: false }, at(21)), "done", "finished is never a cold start");
 });
 
 test("config: agentServerKey reads the env first, then Canvas's persisted key file, at call time", async () => {
