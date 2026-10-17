@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 /** Walk up from this file to the repo root (the folder with pnpm-workspace.yaml). */
@@ -38,6 +39,24 @@ export const WORKTREES_DIR = path.join(DATA_DIR, "worktrees");
 
 /** Hidden acceptance tests, kept outside every worktree so builders never see them. */
 export const HIDDEN_TESTS_DIR = path.join(DATA_DIR, "hidden-tests");
+
+/** Canvas's ingress; its /api/* reaches the OpenHands agent server that runs Autopilot's agents. */
+export const AGENT_SERVER_URL = process.env.SF_AGENT_SERVER_URL ?? "http://127.0.0.1:8000";
+
+/**
+ * The agent server's session key, sent as X-Session-API-Key. Read on every call
+ * so a Canvas restart with a new key needs no factory restart. Canvas's dev
+ * launcher persists the key in ~/.openhands/agent-canvas/api-key.txt.
+ */
+export function agentServerKey(): string | undefined {
+  const fromEnv = process.env.SF_AGENT_SERVER_KEY || process.env.LOCAL_BACKEND_API_KEY;
+  if (fromEnv) return fromEnv;
+  try {
+    return readFileSync(path.join(homedir(), ".openhands", "agent-canvas", "api-key.txt"), "utf8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export const PORT = Number(process.env.SF_PORT ?? 4317);
 
