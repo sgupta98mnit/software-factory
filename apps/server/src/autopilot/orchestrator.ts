@@ -82,7 +82,8 @@ import {
 } from "./prompts.js";
 import { describeOrigin, fromBugForm, fromGithub, fromWebhook, goalFor, originOf, type IntakeRequest, type IntakeSource, type RunOrigin } from "./intake.js";
 import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, parsePolicy, pinnedPolicy, POLICY_FILE, policyHash, type Policy } from "./policy.js";
-import { STARTER_AGENTS_MD, templateById } from "./policy-templates.js";
+import { POLICY_TEMPLATES, STARTER_AGENTS_MD, templateById } from "./policy-templates.js";
+import { explainPolicy } from "./explain.js";
 import { clusterFindings, parseVerdict, passed, type ReviewVerdict } from "./review.js";
 import {
   assumptionsOf,
@@ -813,10 +814,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   function approvePlan(run: Run, actor: string) {
     const critic = latest(run.id, "critic");
     const verdict = (critic?.result as CriticVerdict | null)?.verdict ?? null;
+    const why = actor.startsWith("policy@") ? `The run is autonomous, so the policy approves the plan; the spec critic's verdict was ${verdict ?? "missing"}.` : null;
     return moveRun(run, "building", {
       actor,
       action: "autopilot.plan_approved",
-      data: { critic: verdict, conversation: critic?.conversationId ?? null },
+      data: { critic: verdict, conversation: critic?.conversationId ?? null, ...(why ? { why } : {}) },
     });
   }
 
@@ -1306,7 +1308,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         if (item.workOrderId && stopped.has(item.workOrderId)) ledger.decideInbox(item.id, { decision: "superseded", note: "The plan changed", by: actor });
       }
       ledger.updateRun(run.id, { planTree: tree, revision: null });
-      record(actor, "autopilot.replanned", run.id, { added: keys(diff.added), removed: keys(diff.removed), changed: keys(diff.changed.map((c) => c.wo)), reopened: keys(reopened), scenarios });
+      const why = actor.startsWith("policy@") ? "The run is autonomous, so the policy applies the new plan." : actor === SYSTEM ? "The spec changed without changing any work order, so the plan stands as it is." : null;
+      record(actor, "autopilot.replanned", run.id, { added: keys(diff.added), removed: keys(diff.removed), changed: keys(diff.changed.map((c) => c.wo)), reopened: keys(reopened), scenarios, ...(why ? { why } : {}) });
     });
     changed(run.id);
     if (scenarios && pinnedPolicy(run).hiddenTests.enabled) await startValidator(ledger.getRun(run.id) ?? run, true);
@@ -1766,7 +1769,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const spec = files.filter((f) => f.startsWith("openspec/"));
     if (spec.length) {
       const listed = `${spec.slice(0, 5).join(", ")}${spec.length > 5 ? ` and ${spec.length - 5} more` : ""}`;
-      return { auto: false, reasons: [...decision.reasons, `Changes the spec (${listed}). Only a person lets a work order change what it's measured against; merging it re-plans the run.`], stat };
+      const reasons = [...decision.reasons, `Changes the spec (${listed}). Only a person lets a work order change what it's measured against; merging it re-plans the run.`];
+      return { auto: false, reasons, why: `The policy left it to a person: ${reasons.map((r) => r.replace(/\.$/, "")).join("; ")}.`, stat };
     }
     return { ...decision, stat };
   }
@@ -1810,14 +1814,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * again, with the same answer for the same branch), or the person who
    * approved it last. Never merged without one on record.
    */
-  async function mergeActor(run: Run, wo: WorkOrder): Promise<{ actor: string; reasons: string[] }> {
-    const { auto, reasons } = await mergeCheck(run, wo);
-    if (auto) return { actor: policyActor(run), reasons };
+  async function mergeActor(run: Run, wo: WorkOrder): Promise<{ actor: string; reasons: string[]; why: string }> {
+    const { auto, reasons, why } = await mergeCheck(run, wo);
+    if (auto) return { actor: policyActor(run), reasons, why };
     const approval = ledger
       .listInbox({ state: "decided", runId: run.id })
       .find((i) => i.workOrderId === wo.id && i.kind === "merge_approval" && i.decision === "merge");
     if (!approval?.decidedBy) throw new Error(`WO-${wo.seq} has no merge approval on record.`);
-    return { actor: approval.decidedBy, reasons };
+    const who = approval.decidedBy.replace(/^user:/, "");
+    return { actor: approval.decidedBy, reasons, why: `${who} merged it${approval.note ? ` (“${clip(approval.note, 200)}”)` : ""}. The policy asked a person because: ${reasons.map((r) => r.replace(/\.$/, "")).join("; ")}.` };
   }
 
   /**
@@ -1831,7 +1836,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const jobKey = `${wo.id}#integrate`;
     const outcome = takeJob(jobKey);
     if (outcome === "running") return;
-    const { actor, reasons } = await mergeActor(run, wo);
+    const { actor, reasons, why } = await mergeActor(run, wo);
     const key = `WO-${wo.seq}`;
     // Saved before merging, so a restart (or a failure) knows where the integration branch was.
     let pre = wo.preMergeSha;
@@ -1864,9 +1869,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         ledger.updateRun(run.id, { integrationSha: r.sha });
         moveWorkOrder(wo, "merged", {
           actor,
-          patch: { mergedBy: actor, mergeSha: null },
+          patch: { mergedBy: actor, mergeSha: null, mergeWhy: why },
           action: "autopilot.work_order_merged",
-          data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons },
+          data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons, why },
         });
       });
       return;
@@ -2092,18 +2097,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const policy = pinnedPolicy(run);
     // A preview that failed is for a person to look at, whatever release.auto says.
     if (!why && run.preview && !run.preview.ok) why = "The preview failed, so the policy doesn't release it on its own.";
-    if (!why && policy.release.auto && run.autonomy === "autonomous") return requestRelease(run, policyActor(run));
+    if (!why && policy.release.auto && run.autonomy === "autonomous") {
+      return requestRelease(run, policyActor(run), `The policy has release.auto on and the run is autonomous${run.preview ? ", and the preview passed" : ""}, so the policy releases it.`);
+    }
     openItem(run, "release", `Release ${run.change} into ${run.baseBranch}`, await releaseBody(run, why), [{ ...RELEASE[0]!, label: `Release into ${run.baseBranch}` }, RELEASE[1]!]);
     changed(run.id);
   }
 
   // Strictly increasing, so two releases asked for in the same millisecond still have an order.
   let lastRequest = "";
-  function requestRelease(run: Run, actor: string) {
+  function requestRelease(run: Run, actor: string, why?: string) {
     let at = now();
     if (at <= lastRequest) at = new Date(Date.parse(lastRequest) + 1).toISOString();
     lastRequest = at;
-    return moveRun(run, "releasing", { actor, patch: { releasedBy: actor, releaseRequestedAt: at }, action: "autopilot.release_requested", data: { base: run.baseBranch, branch: run.integrationBranch } });
+    return moveRun(run, "releasing", { actor, patch: { releasedBy: actor, releaseRequestedAt: at }, action: "autopilot.release_requested", data: { base: run.baseBranch, branch: run.integrationBranch, ...(why ? { why } : {}) } });
   }
 
   /** Back to done with the reason, and a fresh release decision. */
@@ -2440,7 +2447,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       ].join("\n");
       ledger.transaction(() => openItem(run, "intake", `New request: ${clip(request.title, 100)}`, body, INTAKE));
     }
-    record(actor, "autopilot.intake_received", run.id, { ...data, mode });
+    record(actor, "autopilot.intake_received", run.id, { ...data, mode, why: mode === "run" ? `The policy has intake.${request.source}: run, so it starts a run without asking.` : `The policy has intake.${request.source}: inbox, so a person decides whether it starts.` });
     return { outcome: mode === "inbox" ? "proposed" : "started", run: ledger.getRun(run.id) ?? run };
   }
 
@@ -2798,6 +2805,72 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return setup();
   }
 
+  // ---- the Policy page ----
+
+  /** The policy file on the base branch, what it makes the factory do, and the templates to start from. */
+  async function policyView() {
+    const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
+    const yaml = branch ? await fileAt(workspace, `refs/heads/${branch}`, POLICY_FILE).catch(() => null) : null;
+    let loaded: { policy: Policy; hash: string; source: string } | null = null;
+    let error: string | null = null;
+    try {
+      loaded = branch ? await loadPolicy(workspace, branch) : { policy: DEFAULT_POLICY, hash: policyHash(DEFAULT_POLICY), source: "defaults" };
+    } catch (err) {
+      error = errorText(err);
+    }
+    return {
+      base: branch,
+      source: loaded?.source ?? `${POLICY_FILE}@${branch}`,
+      hash: loaded?.hash ?? null,
+      error,
+      yaml,
+      policy: loaded?.policy ?? null,
+      explanation: loaded ? explainPolicy(loaded.policy) : [],
+      templates: POLICY_TEMPLATES.map((t) => {
+        const policy = parsePolicy(t.yaml);
+        return { ...t, hash: policyHash(policy), explanation: explainPolicy(policy) };
+      }),
+    };
+  }
+
+  /** What a draft of policy.yml would mean, or what's wrong with it. Nothing is written. */
+  function checkPolicy(yaml: unknown) {
+    if (typeof yaml !== "string") return { ok: false, error: "Send the policy as text.", hash: null, explanation: [] as string[] };
+    try {
+      const policy = parsePolicy(yaml);
+      return { ok: true, error: null, hash: policyHash(policy), explanation: explainPolicy(policy) };
+    } catch (err) {
+      return { ok: false, error: errorText(err), hash: null, explanation: [] as string[] };
+    }
+  }
+
+  /**
+   * A person's new policy (their text, or a template), committed to the base
+   * branch in their name like any other change to it. Runs already going keep
+   * the policy they pinned; new ones read this.
+   */
+  async function writePolicy(input: { yaml?: unknown; template?: unknown }, actor: string) {
+    const template = typeof input.template === "string" ? templateById(input.template) : undefined;
+    if (typeof input.template === "string" && !template) throw new Error("There's no policy template with that name.");
+    const yaml = template?.yaml ?? (typeof input.yaml === "string" ? input.yaml : null);
+    if (!yaml?.trim() || yaml.length > 100_000) throw new Error("Send the policy's text (at most 100,000 characters), or a template's name.");
+    let policy: Policy;
+    try {
+      policy = parsePolicy(yaml);
+    } catch (err) {
+      throw new Error(`The policy isn't valid, so nothing was written: ${errorText(err)}`);
+    }
+    const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
+    if (!branch) throw new Error("Make the workspace a git repo (on a branch) first.");
+    const before = await loadPolicy(workspace, branch).then((p) => p.hash, () => null);
+    const hash = policyHash(policy);
+    const who = actor.replace(/^user:/, "");
+    const sha = await commitToBase(branch, POLICY_FILE, () => (yaml.endsWith("\n") ? yaml : `${yaml}\n`), `factory: ${template ? `the ${template.name.toLowerCase()} policy` : "policy changed"} (${who})`);
+    record(actor, "autopilot.policy_written", path.basename(workspace), { template: template?.id ?? null, hash, from: before, base: branch, sha });
+    broadcast({ type: "autopilot.changed" });
+    return policyView();
+  }
+
   async function status() {
     const agent = await client.listProfiles().then(
       (r) => (agentServerUp(), { reachable: true, error: null as string | null, profiles: r.profiles, activeProfileId: r.activeId }),
@@ -2841,6 +2914,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     previewFile,
     setup,
     fixSetup,
+    policyView,
+    checkPolicy,
+    writePolicy,
     decide,
     pause,
     resume,

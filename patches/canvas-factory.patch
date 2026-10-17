@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..d530b5b
+index 0000000..8be7446
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,805 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -368,6 +368,8 @@ index 0000000..d530b5b
 +  conversationId: string | null;
 +  findings: Finding[] | null;
 +  mergedBy: string | null;
++  /** Why it merged, in plain words: the rules that held, or who approved it and why they were asked. */
++  mergeWhy: string | null;
 +  updatedAt: string;
 +}
 +
@@ -636,6 +638,32 @@ index 0000000..d530b5b
 +/** A path in the selected workspace's Autopilot API. */
 +const ap = (p: string) => `${autopilotIn(selected)}${p}`;
 +
++/** GET /policy: the file on the base branch, what it does in plain words, and the templates. */
++export interface PolicyView {
++  base: string | null;
++  source: string;
++  hash: string | null;
++  error: string | null;
++  /** The file as written; null when there's none (the defaults apply). */
++  yaml: string | null;
++  explanation: string[];
++  templates: {
++    id: string;
++    name: string;
++    summary: string;
++    yaml: string;
++    hash: string;
++    explanation: string[];
++  }[];
++}
++
++export interface PolicyCheck {
++  ok: boolean;
++  error: string | null;
++  hash: string | null;
++  explanation: string[];
++}
++
 +/** One line of Home's setup checklist (GET /setup), with its one-click fix when there is one. */
 +export interface SetupItem {
 +  id: string;
@@ -730,6 +758,8 @@ index 0000000..d530b5b
 +    mergeSha: string | null;
 +    /** Why a person had to decide; empty when the policy merged it. */
 +    mergeReasons: string[];
++    /** Why it merged, in plain words. */
++    mergeWhy: string | null;
 +    review: { verdict: string; findings: number } | null;
 +    builders: number;
 +    checks: { passed: number; failed: number; names: string[] };
@@ -753,6 +783,14 @@ index 0000000..d530b5b
 +    note: string | null;
 +    by: string | null;
 +    at: string | null;
++  }[];
++  /** Every decision the policy made on its own, with its reason. */
++  automated: {
++    at: string;
++    action: string;
++    by: string;
++    workOrder: string | null;
++    why: string | null;
 +  }[];
 +  release: ({ sha: string; at: string | null } & EvidenceApproval) | null;
 +  audit: {
@@ -854,6 +892,11 @@ index 0000000..d530b5b
 +  setup: () => request<SetupItem[]>(ap("/setup")),
 +  fixSetup: (id: string, body: { template?: string } = {}) =>
 +    post<SetupItem[]>(ap(`/setup/${encodeURIComponent(id)}`), body),
++  policy: () => request<PolicyView>(ap("/policy")),
++  checkPolicy: (yaml: string) =>
++    post<PolicyCheck>(ap("/policy/check"), { yaml }),
++  writePolicy: (body: { yaml?: string; template?: string }) =>
++    post<PolicyView>(ap("/policy"), body),
 +  workspaces: () => request<WorkspaceSummary[]>("/workspaces"),
 +  addWorkspace: (body: { name: string; path: string }) =>
 +    post<WorkspaceSummary>("/workspaces", body),
@@ -2365,10 +2408,10 @@ index 0000000..ea4084e
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..9deb02c
+index 0000000..4318c81
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1216 @@
+@@ -0,0 +1,1285 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2388,6 +2431,7 @@ index 0000000..9deb02c
 +    requirements: "Requirements",
 +    workOrders: "Work orders",
 +    audit: "Audit log",
++    policy: "Policy",
 +  },
 +  common: {
 +    loading: "Loading…",
@@ -2702,6 +2746,37 @@ index 0000000..9deb02c
 +    } as Record<string, string>,
 +    decidedToast: "Decision recorded",
 +  },
++  policy: {
++    title: "Policy",
++    subtitle: (source: string, hash: string | null) =>
++      hash ? `${source} · policy@${hash}` : source,
++    noRepo:
++      "The workspace isn't a git repo yet. The policy lives on its base branch: make it a repo from Home's setup checklist.",
++    what: "What it does",
++    whatHelp:
++      "In plain words, from the file below. Runs pin the policy when they start; changing it affects new runs only.",
++    file: "The file",
++    noFile:
++      "There's no .factory/policy.yml on the base branch, so the factory's defaults apply. Start from a template below to write the rules down.",
++    edit: "Edit",
++    editorLabel: ".factory/policy.yml",
++    check: "Check",
++    checking: "Checking…",
++    commit: (base: string) => `Commit to ${base}`,
++    confirm: (base: string) =>
++      `Yes, commit .factory/policy.yml to ${base} in my name`,
++    confirmHelp:
++      "It's a commit to the base branch like any other, recorded in the audit log. Runs already going keep the policy they started with.",
++    cancel: "Cancel",
++    valid: (hash: string) => `Valid. It would be policy@${hash}:`,
++    invalid: (error: string) => `Not valid: ${error}`,
++    templates: "Templates",
++    templatesHelp:
++      "Starting points from the most careful to the most hands-off. Every one leaves release to a person.",
++    useTemplate: "Start from this template",
++    showWhat: "What it does",
++    committed: "Committed. New runs follow it.",
++  },
 +  setup: {
 +    ready: (n: number, of: number) => `${n} of ${of} ready`,
 +    done: "Done",
@@ -2810,6 +2885,9 @@ index 0000000..9deb02c
 +    noControls: "The plan names no controls.",
 +    decisions: "Decisions",
 +    decisionsHelp: "Everything decided in the Inbox, and who decided it.",
++    automated: "Decided by the policy",
++    automatedHelp:
++      "What the policy decided on its own, each with its reason. The hash names the exact rules.",
 +    noDecisions: "No decisions yet.",
 +  },
 +  plan: {
@@ -2986,6 +3064,7 @@ index 0000000..9deb02c
 +    requirements: "Requisitos",
 +    workOrders: "Órdenes de trabajo",
 +    audit: "Registro de auditoría",
++    policy: "Política",
 +  },
 +  common: {
 +    loading: "Cargando…",
@@ -3299,6 +3378,36 @@ index 0000000..9deb02c
 +    },
 +    decidedToast: "Decisión registrada",
 +  },
++  policy: {
++    title: "Política",
++    subtitle: (source, hash) => (hash ? `${source} · policy@${hash}` : source),
++    noRepo:
++      "El espacio de trabajo aún no es un repositorio git. La política vive en su rama base: conviértalo en repositorio desde la lista de configuración de Inicio.",
++    what: "Qué hace",
++    whatHelp:
++      "En palabras sencillas, a partir del archivo de abajo. Las ejecuciones fijan la política al empezar; cambiarla solo afecta a las nuevas.",
++    file: "El archivo",
++    noFile:
++      "No hay .factory/policy.yml en la rama base, así que se aplican los valores por defecto de la fábrica. Empiece desde una plantilla para dejar las reglas por escrito.",
++    edit: "Editar",
++    editorLabel: ".factory/policy.yml",
++    check: "Comprobar",
++    checking: "Comprobando…",
++    commit: (base) => `Confirmar en ${base}`,
++    confirm: (base) =>
++      `Sí, confirmar .factory/policy.yml en ${base} a mi nombre`,
++    confirmHelp:
++      "Es un commit en la rama base como cualquier otro, registrado en la auditoría. Las ejecuciones en curso mantienen la política con la que empezaron.",
++    cancel: "Cancelar",
++    valid: (hash) => `Válida. Sería policy@${hash}:`,
++    invalid: (error) => `No es válida: ${error}`,
++    templates: "Plantillas",
++    templatesHelp:
++      "Puntos de partida, de la más prudente a la más autónoma. Todas dejan la publicación en manos de una persona.",
++    useTemplate: "Empezar con esta plantilla",
++    showWhat: "Qué hace",
++    committed: "Confirmada. Las nuevas ejecuciones la siguen.",
++  },
 +  setup: {
 +    ready: (n, of) => `${n} de ${of} listos`,
 +    done: "Hecho",
@@ -3410,6 +3519,9 @@ index 0000000..9deb02c
 +    decisions: "Decisiones",
 +    decisionsHelp:
 +      "Todo lo que se decidió en la bandeja de entrada, y quién lo decidió.",
++    automated: "Decidido por la política",
++    automatedHelp:
++      "Lo que la política decidió por sí sola, cada cosa con su motivo. El hash identifica las reglas exactas.",
 +    noDecisions: "Aún no hay decisiones.",
 +  },
 +  plan: {
@@ -3587,14 +3699,15 @@ index 0000000..9deb02c
 +}
 diff --git a/src/factory/factory-nav-links.tsx b/src/factory/factory-nav-links.tsx
 new file mode 100644
-index 0000000..6cda042
+index 0000000..e64d6de
 --- /dev/null
 +++ b/src/factory/factory-nav-links.tsx
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,85 @@
 +import {
 +  FileText,
 +  Inbox,
 +  Rocket,
++  Scale,
 +  ShieldCheck,
 +  SquareKanban,
 +} from "lucide-react";
@@ -3645,6 +3758,13 @@ index 0000000..6cda042
 +        ) : null}
 +      </div>
 +      <SidebarNavLink
++        to="/autopilot/policy"
++        label={copy.nav.policy}
++        testId="sidebar-factory-policy-link"
++        collapsed={collapsed}
++        icon={<Scale width={ICON_SIZE} height={ICON_SIZE} />}
++      />
++      <SidebarNavLink
 +        to="/requirements"
 +        label={copy.nav.requirements}
 +        testId="sidebar-factory-requirements-link"
@@ -3670,10 +3790,10 @@ index 0000000..6cda042
 +}
 diff --git a/src/factory/factory-routes.ts b/src/factory/factory-routes.ts
 new file mode 100644
-index 0000000..a90f6d1
+index 0000000..c87818c
 --- /dev/null
 +++ b/src/factory/factory-routes.ts
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,23 @@
 +import { route } from "@react-router/dev/routes";
 +
 +/**
@@ -3683,6 +3803,7 @@ index 0000000..a90f6d1
 + */
 +export const factoryRoutes = [
 +  route("autopilot", "factory/routes/autopilot.tsx"),
++  route("autopilot/policy", "factory/routes/autopilot-policy.tsx"),
 +  route(
 +    "autopilot/runs/:runId/evidence",
 +    "factory/routes/autopilot-evidence.tsx",
@@ -3698,10 +3819,10 @@ index 0000000..a90f6d1
 +];
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..5f0a6b4
+index 0000000..b2d86ee
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,426 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -3738,6 +3859,7 @@ index 0000000..5f0a6b4
 +  inboxCount: ["factory", "autopilot", "inbox-count"] as const,
 +  workspaces: ["factory", "workspaces"] as const,
 +  setup: ["factory", "autopilot", "setup"] as const,
++  policy: ["factory", "autopilot", "policy"] as const,
 +};
 +
 +// Don't hammer a server that isn't running (the offline card has a retry
@@ -3966,6 +4088,31 @@ index 0000000..5f0a6b4
 +    mutationFn: (id: string) => FactoryApi.fixSetup(id),
 +    onSuccess: (items) =>
 +      queryClient.setQueryData(FACTORY_QUERY_KEYS.setup, items),
++    onSettled: () => invalidateAutopilot(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++export const usePolicy = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.policy,
++    queryFn: FactoryApi.policy,
++    retry,
++    meta: { disableToast: true },
++  });
++
++export const useCheckPolicy = () =>
++  useMutation({
++    mutationFn: FactoryApi.checkPolicy,
++    meta: { disableToast: true },
++  });
++
++export function useWritePolicy() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: FactoryApi.writePolicy,
++    onSuccess: (view) =>
++      queryClient.setQueryData(FACTORY_QUERY_KEYS.policy, view),
 +    onSettled: () => invalidateAutopilot(queryClient),
 +    meta: { disableToast: true },
 +  });
@@ -4338,10 +4485,10 @@ index 0000000..380b38f
 +}
 diff --git a/src/factory/routes/autopilot-evidence.tsx b/src/factory/routes/autopilot-evidence.tsx
 new file mode 100644
-index 0000000..9816ea7
+index 0000000..84894b6
 --- /dev/null
 +++ b/src/factory/routes/autopilot-evidence.tsx
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,666 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useParams } from "react-router";
@@ -4449,6 +4596,7 @@ index 0000000..9816ea7
 +      <WorkOrders evidence={evidence} />
 +      <Controls evidence={evidence} />
 +      <Decisions evidence={evidence} />
++      <Automated evidence={evidence} />
 +      <p className="text-xs text-muted">
 +        {copy.evidence.generated(
 +          formatWhen(evidence.generatedAt, i18n.language),
@@ -4832,7 +4980,7 @@ index 0000000..9816ea7
 +                      ))}
 +                    </ul>
 +                  ) : w.approval?.kind === "policy" ? (
-+                    copy.evidence.allRulesHeld
++                    (w.mergeWhy ?? copy.evidence.allRulesHeld)
 +                  ) : null}
 +                </td>
 +              </tr>
@@ -4885,6 +5033,45 @@ index 0000000..9816ea7
 +      ) : (
 +        <p className="text-sm text-muted">{copy.evidence.noControls}</p>
 +      )}
++    </section>
++  );
++}
++
++/** What the policy decided on its own, each with its reason in plain words. */
++function Automated({ evidence }: { evidence: Evidence }) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  if (!evidence.automated.length) return null;
++  return (
++    <section
++      aria-labelledby="factory-evidence-automated"
++      className="flex flex-col gap-3"
++    >
++      <SectionHeading
++        id="factory-evidence-automated"
++        title={copy.evidence.automated}
++        help={copy.evidence.automatedHelp}
++      />
++      <ul
++        className="flex flex-col gap-2 text-sm"
++        data-testid="factory-evidence-automated"
++      >
++        {evidence.automated.map((a) => (
++          <li
++            key={`${a.at}-${a.action}-${a.workOrder}`}
++            className="flex flex-col"
++          >
++            <span className="flex flex-wrap gap-x-2 text-xs text-muted">
++              <time dateTime={a.at}>{formatWhen(a.at, i18n.language)}</time>
++              <span className="font-mono">{a.by}</span>
++              {a.workOrder ? (
++                <span className="font-mono">{a.workOrder}</span>
++              ) : null}
++            </span>
++            <span className="text-foreground">{a.why ?? a.action}</span>
++          </li>
++        ))}
++      </ul>
 +    </section>
 +  );
 +}
@@ -4968,12 +5155,338 @@ index 0000000..9816ea7
 +    </section>
 +  );
 +}
+diff --git a/src/factory/routes/autopilot-policy.tsx b/src/factory/routes/autopilot-policy.tsx
+new file mode 100644
+index 0000000..a798c9b
+--- /dev/null
++++ b/src/factory/routes/autopilot-policy.tsx
+@@ -0,0 +1,320 @@
++import React from "react";
++import { CircleAlert, CircleCheck, FilePen } from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { cn } from "#/utils/utils";
++import type { PolicyCheck, PolicyView } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useCheckPolicy, usePolicy, useWritePolicy } from "../hooks";
++import {
++  FactoryError,
++  FactoryLoading,
++  FactoryPage,
++} from "../components/factory-page";
++import { factoryFieldClassName } from "../components/start-agent-modal";
++
++/**
++ * The workspace's policy: what it makes the factory do in plain words, the
++ * file on the base branch, templates to start from, and an editor whose
++ * commit lands on the base branch in the person's name.
++ */
++export default function FactoryAutopilotPolicyRoute() {
++  const copy = useFactoryCopy();
++  const policy = usePolicy();
++  const [draft, setDraft] = React.useState<string | null>(null);
++  const data = policy.data;
++
++  return (
++    <FactoryPage
++      testId="factory-policy"
++      title={copy.policy.title}
++      subtitle={data ? copy.policy.subtitle(data.source, data.hash) : undefined}
++      error={policy.error}
++      onRetry={() => void policy.refetch()}
++    >
++      <div className="mx-auto flex max-w-4xl flex-col gap-8 px-6 py-6">
++        {policy.isLoading ? <FactoryLoading /> : null}
++        {data ? (
++          <>
++            {data.error ? (
++              <p
++                role="alert"
++                className="rounded-lg border border-feedback-error px-3 py-2 text-sm text-feedback-error"
++              >
++                {data.error}
++              </p>
++            ) : null}
++            {!data.base ? (
++              <p className="text-sm text-muted">{copy.policy.noRepo}</p>
++            ) : null}
++            {data.explanation.length ? (
++              <section
++                aria-labelledby="factory-policy-what"
++                className="flex flex-col gap-2"
++              >
++                <Heading
++                  id="factory-policy-what"
++                  title={copy.policy.what}
++                  help={copy.policy.whatHelp}
++                />
++                <Explanation lines={data.explanation} />
++              </section>
++            ) : null}
++            {draft !== null && data.base ? (
++              <Editor
++                base={data.base}
++                initial={draft}
++                onClose={() => setDraft(null)}
++              />
++            ) : (
++              <FileSection
++                data={data}
++                onEdit={() => setDraft(data.yaml ?? "")}
++              />
++            )}
++            <Templates
++              data={data}
++              onUse={(yaml) => {
++                setDraft(yaml);
++                window.scrollTo({ top: 0, behavior: "smooth" });
++              }}
++            />
++          </>
++        ) : null}
++      </div>
++    </FactoryPage>
++  );
++}
++
++function Heading({
++  id,
++  title,
++  help,
++}: {
++  id: string;
++  title: string;
++  help?: string;
++}) {
++  return (
++    <div>
++      <h2 id={id} className="text-sm font-semibold text-foreground">
++        {title}
++      </h2>
++      {help ? <p className="text-xs text-muted">{help}</p> : null}
++    </div>
++  );
++}
++
++function Explanation({ lines }: { lines: string[] }) {
++  return (
++    <ul className="flex list-disc flex-col gap-1 pl-5 text-sm text-foreground">
++      {lines.map((line) => (
++        <li key={line}>{line}</li>
++      ))}
++    </ul>
++  );
++}
++
++function FileSection({
++  data,
++  onEdit,
++}: {
++  data: PolicyView;
++  onEdit: () => void;
++}) {
++  const copy = useFactoryCopy();
++  return (
++    <section
++      aria-labelledby="factory-policy-file"
++      className="flex flex-col gap-2"
++    >
++      <div className="flex items-center justify-between gap-2">
++        <Heading id="factory-policy-file" title={copy.policy.file} />
++        {data.base ? (
++          <BrandButton
++            testId="factory-policy-edit"
++            type="button"
++            variant="secondary"
++            onClick={onEdit}
++            startContent={<FilePen className="size-4" aria-hidden />}
++          >
++            {copy.policy.edit}
++          </BrandButton>
++        ) : null}
++      </div>
++      {data.yaml === null ? (
++        <p className="text-sm text-muted">{copy.policy.noFile}</p>
++      ) : (
++        <pre
++          data-testid="factory-policy-yaml"
++          className="overflow-x-auto rounded-xl border border-border-subtle bg-surface p-3 font-mono text-xs text-foreground"
++        >
++          {data.yaml}
++        </pre>
++      )}
++    </section>
++  );
++}
++
++function CheckResult({ result }: { result: PolicyCheck }) {
++  const copy = useFactoryCopy();
++  return (
++    <div
++      role="status"
++      data-testid="factory-policy-check"
++      className={cn(
++        "flex flex-col gap-2 rounded-lg border px-3 py-2 text-sm",
++        result.ok
++          ? "border-border-subtle"
++          : "border-feedback-error text-feedback-error",
++      )}
++    >
++      <p className="flex items-center gap-1.5">
++        {result.ok ? (
++          <CircleCheck className="size-4 text-success" aria-hidden />
++        ) : (
++          <CircleAlert className="size-4" aria-hidden />
++        )}
++        {result.ok
++          ? copy.policy.valid(result.hash ?? "")
++          : copy.policy.invalid(result.error ?? "")}
++      </p>
++      {result.ok ? <Explanation lines={result.explanation} /> : null}
++    </div>
++  );
++}
++
++function Editor({
++  base,
++  initial,
++  onClose,
++}: {
++  base: string;
++  initial: string;
++  onClose: () => void;
++}) {
++  const copy = useFactoryCopy();
++  const check = useCheckPolicy();
++  const write = useWritePolicy();
++  const [yaml, setYaml] = React.useState(initial);
++  const [confirming, setConfirming] = React.useState(false);
++  const id = React.useId();
++  React.useEffect(() => setYaml(initial), [initial]);
++
++  return (
++    <section className="flex flex-col gap-2">
++      <label htmlFor={id} className="text-sm font-semibold text-foreground">
++        {copy.policy.editorLabel}
++      </label>
++      <textarea
++        id={id}
++        data-testid="factory-policy-editor"
++        className={cn(factoryFieldClassName, "min-h-72 font-mono text-xs")}
++        value={yaml}
++        spellCheck={false}
++        onChange={(e) => {
++          setYaml(e.target.value);
++          setConfirming(false);
++          check.reset();
++        }}
++      />
++      {check.data ? <CheckResult result={check.data} /> : null}
++      {confirming ? (
++        <p className="text-xs text-muted">{copy.policy.confirmHelp}</p>
++      ) : null}
++      <div className="flex flex-wrap gap-2">
++        <BrandButton
++          testId="factory-policy-check-button"
++          type="button"
++          variant="secondary"
++          onClick={() => check.mutate(yaml)}
++          isDisabled={check.isPending || !yaml.trim()}
++        >
++          {check.isPending ? copy.policy.checking : copy.policy.check}
++        </BrandButton>
++        <BrandButton
++          testId="factory-policy-commit"
++          type="button"
++          variant="primary"
++          isDisabled={write.isPending || !yaml.trim()}
++          onClick={() => {
++            if (!confirming) {
++              setConfirming(true);
++              check.mutate(yaml);
++              return;
++            }
++            write.mutate({ yaml }, { onSuccess: onClose });
++          }}
++        >
++          {confirming ? copy.policy.confirm(base) : copy.policy.commit(base)}
++        </BrandButton>
++        <BrandButton type="button" variant="tertiary" onClick={onClose}>
++          {copy.policy.cancel}
++        </BrandButton>
++      </div>
++      <FactoryError error={write.error ?? check.error} />
++    </section>
++  );
++}
++
++function Templates({
++  data,
++  onUse,
++}: {
++  data: PolicyView;
++  onUse: (yaml: string) => void;
++}) {
++  const copy = useFactoryCopy();
++  const [open, setOpen] = React.useState<string | null>(null);
++  return (
++    <section
++      aria-labelledby="factory-policy-templates"
++      className="flex flex-col gap-3"
++    >
++      <Heading
++        id="factory-policy-templates"
++        title={copy.policy.templates}
++        help={copy.policy.templatesHelp}
++      />
++      <ul className="grid gap-3 sm:grid-cols-2">
++        {data.templates.map((t) => (
++          <li
++            key={t.id}
++            data-testid={`factory-policy-template-${t.id}`}
++            className={cn(
++              "flex flex-col gap-2 rounded-xl border bg-surface px-4 py-3",
++              t.hash === data.hash ? "border-primary" : "border-border-subtle",
++            )}
++          >
++            <p className="flex items-baseline justify-between gap-2">
++              <span className="text-sm font-semibold text-foreground">
++                {t.name}
++              </span>
++              <span className="font-mono text-xs text-muted">{`policy@${t.hash}`}</span>
++            </p>
++            <p className="text-sm text-muted">{t.summary}</p>
++            {open === t.id ? <Explanation lines={t.explanation} /> : null}
++            <div className="flex flex-wrap gap-2">
++              <BrandButton
++                type="button"
++                variant="tertiary"
++                onClick={() => setOpen(open === t.id ? null : t.id)}
++              >
++                {copy.policy.showWhat}
++              </BrandButton>
++              {data.base ? (
++                <BrandButton
++                  testId={`factory-policy-use-${t.id}`}
++                  type="button"
++                  variant="secondary"
++                  onClick={() => onUse(t.yaml)}
++                >
++                  {copy.policy.useTemplate}
++                </BrandButton>
++              ) : null}
++            </div>
++          </li>
++        ))}
++      </ul>
++    </section>
++  );
++}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..45959b9
+index 0000000..dd8f0b8
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,1067 @@
+@@ -0,0 +1,1072 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -5938,6 +6451,11 @@ index 0000000..45959b9
 +              </span>
 +            ) : null}
 +          </span>
++          {wo.mergeWhy ? (
++            <p className="text-xs text-muted" data-testid="factory-merge-why">
++              {wo.mergeWhy}
++            </p>
++          ) : null}
 +        </div>
 +
 +        {items

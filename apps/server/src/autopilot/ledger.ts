@@ -160,6 +160,7 @@ export interface WorkOrder {
   findings: Finding[] | null; // what triggered the latest repair
   budgetExtraUsd: number;
   conflictRounds: number; // merge-conflict rounds so far, outside the repair limits
+  mergeWhy: string | null; // why it merged, in plain words (the policy's rules that held, or who approved and why they were asked)
   mergedBy: string | null; // "policy@<hash>" or "user:<name>"
   updatedAt: string;
 }
@@ -399,6 +400,11 @@ const SCHEMA_V12 = `
 ALTER TABLE runs ADD COLUMN preview TEXT;
 `;
 
+// v14: why each work order merged, in plain words.
+const SCHEMA_V14 = `
+ALTER TABLE work_orders ADD COLUMN merge_why TEXT;
+`;
+
 // v13: lessons: lines for the workspace's AGENTS.md, from mistakes builders keep making.
 const SCHEMA_V13 = `
 CREATE TABLE lessons (
@@ -482,6 +488,7 @@ export function openLedger(file: string) {
   if (version < 11) transaction(() => db.exec(`${SCHEMA_V11}\nPRAGMA user_version = 11;`));
   if (version < 12) transaction(() => db.exec(`${SCHEMA_V12}\nPRAGMA user_version = 12;`));
   if (version < 13) transaction(() => db.exec(`${SCHEMA_V13}\nPRAGMA user_version = 13;`));
+  if (version < 14) transaction(() => db.exec(`${SCHEMA_V14}\nPRAGMA user_version = 14;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

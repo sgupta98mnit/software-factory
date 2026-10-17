@@ -152,6 +152,8 @@ export function createAutopilotRoutes(o: Orchestrator) {
       conversationId: last?.conversationId ?? null,
       findings: wo.findings,
       mergedBy: wo.mergedBy,
+      // Why it merged, in plain words (the rules that held, or who approved it and why they were asked).
+      mergeWhy: wo.mergeWhy,
       updatedAt: wo.updatedAt,
     };
   }
@@ -260,6 +262,11 @@ export function createAutopilotRoutes(o: Orchestrator) {
   // Home's setup checklist, and its one-click fixes (files go onto the base branch in the person's name).
   app.get("/setup", async (c) => c.json(await o.setup()));
   app.post("/setup/:fix", async (c) => c.json(await o.fixSetup(c.req.param("fix"), LOCAL_USER, await body<{ template?: unknown }>(c))));
+
+  // The Policy page: the file on the base branch in plain words, templates, and a person's edits (committed in their name).
+  app.get("/policy", async (c) => c.json(await o.policyView()));
+  app.post("/policy/check", async (c) => c.json(o.checkPolicy((await body<{ yaml?: unknown }>(c)).yaml)));
+  app.post("/policy", async (c) => c.json(await o.writePolicy(await body<{ yaml?: unknown; template?: unknown }>(c), LOCAL_USER)));
 
   // What the factory has learned: per policy hash, how its merge rules fared; and the AGENTS.md lessons.
   app.get("/insights", (c) => c.json(buildInsights(ledger, listAudit(Number.MAX_SAFE_INTEGER))));

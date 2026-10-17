@@ -79,6 +79,8 @@ export async function buildEvidence(ledger: Ledger, workspace: string, run: Run)
       mergeSha: (merged?.data.sha as string | undefined) ?? null,
       // Why a person had to decide (empty for a policy merge: every rule held).
       mergeReasons: (merged?.data.reasons as string[] | undefined) ?? [],
+      // Why it merged, in plain words: the rules that held, or who approved it and why they were asked.
+      mergeWhy: w.mergeWhy,
       review: review?.verdict ? { verdict: review.verdict, findings: review.findings?.length ?? 0 } : null,
       builders: attempts.filter((a) => a.workOrderId === w.id && a.role === "builder").length,
       checks: { passed: own.filter((c) => c.ok).length, failed: own.filter((c) => !c.ok).length, names: [...new Set(own.map((c) => c.name))] },
@@ -118,6 +120,11 @@ export async function buildEvidence(ledger: Ledger, workspace: string, run: Run)
       at: i.decidedAt,
     }))
     .sort((a, b) => (a.at ?? "").localeCompare(b.at ?? "")); // in the order they were made
+
+  // Every decision the policy made on its own, with its reason in plain words.
+  const automated = events
+    .filter((e) => typeof e.data.why === "string" && (String(e.actor).startsWith("policy@") || (e.action === "autopilot.intake_received" && e.data.mode === "run")))
+    .map((e) => ({ at: e.at, action: e.action.replace(/^autopilot\./, ""), by: e.actor, workOrder: (e.data.workOrder as string | undefined) ?? null, why: (e.data.why as string | undefined) ?? null }));
 
   const verify = verifyAudit();
   const pick = (e: AuditEvent | undefined) => (e ? { at: e.at, by: e.actor, seq: e.seq } : null);
@@ -159,6 +166,7 @@ export async function buildEvidence(ledger: Ledger, workspace: string, run: Run)
     workOrders: workOrderEvidence,
     controls,
     decisions,
+    automated,
     release: run.releasedSha ? { sha: run.releasedSha, at: run.releasedAt, ...approver(run.releasedBy) } : null,
     audit: {
       events: events.length,

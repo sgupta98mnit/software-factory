@@ -282,9 +282,10 @@ const some = (items: string[], max = 10) => (items.length > max ? `${items.slice
 
 /**
  * Whether the policy merges a work order on its own, and if not, why a person
- * has to. Auto only when every check holds; autonomy suggest never is.
+ * has to. Auto only when every check holds; autonomy suggest never is. `why`
+ * says it in one plain sentence either way, for the audit log and the screens.
  */
-export function evaluateMerge(policy: Policy, facts: MergeFacts): { auto: boolean; reasons: string[] } {
+export function evaluateMerge(policy: Policy, facts: MergeFacts): { auto: boolean; reasons: string[]; why: string } {
   const { autoMerge } = policy;
   const reasons: string[] = [];
   if (facts.autonomy === "suggest") reasons.push("Autonomy is suggest: a person approves every merge.");
@@ -304,7 +305,10 @@ export function evaluateMerge(policy: Policy, facts: MergeFacts): { auto: boolea
   if (facts.linesChanged >= autoMerge.maxChangedLines) {
     reasons.push(`Changes ${facts.linesChanged} lines; the policy merges fewer than ${autoMerge.maxChangedLines} on its own.`);
   }
-  return { auto: !reasons.length, reasons };
+  const why = reasons.length
+    ? `The policy left it to a person: ${reasons.map((r) => r.replace(/\.$/, "")).join("; ")}.`
+    : `The policy merged it: the gates${facts.hiddenTestsOk ? ", the hidden acceptance tests" : ""} and the review passed, the scans found no secrets or risky dependencies, it adds no dependency outside the allowlist, it changes no sensitive path, and it changes ${facts.linesChanged} line${facts.linesChanged === 1 ? "" : "s"} (the limit is ${autoMerge.maxChangedLines}).`;
+  return { auto: !reasons.length, reasons, why };
 }
 
 const MANIFEST = /(^|\/)package\.json$/;

@@ -146,7 +146,11 @@ const OK: MergeFacts = {
 };
 
 test("evaluateMerge: auto only when every check holds; each one that doesn't is a reason a person sees", () => {
-  const with_ = (facts: Partial<MergeFacts>, policy = DEFAULT_POLICY) => evaluateMerge(policy, { ...OK, ...facts });
+  // `why` (the plain sentence) is tested with the Policy page; here, the decision and its reasons.
+  const with_ = (facts: Partial<MergeFacts>, policy = DEFAULT_POLICY) => {
+    const { auto, reasons } = evaluateMerge(policy, { ...OK, ...facts });
+    return { auto, reasons };
+  };
   assert.deepEqual(with_({}), { auto: true, reasons: [] });
   assert.deepEqual(with_({ autonomy: "autonomous", hiddenTestsOk: null }), { auto: true, reasons: [] }); // hidden tests not run
   assert.equal(with_({ linesChanged: 399 }).auto, true);

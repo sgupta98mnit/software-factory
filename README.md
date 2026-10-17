@@ -123,6 +123,8 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 
 ## Autopilot policy
 
+The **Policy** page (sidebar) shows the policy in plain words, the file itself, and four templates (recommended, cautious, federal strict, hands-off; every one leaves release to a person). You can edit the file there: **Check** says what a draft would do, or what's wrong with it, without writing anything, and **Commit** puts it on the base branch in your name, after a confirmation. Runs already going keep the policy they started with. Every decision the policy makes on its own carries a plain-language reason: on the work order ("The policy merged it: the gates and the review passed, … 42 lines (the limit is 400)"), in the audit log, and in the run's evidence under **Decided by the policy**.
+
 Each run reads `.factory/policy.yml` from the workspace's base branch when it starts and keeps it until the run ends. It never reads the file from a worktree or a work-order branch, so a change can't relax its own rules. Without the file, Autopilot uses these defaults. Set only the keys you want to change, and quote glob patterns:
 
 ```yaml

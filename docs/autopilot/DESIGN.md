@@ -553,7 +553,30 @@ refused on a dirty checkout of the base) and are audited
 Templates (recommended, cautious, federal, hands-off) each parse under
 `parsePolicy`, and every one writes `release: { auto: false }` out.
 
-## 23. Changes since the first build
+## 23. The Policy page, and a reason for every automated decision
+
+- `explainPolicy` (explain.ts) turns a policy into one plain sentence per
+  thing it decides: autonomy, merges, review, repairs, gates, hidden tests,
+  budgets, parallelism and queue, preview, release, intake, watchdog, and
+  learning.
+- `GET /policy` returns the base branch's file (or null), its source, hash,
+  error and explanation, plus the templates, each with its hash and
+  explanation. `POST /policy/check {yaml}` parses a draft without writing.
+  `POST /policy {yaml | template}` validates it, then commits it to the base
+  branch through `commitToBase` as the person, audited as `policy_written`
+  with the template, the new hash and the old one (`from`).
+- `evaluateMerge` also returns `why`: one sentence on why the policy merged
+  (every rule that held, with the lines and the limit) or why it left the
+  work order to a person. On merge, `work_orders.merge_why` (ledger v14)
+  and `autopilot.work_order_merged.data.why` keep it. A person's merge reads
+  "<who> merged it (“note”). The policy asked a person because: …". These
+  audit records also carry `why`: `plan_approved` by the policy,
+  `release_requested` by `release.auto`, `replanned` by the policy, and
+  `intake_received`. The evidence's `automated` list is every policy (or
+  intake `run`) decision with its reason; the Pipeline's work-order panel
+  shows `mergeWhy`.
+
+## 24. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a
