@@ -40,6 +40,14 @@ Goal ─▶ spec agent ─▶ openspec validate --strict ─▶ commit ─▶ cr
 | `scan.ts` | Secret scan of added lines, dependency scan of package.json changes |
 | `notify.ts` | Slack/Teams webhook alerts: one alert, then a daily digest |
 | `hidden.ts` | Hidden acceptance tests: headers, selection, running, findings by scenario |
+| `evidence.ts` | A run's evidence: scenarios to hidden tests to work orders to approvers, controls, decisions, the audit chain (§14) |
+| `intake.ts` | GitHub issues, signed webhooks and the bug form: signature checks, parsing, the policy's choice (§17) |
+| `preview.ts` | Start the app, check its pages, take screenshots with a headless Chromium (§19) |
+| `learning.ts` | Lessons for AGENTS.md from repeated mistakes; insights per policy hash (§20) |
+| `registry.ts` | More than one workspace: an orchestrator each, `/workspaces`, `/w/:id/autopilot/*`, the combined Inbox (§21) |
+| `policy-templates.ts` | The four policy templates and the starter AGENTS.md (§22–23) |
+| `explain.ts` | The policy in plain sentences (§23) |
+| `metrics.ts` | Lead time, autonomy rate, cost per change, failure reasons (§24) |
 | `routes.ts` | HTTP API under `/sf-api/autopilot` (§5) |
 | `../demo/` | Fake agent server and scripted agents (tests, `pnpm demo`) |
 
@@ -88,9 +96,22 @@ All JSON, camelCase. Errors are `{ error }` with 404 (missing run or item) or
 | `POST /runs` `{ goal, autonomy?, budgetUsd? }` | `RunSummary` |
 | `GET /runs/:id` | `RunDetail` = summary + `workOrders[]`, `attempts[]`, `checks[]`, `inbox[]` (all states), `etaMs` |
 | `POST /runs/:id/pause\|resume\|cancel` `{ note? }` | `RunSummary` |
+| `POST /runs/:id/release` | `RunSummary` (a person asks to release a finished run, §13) |
+| `POST /runs/:id/revise` `{ note }` | `RunSummary` (a spec change, §18) |
+| `GET /runs/:id/evidence` (`?download=1` records the export) | `Evidence` (§14) |
+| `GET /runs/:id/preview/:file` | A preview screenshot (PNG, §19) |
+| `POST /intake/:source` (`github`, `webhook`, `bug`) | `{ outcome, reason, run }` (§17) |
+| `GET /setup`, `POST /setup/:fix` `{ template? }` | `SetupItem[]` (§22) |
+| `GET /policy`, `POST /policy/check` `{ yaml }`, `POST /policy` `{ yaml \| template }` | `PolicyView`, `PolicyCheck`, `PolicyView` (§23) |
+| `GET /insights`, `GET /lessons` | `PolicyInsight[]`, lessons (§20) |
+| `GET /metrics?days=N` | `Metrics` (§24) |
 | `GET /inbox?state=open\|decided\|all` | `InboxItem[]`, newest first |
 | `GET /inbox/count` | `{ open }` |
 | `POST /inbox/:id/decide` `{ choice, note? }` | `InboxItem` |
+
+Outside `/autopilot`, the registry (§21) serves `GET/POST /workspaces`,
+`DELETE /workspaces/:id`, `GET /workspaces/inbox[/count]` (every workspace's
+items) and forwards `/w/:id/autopilot/*` to that workspace's routes.
 
 `RunSummary`: `id, goal, change, autonomy, state, pausedReason, baseBranch,
 integrationBranch, costUsd, budgetUsd, policyHash, createdBy, createdAt,
@@ -124,10 +145,13 @@ or its work orders move.
 | `merge_approval` | merge, send_back (note), skip |
 | `run_paused` | resume, cancel |
 | `integration_moved` | restore (put the branch back where the factory left it), cancel |
-
 | `budget_reached` (run) | raise_half, raise_double, cancel |
 | `budget_reached` (work order) | raise, skip, cancel |
 | `release` | release, hold |
+| `intake` | start, cancel ("Not now") |
+| `replan_approval` | replan, keep, cancel |
+| `spec_revision` (the revision couldn't be finished) | retry, drop |
+| `lesson` | accept, decline |
 
 ## 7. Invariants the tests hold
 

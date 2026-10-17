@@ -8,6 +8,46 @@ current code before acting on it.
 Source: an audit of `apps/server/src/autopilot/*` on 17 Oct 2026 (repros were
 run against the fake agent server), and the Phase 1 UI review.
 
+## What remains
+
+All five phases of the Autopilot plan are built and their tests pass.
+Every confirmed defect below is fixed with a regression test. In order of
+importance, this is what's still open:
+
+1. **Not yet run against real models.** Every run in development and testing
+   used the scripted fake agent server, by design: real agents are never run
+   unattended. The first supervised runs with Claude Code or Codex will test
+   things the scripts can't: how briefs read to a real model, verdict parsing
+   on real replies, cost accounting, and how often the watchdog fires. Start
+   with `suggest` or `supervised` on a throwaway repo, with someone watching
+   the Inbox.
+2. **No sign-in or roles.** Anything that reaches 127.0.0.1 can decide,
+   release or change the policy, and people are named by `SF_USER` (see
+   "Plausible" below). This comes first for any shared or production use.
+3. **No sandbox.** Several gaps below need agents, gates, hidden tests and the
+   preview in containers instead of on the host:
+   - hidden tests share a process with the builder's code;
+   - repo-level git config filters;
+   - `HOME` is visible to gates;
+   - the preview's port and processes.
+4. **Intake needs a relay you run**, and that relay should forward only
+   `/intake/github` and `/intake/webhook`. Webhook requests without a
+   `reference` aren't deduplicated.
+5. **Spec drift edge cases:**
+   - a re-plan reads tasks.md from the worktree;
+   - a stale `replan_approval` item;
+   - old-plan work orders can still be dispatched in a short window;
+   - a person-approved work order can break the plan.
+6. **Concurrency on the base branch:** lessons and releases aren't ordered
+   against each other, and `queue.maxActiveRuns` holds only when runs start.
+7. **Server-written text is English only.** The Canvas copy is in English
+   and Spanish, but the policy's plain-language explanation, merge reasons
+   and metrics failure reasons come from the server in English.
+8. **The demo shows Canvas's onboarding once:** its welcome steps and the
+   usage-data question ("Skip for now", then "Confirm").
+
+The "Plausible, not fixed yet" section has the full list with details.
+
 ## Confirmed
 
 | # | Severity | Issue | Status |
@@ -195,8 +235,9 @@ run against the fake agent server), and the Phase 1 UI review.
   Accept.
 - Insights don't count flaky re-runs in the release test (it records no
   `gates_run`).
-- The combined Inbox's item ids repeat across workspaces; Canvas keys and
-  routes have to use the workspace too.
+- The combined Inbox's item ids repeat across workspaces. Canvas's cards key on
+  the workspace and id and decide through the item's own workspace API; only
+  the cards' test ids (`factory-inbox-item-<id>`) can repeat.
 
 ## Phase 1 UI review (fixed in "Home, Pipeline and Inbox screens")
 

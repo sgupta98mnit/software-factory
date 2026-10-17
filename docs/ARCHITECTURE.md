@@ -3,6 +3,7 @@
 ```
 Browser: Agent Canvas (canvas/, our OpenHands clone)
    │  Chat, conversations, settings ........ OpenHands, unchanged
+   │  Autopilot: Home · Pipeline · Inbox · Evidence · Policy · Metrics
    │  Requirements · Work orders · Audit log  canvas/src/factory/ (ours)
    │
    ▼  http://localhost:8000  (Canvas ingress)
@@ -14,12 +15,22 @@ Browser: Agent Canvas (canvas/, our OpenHands clone)
                                           ├── backlog.ts   reads backlog/tasks/*.md, edits via `backlog` CLI, watches the folder
                                           ├── briefs.ts    the first message an agent gets
                                           ├── audit.ts     data/audit.jsonl (hash chain)
-                                          └── events.ts    Server-Sent Events: "something changed"
+                                          ├── events.ts    Server-Sent Events: "something changed"
+                                          └── autopilot/   goal → spec → plan → build → verify → merge → release
+                                               ├── orchestrator.ts  state machine, tick() every 3 s
+                                               ├── ledger.ts        data/autopilot.db (SQLite): runs, work orders, attempts, checks, inbox
+                                               ├── openhands.ts     drives agents as OpenHands conversations (/api)
+                                               └── registry.ts      more workspaces: data/workspaces/<id>/
 
 Workspace repo (workspaces/benefits-portal, or SF_WORKSPACE)
    openspec/   requirements: changes/<name>/{proposal,design,tasks}.md + specs/
    backlog/    work orders: tasks/wo-N - Title.md
+   .factory/policy.yml   Autopilot's rules, read from the base branch only
    AGENTS.md, CLAUDE.md, .claude/, .agents/   rules and skills the agents load
+
+Factory data (data/, or SF_DATA_DIR; git-ignored)
+   audit.jsonl, autopilot.db, worktrees/ (one per run and work order),
+   hidden-tests/ (outside every worktree), previews/, workspaces/<id>/
 ```
 
 ## The split
@@ -37,6 +48,30 @@ Workspace repo (workspaces/benefits-portal, or SF_WORKSPACE)
 3. **The agent works in Canvas.** As it runs `backlog task edit WO-1 --status "In Progress"`, `--check-ac 1`, `--final-summary …`, the API's file watcher hashes each change into the audit log and tells open pages to refresh (SSE), so the board moves while you watch.
 4. **You approve.** Approve moves it to the last status (Done) through the CLI and records `work_order.approved` with your name and note.
 5. **If anything else marks it Done** (an agent, a hand edit), the watcher records `work_order.done_without_approval` and the board shows **Not approved** until a person approves it or moves it back.
+
+## Autopilot
+
+Autopilot runs the life of a work order above without a person at each step: a goal becomes a validated OpenSpec change, the change becomes work orders in dependency waves, builders work in their own git worktrees, and the factory checks their work itself before anything merges. `docs/AUTOPILOT.md` describes it for the team using it. `docs/autopilot/DESIGN.md` is the contract: states, API shapes, invariants, and one section per feature.
+
+- **One loop, restartable.** `orchestrator.ts` reads each run's state from the SQLite ledger, takes one step (start an agent, record its result, run gates as a job, merge), and writes the new state, every 3 seconds. A run is handled by one thing at a time. A restart resumes where it stopped: attempts are written before the agent server is called, with a fixed conversation id.
+- **Agents are OpenHands conversations.** Each role (spec, critic, validator, builder, reviewer) is a normal Canvas conversation started with a brief from `prompts.ts`, so every transcript and diff stays visible in Canvas. Agents never branch, merge or approve; the factory does, in `git.ts` and `integrator.ts`.
+- **The factory checks for itself.** It runs these itself and never takes an agent's word for them:
+  - gates (`gates.ts`);
+  - secret and dependency scans (`scan.ts`);
+  - hidden acceptance tests (`hidden.ts`);
+  - the merge policy (`policy.ts`);
+  - the preview (`preview.ts`).
+- **People decide through the Inbox.** Anything the policy doesn't allow becomes an Inbox item with options and reasons. A person's choice is recorded with their name. The policy's own decisions are recorded as `policy@<hash>`, with a plain-language `why`.
+- **The policy lives on the base branch.** `.factory/policy.yml` is read from `refs/heads/<base>` when a run starts and pinned to the run. Release is a person's click unless the policy says `release: { auto: true }` for autonomous runs. A person always merges changes to `openspec/`, `.factory/`, `AGENTS.md` and `CLAUDE.md`.
+- **Around the loop:**
+  - intake (`intake.ts`: GitHub issues, signed webhooks, the bug form);
+  - alerts (`notify.ts`);
+  - evidence for assessors (`evidence.ts`);
+  - lessons and per-policy insights (`learning.ts`);
+  - metrics (`metrics.ts`);
+  - the setup checklist and policy templates (`policy-templates.ts`, `explain.ts`);
+  - more than one workspace (`registry.ts`).
+- **No model needed to try it.** `src/demo/` has a fake agent server and scripted agents. The tests and `pnpm demo` use them, so the whole factory runs with no keys and no network.
 
 ## The audit log
 
@@ -60,11 +95,17 @@ Workspace repo (workspaces/benefits-portal, or SF_WORKSPACE)
 | Change what agents are told | `apps/server/src/briefs.ts`, and the conventions block in the workspace's `AGENTS.md` / `CLAUDE.md` |
 | Add a gate (for example, no approval until every criterion is checked) | `setStatus` in `apps/server/src/backlog.ts` |
 | Record something new | `audit(actor, action, subject, data)`, plus a label in `canvas/src/factory/copy.ts` |
+| Add an Autopilot step or decision | `apps/server/src/autopilot/orchestrator.ts` (a state, a step, an Inbox kind with its options), then DESIGN.md §3 and §6 |
+| Add a policy setting | `DEFAULT_POLICY` and `RULES` in `autopilot/policy.ts`, a sentence in `explain.ts`, the README's policy block. Changing a default changes the default policy's hash |
+| Add an Autopilot API | `autopilot/routes.ts`, a method and type in `canvas/src/factory/api.ts`, DESIGN.md §5 |
+| Test against agents | `src/demo/fake-agent-server.ts` with a handler, or `scripted-agents.ts`; temp dirs and `openLedger(":memory:")`, no network |
 
 ## Next milestones
 
-1. **Sandboxed agents:** agent server in Docker, workspace mounted, `SF_AGENT_WORKSPACE` set.
-2. **Gates:** approval only when acceptance criteria are checked and tests passed; ISSO sign-off for work orders with controls.
-3. **Git worktree per work order:** Canvas can already start a conversation in a new worktree; wire it to branches and pull requests.
-4. **A federal OpenSpec schema:** `openspec schema fork` to add a `controls.md` artifact mapped to NIST 800-53, then OSCAL output.
-5. **Sign-in and roles** (product owner, engineer, ISSO) instead of `SF_USER`.
+1. **Sign-in and roles** (product owner, engineer, ISSO) instead of `SF_USER`. The API has no authentication today: anything that can reach 127.0.0.1 can decide, release or change the policy.
+2. **Sandboxed agents, gates and previews:** agent server in Docker with the workspace mounted (`SF_AGENT_WORKSPACE`), and gates and the preview run in a container instead of on the host.
+3. **Pull requests:** release to a branch and open a pull request instead of merging into the base branch, for teams whose base branch is protected.
+4. **A federal OpenSpec schema:** `openspec schema fork` to add a `controls.md` artifact mapped to NIST 800-53, then OSCAL output from the evidence.
+5. **Hosted intake:** receive GitHub and other webhooks without a relay you run.
+
+`docs/autopilot/OPEN-ISSUES.md` lists the known defects and the plausible ones not fixed yet.
