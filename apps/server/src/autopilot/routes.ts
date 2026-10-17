@@ -257,6 +257,10 @@ export function createAutopilotRoutes(o: Orchestrator) {
     return c.json(summary(await o.reviseSpec(run.id, note ?? "", LOCAL_USER)));
   });
 
+  // Home's setup checklist, and its one-click fixes (files go onto the base branch in the person's name).
+  app.get("/setup", async (c) => c.json(await o.setup()));
+  app.post("/setup/:fix", async (c) => c.json(await o.fixSetup(c.req.param("fix"), LOCAL_USER, await body<{ template?: unknown }>(c))));
+
   // What the factory has learned: per policy hash, how its merge rules fared; and the AGENTS.md lessons.
   app.get("/insights", (c) => c.json(buildInsights(ledger, listAudit(Number.MAX_SAFE_INTEGER))));
   app.get("/lessons", (c) => c.json(ledger.listLessons()));

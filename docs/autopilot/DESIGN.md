@@ -528,7 +528,32 @@ queries. A link's `?w=<id>` switches to that workspace before the page asks
 for the run. The Inbox and its badge use the combined endpoints, and a
 decision goes to its item's own workspace.
 
-## 22. Changes since the first build
+## 22. Setup checklist
+
+`GET /setup` (`setup()` in the orchestrator) returns items with `{id, ok,
+optional?, title, detail, fix}`, all text written for a person:
+
+- `agent-server`: reachable, with profiles;
+- `workspace`: exists, and is a repo;
+- `policy`: a file on the base branch, valid;
+- `gates`: the policy's gates or the detected npm gates;
+- `agents-md`: AGENTS.md on the base branch;
+- `alerts`: `SF_NOTIFY_WEBHOOK` (optional).
+
+`POST /setup/:fix` (`fixSetup`) runs one fix as the person:
+
+- `init-repo`: `ensureRepo`, audited `workspace_initialized`;
+- `policy`: a template from policy-templates.ts (default `recommended`),
+  refused if the base already has a policy;
+- `agents-md`: a starter file, refused if one exists.
+
+The last two go through `commitToBase` (detached worktree, compare-and-swap,
+refused on a dirty checkout of the base) and are audited
+(`policy_written` with the template and hash, `agents_md_written`).
+Templates (recommended, cautious, federal, hands-off) each parse under
+`parsePolicy`, and every one writes `release: { auto: false }` out.
+
+## 23. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

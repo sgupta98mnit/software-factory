@@ -81,7 +81,8 @@ import {
   verdictReminder,
 } from "./prompts.js";
 import { describeOrigin, fromBugForm, fromGithub, fromWebhook, goalFor, originOf, type IntakeRequest, type IntakeSource, type RunOrigin } from "./intake.js";
-import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash, type Policy } from "./policy.js";
+import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, parsePolicy, pinnedPolicy, POLICY_FILE, policyHash, type Policy } from "./policy.js";
+import { STARTER_AGENTS_MD, templateById } from "./policy-templates.js";
 import { clusterFindings, parseVerdict, passed, type ReviewVerdict } from "./review.js";
 import {
   assumptionsOf,
@@ -2016,6 +2017,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const dir = path.join(worktrees, `_base-${randomBytes(3).toString("hex")}`);
     await addDetachedWorktree(workspace, dir, tip);
     try {
+      mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
       writeFileSync(path.join(dir, file), edit(await fileAt(workspace, ref, file)));
       await git(dir, ["add", "--", file]);
       await git(dir, ["commit", "-q", "-m", message]);
@@ -2696,6 +2698,106 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
   }
 
+  // ---- setup: Home's checklist, with one-click fixes ----
+
+  interface SetupItem {
+    id: string;
+    ok: boolean;
+    /** Nice to have, not needed for a run (alerts). */
+    optional?: boolean;
+    title: string;
+    detail: string;
+    fix: { id: string; label: string } | null;
+  }
+
+  /** What a workspace needs before (or for better) runs, each with what's wrong and, where a click can fix it, how. */
+  async function setup(): Promise<SetupItem[]> {
+    const s = await status();
+    const exists = existsSync(workspace);
+    const branch = s.workspace.branch;
+    const loaded = branch ? await loadPolicy(workspace, branch).catch(() => null) : { policy: DEFAULT_POLICY };
+    const items: SetupItem[] = [];
+    const agent = s.agentServer;
+    items.push({
+      id: "agent-server",
+      ok: agent.reachable && agent.profiles.length > 0,
+      title: agent.reachable ? `The agent server answers, with ${agent.profiles.length} agent profile${agent.profiles.length === 1 ? "" : "s"}` : "The agent server doesn't answer",
+      detail: agent.reachable ? agent.url : `${agent.url}: ${agent.error}. Start Canvas (pnpm dev), or set SF_AGENT_SERVER_URL to where it runs.`,
+      fix: null,
+    });
+    items.push({
+      id: "workspace",
+      ok: exists && s.workspace.isRepo,
+      title: !exists ? "The workspace folder doesn't exist" : s.workspace.isRepo ? `The workspace is a git repo on ${branch ?? "a detached HEAD"}` : "The workspace isn't a git repo yet",
+      detail: !exists ? `${workspace}: create it, or set SF_WORKSPACE to your project.` : s.workspace.isRepo ? workspace : `${workspace}: the factory works on branches of its own, so the workspace must be a repo. Its first commit takes the files as they are (.env files excluded).`,
+      fix: exists && !s.workspace.isRepo ? { id: "init-repo", label: "Make it a git repo" } : null,
+    });
+    const hasPolicy = s.policy.source !== "defaults";
+    items.push({
+      id: "policy",
+      ok: hasPolicy && !s.policy.error,
+      title: s.policy.error ? "The policy has an error" : hasPolicy ? `Policy ${s.policy.source} (policy@${s.policy.hash})` : "No policy file yet: the factory's defaults apply",
+      detail: s.policy.error ?? (hasPolicy ? "Runs pin these rules when they start. Change them on the Policy page." : "A .factory/policy.yml on the base branch writes the rules down where everyone can see and review them."),
+      fix: !hasPolicy && s.workspace.isRepo && branch ? { id: "policy", label: `Add the recommended policy to ${branch}` } : null,
+    });
+    const gates = loaded ? (loaded.policy.gates ?? (exists ? detectGates(workspace) : [])) : [];
+    items.push({
+      id: "gates",
+      ok: gates.length > 0,
+      title: gates.length ? `Gates: ${gates.map((g) => g.name).join(", ")}` : "No gates found yet",
+      detail: gates.length ? "The factory runs these on every work order before anything merges." : "Builders usually add a test script, but a repo that has one from the start gives every work order a check. Add a test script to package.json, or list gates in the policy.",
+      fix: null,
+    });
+    const agentsMd = branch ? (await fileAt(workspace, `refs/heads/${branch}`, "AGENTS.md").catch(() => null)) !== null : false;
+    items.push({
+      id: "agents-md",
+      ok: agentsMd,
+      title: agentsMd ? "AGENTS.md tells agents how this repo works" : "No AGENTS.md",
+      detail: agentsMd ? "Every agent reads it. The factory proposes lines for it when builders keep making the same mistake." : "Every agent reads AGENTS.md: a few lines on how this repo builds and tests save repair rounds.",
+      fix: !agentsMd && s.workspace.isRepo && branch ? { id: "agents-md", label: `Add a starter AGENTS.md to ${branch}` } : null,
+    });
+    items.push({
+      id: "alerts",
+      ok: !!s.notifications.channel,
+      optional: true,
+      title: s.notifications.channel ? `Alerts go to ${s.notifications.channel === "json" ? "a webhook" : s.notifications.channel === "slack" ? "Slack" : "Teams"}` : "No team alerts",
+      detail: s.notifications.channel ? `One alert for the first decision, then a daily digest at ${s.notifications.digestHour}:00.` : "Set SF_NOTIFY_WEBHOOK to a Slack or Teams incoming webhook to hear when Autopilot needs someone.",
+      fix: null,
+    });
+    return items;
+  }
+
+  /** One of the checklist's fixes, as the person who clicked it. Files go onto the base branch in their name. */
+  async function fixSetup(id: string, actor: string, opts: { template?: unknown } = {}): Promise<SetupItem[]> {
+    const who = actor.replace(/^user:/, "");
+    const branchOrThrow = async () => {
+      const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
+      if (!branch) throw new Error("Make the workspace a git repo (on a branch) first.");
+      return branch;
+    };
+    if (id === "init-repo") {
+      if (!existsSync(workspace)) throw new Error(`${workspace} doesn't exist.`);
+      if ((await ensureRepo(workspace)).initialized) record(actor, "autopilot.workspace_initialized", path.basename(workspace), { path: workspace });
+    } else if (id === "policy") {
+      const branch = await branchOrThrow();
+      if ((await fileAt(workspace, `refs/heads/${branch}`, POLICY_FILE)) !== null) throw new Error(`There's already a policy on ${branch}. Change it on the Policy page.`);
+      const template = templateById(typeof opts.template === "string" ? opts.template : "recommended");
+      if (!template) throw new Error("There's no policy template with that name.");
+      const hash = policyHash(parsePolicy(template.yaml));
+      const sha = await commitToBase(branch, POLICY_FILE, () => template.yaml, `factory: the ${template.name.toLowerCase()} policy (${who})`);
+      record(actor, "autopilot.policy_written", path.basename(workspace), { template: template.id, hash, base: branch, sha });
+    } else if (id === "agents-md") {
+      const branch = await branchOrThrow();
+      if ((await fileAt(workspace, `refs/heads/${branch}`, "AGENTS.md")) !== null) throw new Error(`${branch} already has an AGENTS.md.`);
+      const sha = await commitToBase(branch, "AGENTS.md", () => STARTER_AGENTS_MD, `agents: a starter AGENTS.md (${who})`);
+      record(actor, "autopilot.agents_md_written", path.basename(workspace), { base: branch, sha });
+    } else {
+      throw new Error(`There's no setup fix called "${id}".`);
+    }
+    broadcast({ type: "autopilot.changed" });
+    return setup();
+  }
+
   async function status() {
     const agent = await client.listProfiles().then(
       (r) => (agentServerUp(), { reachable: true, error: null as string | null, profiles: r.profiles, activeProfileId: r.activeId }),
@@ -2737,6 +2839,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     intake,
     reviseSpec,
     previewFile,
+    setup,
+    fixSetup,
     decide,
     pause,
     resume,

@@ -74,6 +74,19 @@ Canvas shows its onboarding the first time. Pick **Claude Code** or **Codex** as
 
 To start over: stop `pnpm dev`, then delete `data\` and `workspaces\benefits-portal\backlog\tasks\`.
 
+## Setup checklist
+
+Home's **Setup** panel checks what a workspace needs before (or for better) runs, and fixes what one click can:
+
+- the agent server answers, with agent profiles;
+- the workspace is a git repo (**Make it a git repo**);
+- the base branch has a valid policy (**Add the recommended policy**);
+- there are gates to run;
+- AGENTS.md exists (**Add a starter AGENTS.md**);
+- team alerts are configured (optional).
+
+The fixes that add a file commit it to the base branch in your name, only if the branch hasn't moved and the checkout has no uncommitted changes, and the audit log records them.
+
 ## Use your own project
 
 ```powershell
