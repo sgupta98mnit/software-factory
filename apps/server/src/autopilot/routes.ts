@@ -9,6 +9,7 @@ import type { Orchestrator } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
 import { buildEvidence } from "./evidence.js";
 import { audit } from "../audit.js";
+import { INTAKE_SOURCES, signatureOk, type IntakeSource } from "./intake.js";
 
 // Work-order states that count as in progress.
 const ACTIVE_WO = new Set<string>(["building", "verifying", "reviewing", "ready", "awaiting_merge_approval", "merging"]);
@@ -109,6 +110,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       openInbox: ledger.listInbox({ runId: run.id }).length,
       // Its place in line while queued; the change whose release goes first while releasing.
       ...o.waitingOn(run),
+      origin: run.origin,
     };
   }
 
@@ -189,6 +191,33 @@ export function createAutopilotRoutes(o: Orchestrator) {
       return c.json(summary(updated));
     });
   }
+
+  // Requests from outside: GitHub's issues webhook and other systems' signed JSON (through a relay: this API is
+  // on 127.0.0.1), and Home's bug form. The policy decides what each becomes (intake.ts).
+  app.post("/intake/:source", async (c) => {
+    const source = c.req.param("source") as IntakeSource;
+    if (!INTAKE_SOURCES.includes(source)) throw new HTTPException(404, { message: `No intake source "${source}" (one of: ${INTAKE_SOURCES.join(", ")})` });
+    const raw = await c.req.text();
+    if (raw.length > 512_000) return c.json({ error: "The request is too large." }, 413);
+    const secret = source === "github" ? process.env.SF_INTAKE_GITHUB_SECRET : source === "webhook" ? process.env.SF_INTAKE_SECRET : undefined;
+    const header = source === "github" ? c.req.header("x-hub-signature-256") : c.req.header("x-sf-signature");
+    if (source !== "bug" && !signatureOk(secret, raw, header)) {
+      const reason = secret ? "bad or missing signature" : `${source === "github" ? "SF_INTAKE_GITHUB_SECRET" : "SF_INTAKE_SECRET"} isn't set`;
+      await audit(`intake:${source}`, "autopilot.intake_rejected", `intake:${source}`, { reason });
+      return c.json({ error: `Rejected: ${reason}.` }, 401);
+    }
+    const event = c.req.header("x-github-event");
+    if (source === "github" && event === "ping") return c.json({ ok: true });
+    let payload: unknown;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      return c.json({ error: "The body must be JSON." }, 400);
+    }
+    // Signed sources act as themselves; the bug form is the person using Canvas.
+    const result = await o.intake({ source, payload, event }, source === "bug" ? LOCAL_USER : `intake:${source}`);
+    return c.json({ outcome: result.outcome, reason: result.reason ?? null, run: result.run ? summary(result.run) : null }, result.outcome === "duplicate" || result.outcome === "ignored" ? 200 : 202);
+  });
 
   // Scenario <-> hidden test <-> work order <-> approval, for assessors. ?download=1 saves it as a file (and says so in the audit log).
   app.get("/runs/:id/evidence", async (c) => {

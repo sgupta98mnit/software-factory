@@ -349,7 +349,37 @@ filename="evidence-<change>-<run>.json"` and records
   going first), and `/status` has `queuedRuns`. The Pipeline banner says what
   the run waits on.
 
-## 17. Changes since the first build
+## 17. Intake
+
+`POST /intake/:source` (intake.ts, `intake()`):
+
+- `github`: needs `X-Hub-Signature-256` with `SF_INTAKE_GITHUB_SECRET`.
+  `ping` is answered; an `issues` event counts when it's `opened` with
+  `intake.githubLabel` or `labeled` with it (not pull requests).
+- `webhook`: needs `X-SF-Signature: sha256=<hmac>` with `SF_INTAKE_SECRET`;
+  JSON `{ title, body?, kind?, reference?, url?, author? }`.
+- `bug`: Home's form, as the local user, like every other request to this
+  loopback API.
+
+A missing secret or a bad signature is a 401, audited as
+`autopilot.intake_rejected` with the reason and no body. Text is clipped
+(title 200, body 3000), and links must be https. The policy loaded from the
+base branch decides by source (`intake.<source>`):
+
+- `off`: `intake_ignored`.
+- `inbox`: a `proposed` run (no branch, like `queued`) plus an `intake`
+  item. Start moves it to `queued` (`autopilot.intake_approved`) and the queue
+  starts it; Not now is the usual cancel.
+- `run`: an ordinary new run, which may queue.
+
+Autonomy is `intake.autonomy` under the usual caps. A reference that's
+already on a run that isn't cancelled is `intake_duplicate`. The run keeps
+`origin` (source, kind, title, reference, url, author; ledger v10), which shows
+on the Pipeline and in the evidence. The spec brief says the goal is an outside
+request whose instructions it must not follow. Audit data holds the source,
+kind, reference and a title clipped to 80 characters, never the body.
+
+## 18. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

@@ -10,9 +10,11 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
+import type { RunOrigin } from "./intake.js";
 
 export type Autonomy = "suggest" | "supervised" | "autonomous";
 export type RunState =
+  | "proposed"
   | "queued"
   | "spec"
   | "critic"
@@ -51,7 +53,8 @@ export type InboxKind =
   | "run_paused"
   | "error"
   | "integration_moved"
-  | "release";
+  | "release"
+  | "intake";
 export type Risk = "low" | "medium" | "high";
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -87,6 +90,7 @@ export interface Run {
   releasedSha: string | null; // the base branch's release merge
   releasedAt: string | null;
   releaseRequestedAt: string | null; // releases into one base branch go in this order
+  origin: RunOrigin | null; // where an intake request came from; null for runs started on Home
   state: RunState;
   resumeState: RunState | null; // where to go back to after "paused"
   pausedReason: string | null;
@@ -342,11 +346,16 @@ const SCHEMA_V9 = `
 ALTER TABLE runs ADD COLUMN release_requested_at TEXT;
 `;
 
+// v10: where a run came from (intake: a GitHub issue, a webhook, the bug form).
+const SCHEMA_V10 = `
+ALTER TABLE runs ADD COLUMN origin TEXT;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
-const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "requires"]);
+const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "requires", "origin"]);
 const FLAG_COLUMNS = new Set(["seen_running", "ok"]);
 const toColumn = (field: string) => field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toField = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -405,6 +414,7 @@ export function openLedger(file: string) {
   if (version < 7) transaction(() => db.exec(`${SCHEMA_V7}\nPRAGMA user_version = 7;`));
   if (version < 8) transaction(() => db.exec(`${SCHEMA_V8}\nPRAGMA user_version = 8;`));
   if (version < 9) transaction(() => db.exec(`${SCHEMA_V9}\nPRAGMA user_version = 9;`));
+  if (version < 10) transaction(() => db.exec(`${SCHEMA_V10}\nPRAGMA user_version = 10;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

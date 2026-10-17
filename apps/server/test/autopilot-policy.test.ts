@@ -130,7 +130,7 @@ test("policyHash: the same rules always hash the same, however the file writes t
   assert.notEqual(policyHash(a), policyHash(parsePolicy("parallel: 2\nrepair: { fresh: 0, sameConversation: 2 }\n")));
   assert.equal(policyHash(parsePolicy("parallel: 3\n")), policyHash(DEFAULT_POLICY)); // the defaults, written out
   // Pinned: changing a default changes the actor of every new run's policy approvals. Update this on purpose.
-  assert.equal(policyHash(DEFAULT_POLICY), "a9a64cab9ee5"); // selfHealing and queue (Phase 4)
+  assert.equal(policyHash(DEFAULT_POLICY), "f04a4ca97299"); // selfHealing, queue and intake (Phase 4)
 });
 
 const OK: MergeFacts = {

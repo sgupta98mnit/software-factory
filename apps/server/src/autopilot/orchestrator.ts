@@ -78,6 +78,7 @@ import {
   quietNudge,
   verdictReminder,
 } from "./prompts.js";
+import { describeOrigin, fromBugForm, fromGithub, fromWebhook, goalFor, originOf, type IntakeRequest, type IntakeSource, type RunOrigin } from "./intake.js";
 import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash, type Policy } from "./policy.js";
 import { clusterFindings, parseVerdict, passed, type ReviewVerdict } from "./review.js";
 import {
@@ -151,6 +152,10 @@ const MERGE: InboxOption[] = [
 const INTEGRATION_MOVED: InboxOption[] = [
   { id: "restore", label: "Put it back and go on", tone: "primary" },
   { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const INTAKE: InboxOption[] = [
+  { id: "start", label: "Start a run", tone: "primary" },
+  { id: "cancel", label: "Not now" },
 ];
 const RUN_PAUSED: InboxOption[] = [
   { id: "resume", label: "Resume", tone: "primary" },
@@ -488,7 +493,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // A spec agent started after one that failed (or whose tasks.md couldn't be planned) hears why.
     const before = ledger.listAttempts({ runId: run.id, role: "spec" }).filter((x) => x.id < a.id).at(-1);
     const problem = (before?.result as { reason?: string } | null)?.reason ?? null;
-    return specBrief({ goal: run.goal, change: run.change, autonomy: run.autonomy, openspecVersion: tools.openspec.version, problem });
+    return specBrief({ goal: run.goal, change: run.change, autonomy: run.autonomy, openspecVersion: tools.openspec.version, problem, origin: run.origin });
   }
 
   /** Safe to repeat after a restart: the conversation id is fixed, so the agent server returns the existing one. */
@@ -1835,7 +1840,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** Cheap: hands each live run to advance(), skipping runs that are still busy. */
   async function tick() {
     for (const run of ledger.listRuns()) {
-      if (!TERMINAL.has(run.state) && run.state !== "paused" && run.state !== "queued") launch(run.id, () => advance(run.id));
+      if (!TERMINAL.has(run.state) && !["paused", "queued", "proposed"].includes(run.state)) launch(run.id, () => advance(run.id));
     }
     // The oldest waiting run starts when a slot is free; one a tick, so the count is never stale.
     const runs = ledger.listRuns();
@@ -1878,13 +1883,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   // One run is created at a time: two at once (a double-click) would both init the repo or pick the same change name.
   let creating: Promise<unknown> = Promise.resolve();
-  function createRun(input: { goal: string; autonomy?: Autonomy; budgetUsd?: number | null; actor: string }): Promise<Run> {
+  type NewRunInput = { goal: string; autonomy?: Autonomy; budgetUsd?: number | null; actor: string; origin?: RunOrigin | null; proposed?: boolean };
+  function createRun(input: NewRunInput): Promise<Run> {
     const next = creating.then(() => createRunNow(input));
     creating = next.catch(() => undefined);
     return next;
   }
 
-  async function createRunNow(input: { goal: string; autonomy?: Autonomy; budgetUsd?: number | null; actor: string }): Promise<Run> {
+  async function createRunNow(input: NewRunInput): Promise<Run> {
     const goal = typeof input.goal === "string" ? input.goal.trim() : "";
     if (!goal || goal.length > 4000) throw new Error("The goal must be 1 to 4000 characters.");
     if (input.autonomy !== undefined && !AUTONOMY.includes(input.autonomy)) throw new Error(`Autonomy must be one of: ${AUTONOMY.join(", ")}.`);
@@ -1914,15 +1920,17 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // branch is made when it starts, from the base as it is then (with anything released meanwhile).
     const runs = ledger.listRuns();
     const queued = runs.some((r) => r.state === "queued") || runs.filter((r) => WORKING.has(r.state)).length >= policy.queue.maxActiveRuns;
+    // A request from outside that waits for a person to start it has no branch either.
+    const state: RunState = input.proposed ? "proposed" : queued ? "queued" : "spec";
     let integrationDir: string | null = null;
     let integrationSha: string | null = null;
-    if (!queued) {
+    if (state === "spec") {
       integrationDir = path.join(worktrees, id, "integration");
       await addWorktree(workspace, integrationDir, integrationBranch, baseBranch);
       integrationSha = await headSha(integrationDir);
     }
 
-    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, integrationSha, policy, policyHash: hash, createdBy: input.actor, state: queued ? "queued" : "spec" });
+    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, integrationSha, policy, policyHash: hash, createdBy: input.actor, state, origin: input.origin ?? null });
     record(input.actor, "autopilot.run_created", id, {
       change,
       autonomy,
@@ -1931,11 +1939,57 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       goalSha256: sha256(goal),
       budgetUsd,
       policyHash: hash,
-      ...(queued ? { queued: true } : {}),
+      ...(state !== "spec" ? { [state]: true } : {}),
+      ...(input.origin ? { source: input.origin.source, reference: input.origin.reference } : {}),
     });
     record(SYSTEM, "autopilot.policy_loaded", id, { hash, source, policy });
     changed(id);
     return run;
+  }
+
+  /**
+   * A request from outside (routes.ts has checked its signature). The
+   * policy on the base branch decides: ignored, a proposed run waiting for a
+   * person's Start in the Inbox, or a run. A reference already behind a run
+   * that isn't cancelled is a duplicate (GitHub redelivers; a label can be
+   * added twice). Audit data holds the source, reference and a clipped title,
+   * never the body.
+   */
+  async function intake(input: { source: IntakeSource; payload: unknown; event?: string }, actor: string): Promise<{ outcome: "ignored" | "duplicate" | "proposed" | "started"; reason?: string; run?: Run }> {
+    const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
+    const { policy } = branch ? await loadPolicy(workspace, branch) : { policy: DEFAULT_POLICY };
+    const request: IntakeRequest | null =
+      input.source === "github" ? fromGithub(input.event, input.payload, policy.intake.githubLabel) : input.source === "webhook" ? fromWebhook(input.payload) : fromBugForm(input.payload, actor.replace(/^user:/, ""));
+    const subject = `intake:${input.source}`;
+    if (!request) {
+      record(actor, "autopilot.intake_ignored", subject, { source: input.source, event: input.event ?? null, reason: "not for the factory" });
+      return { outcome: "ignored", reason: `Only issues opened with the "${policy.intake.githubLabel}" label, or given it, start anything.` };
+    }
+    const data = { source: request.source, kind: request.kind, reference: request.reference, title: clip(request.title, 80) };
+    const mode = policy.intake[request.source];
+    if (mode === "off") {
+      record(actor, "autopilot.intake_ignored", subject, { ...data, reason: "policy" });
+      return { outcome: "ignored", reason: `The policy has intake.${request.source}: off.` };
+    }
+    const dup = request.reference ? ledger.listRuns().find((r) => r.origin?.reference === request.reference && r.state !== "cancelled") : undefined;
+    if (dup) {
+      record(actor, "autopilot.intake_duplicate", dup.id, data);
+      return { outcome: "duplicate", run: dup };
+    }
+    const run = await createRun({ goal: goalFor(request), autonomy: policy.intake.autonomy, actor, origin: originOf(request), proposed: mode === "inbox" });
+    if (mode === "inbox") {
+      const body = [
+        `A ${describeOrigin(run.origin as RunOrigin)} asks for this${request.url ? ` (${request.url})` : ""}:`,
+        "",
+        `> ${mdText(request.title)}`,
+        ...(request.body ? ["", ...request.body.split("\n").map((l) => `> ${mdText(l)}`)] : []),
+        "",
+        `Start puts it in line as \`${run.change}\` at ${run.autonomy} autonomy (the policy's intake.autonomy, under its cap). Not now closes it; the same request can come in again later.`,
+      ].join("\n");
+      ledger.transaction(() => openItem(run, "intake", `New request: ${clip(request.title, 100)}`, body, INTAKE));
+    }
+    record(actor, "autopilot.intake_received", run.id, { ...data, mode });
+    return { outcome: mode === "inbox" ? "proposed" : "started", run: ledger.getRun(run.id) ?? run };
   }
 
   function mustRun(runId: string): Run {
@@ -2080,6 +2134,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         return;
       case "release:hold":
         return; // stays done; Release on the Pipeline asks again
+      case "intake:start":
+        // In line like any new run: it starts (and gets its branch) when the queue has room.
+        if (run.state !== "proposed") throw new Error(`This run isn't waiting to be started (it's ${run.state}).`);
+        moveRun(run, "queued", { actor, action: "autopilot.intake_approved", data: { source: run.origin?.source ?? null, reference: run.origin?.reference ?? null } });
+        return;
       case "integration_moved:restore":
         await restoreIntegration(run, actor);
         if (run.state === "paused") await unpause(run, actor);
@@ -2180,6 +2239,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     workspace,
     waitingOn,
     createRun,
+    intake,
     decide,
     pause,
     resume,

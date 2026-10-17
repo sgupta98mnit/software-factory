@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..b3a42a6
+index 0000000..3f1c748
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,648 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -244,6 +244,7 @@ index 0000000..b3a42a6
 +];
 +
 +export type RunState =
++  | "proposed"
 +  | "queued"
 +  | "spec"
 +  | "critic"
@@ -316,6 +317,24 @@ index 0000000..b3a42a6
 +  queuePosition: number | null;
 +  /** While releasing: the change whose release into the same base goes first. */
 +  releaseAfter: string | null;
++  /** The outside request it came from; null for a run started on Home. */
++  origin: RunOrigin | null;
++}
++
++export interface RunOrigin {
++  source: "github" | "webhook" | "bug";
++  kind: "feature" | "bug";
++  title: string;
++  reference: string | null;
++  url: string | null;
++  author: string | null;
++}
++
++/** POST /autopilot/intake/:source: what the policy made of the request. */
++export interface IntakeResult {
++  outcome: "ignored" | "duplicate" | "proposed" | "started";
++  reason: string | null;
++  run: RunSummary | null;
 +}
 +
 +export interface AutopilotWorkOrder {
@@ -405,7 +424,8 @@ index 0000000..b3a42a6
 +  | "run_paused"
 +  | "error"
 +  | "integration_moved"
-+  | "release";
++  | "release"
++  | "intake";
 +
 +export interface InboxItem {
 +  id: number;
@@ -559,6 +579,7 @@ index 0000000..b3a42a6
 +    state: RunState;
 +    createdBy: string;
 +    createdAt: string;
++    origin: RunOrigin | null;
 +    baseBranch: string;
 +    integrationBranch: string;
 +    integrationSha: string | null;
@@ -709,6 +730,12 @@ index 0000000..b3a42a6
 +    ),
 +  release: (id: string) =>
 +    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/release`),
++  reportBug: (body: {
++    title: string;
++    happened: string;
++    expected?: string;
++    steps?: string;
++  }) => post<IntakeResult>("/autopilot/intake/bug", body),
 +  evidence: (id: string) =>
 +    request<Evidence>(`/autopilot/runs/${encodeURIComponent(id)}/evidence`),
 +  inbox: (state: "open" | "decided" | "all" = "open") =>
@@ -850,12 +877,12 @@ index 0000000..2305eef
 +}
 diff --git a/src/factory/components/autopilot-badges.tsx b/src/factory/components/autopilot-badges.tsx
 new file mode 100644
-index 0000000..23dec8a
+index 0000000..ba3831f
 --- /dev/null
 +++ b/src/factory/components/autopilot-badges.tsx
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,178 @@
 +import { cn } from "#/utils/utils";
-+import type { AutopilotWorkOrderState, RunState } from "../api";
++import type { AutopilotWorkOrderState, RunOrigin, RunState } from "../api";
 +import { useFactoryCopy } from "../copy";
 +
 +type Tone = "active" | "waiting" | "good" | "bad" | "quiet";
@@ -869,6 +896,7 @@ index 0000000..23dec8a
 +};
 +
 +const RUN_TONE: Record<RunState, Tone> = {
++  proposed: "waiting",
 +  queued: "quiet",
 +  spec: "active",
 +  critic: "active",
@@ -1005,6 +1033,188 @@ index 0000000..23dec8a
 +/** "user:sumit" -> "sumit"; "policy@abc123" stays, since it names the exact rules. */
 +export function approverName(actor: string) {
 +  return actor.replace(/^user:/, "");
++}
++
++/** Where an outside request came from: "GitHub issue github:org/repo#12 · @alice", linked when it has a URL. */
++export function OriginLabel({ origin }: { origin: RunOrigin }) {
++  const copy = useFactoryCopy();
++  const what = [
++    copy.intake.sources[origin.source] ?? origin.source,
++    origin.reference ?? (origin.source === "webhook" ? origin.author : null),
++    origin.author && origin.source === "github" ? `@${origin.author}` : null,
++  ]
++    .filter(Boolean)
++    .join(" ");
++  const text = copy.intake.from(what);
++  return origin.url ? (
++    <a
++      href={origin.url}
++      target="_blank"
++      rel="noreferrer noopener"
++      className="text-link hover:underline"
++    >
++      {text}
++    </a>
++  ) : (
++    <span>{text}</span>
++  );
++}
+diff --git a/src/factory/components/bug-report.tsx b/src/factory/components/bug-report.tsx
+new file mode 100644
+index 0000000..0115891
+--- /dev/null
++++ b/src/factory/components/bug-report.tsx
+@@ -0,0 +1,151 @@
++import React from "react";
++import { Link } from "react-router";
++import { Bug } from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { cn } from "#/utils/utils";
++import type { IntakeResult } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useReportBug } from "../hooks";
++import { FactoryError } from "./factory-page";
++import { factoryFieldClassName } from "./start-agent-modal";
++
++const FIELDS = ["title", "happened", "expected", "steps"] as const;
++type Field = (typeof FIELDS)[number];
++const EMPTY: Record<Field, string> = {
++  title: "",
++  happened: "",
++  expected: "",
++  steps: "",
++};
++
++/** Home's bug form: a report goes through intake, where the policy decides what it becomes. */
++export function BugReport() {
++  const copy = useFactoryCopy();
++  const report = useReportBug();
++  const [open, setOpen] = React.useState(false);
++  const [form, setForm] = React.useState(EMPTY);
++  const [result, setResult] = React.useState<IntakeResult | null>(null);
++  const id = React.useId();
++  const ready = form.title.trim() && form.happened.trim();
++
++  const submit = (event: React.FormEvent) => {
++    event.preventDefault();
++    if (!ready) return;
++    report.mutate(form, {
++      onSuccess: (r) => {
++        setResult(r);
++        setForm(EMPTY);
++      },
++    });
++  };
++
++  if (!open) {
++    return (
++      <button
++        type="button"
++        data-testid="factory-report-bug"
++        onClick={() => {
++          setOpen(true);
++          setResult(null);
++        }}
++        className="inline-flex items-center gap-1.5 self-start text-sm text-link hover:underline"
++      >
++        <Bug className="size-4" aria-hidden />
++        {copy.intake.report}
++      </button>
++    );
++  }
++
++  return (
++    <form
++      onSubmit={submit}
++      aria-label={copy.intake.report}
++      className="flex flex-col gap-3 rounded-xl border border-border-subtle bg-surface px-4 py-3.5 text-sm"
++    >
++      <h2 className="flex items-center gap-1.5 text-xs font-medium text-muted">
++        <Bug className="size-4" aria-hidden />
++        {copy.intake.report}
++      </h2>
++      {FIELDS.map((field) => (
++        <label key={field} className="flex flex-col gap-1 text-muted">
++          {copy.intake[field]}
++          {field === "title" ? (
++            <input
++              id={`${id}-${field}`}
++              data-testid={`factory-bug-${field}`}
++              className={factoryFieldClassName}
++              value={form[field]}
++              maxLength={200}
++              onChange={(e) => setForm({ ...form, [field]: e.target.value })}
++              disabled={report.isPending}
++            />
++          ) : (
++            <textarea
++              id={`${id}-${field}`}
++              data-testid={`factory-bug-${field}`}
++              className={cn(factoryFieldClassName, "min-h-16")}
++              value={form[field]}
++              maxLength={1500}
++              onChange={(e) => setForm({ ...form, [field]: e.target.value })}
++              disabled={report.isPending}
++            />
++          )}
++        </label>
++      ))}
++      <p className="text-xs text-muted">{copy.intake.help}</p>
++      <div className="flex items-center gap-2">
++        <BrandButton
++          testId="factory-bug-send"
++          type="submit"
++          variant="primary"
++          isDisabled={!ready || report.isPending}
++        >
++          {report.isPending ? copy.intake.sending : copy.intake.send}
++        </BrandButton>
++        <BrandButton
++          type="button"
++          variant="tertiary"
++          onClick={() => setOpen(false)}
++        >
++          {copy.common.close}
++        </BrandButton>
++      </div>
++      <FactoryError error={report.error} />
++      {result ? <IntakeOutcome result={result} /> : null}
++    </form>
++  );
++}
++
++function IntakeOutcome({ result }: { result: IntakeResult }) {
++  const copy = useFactoryCopy();
++  const text =
++    result.outcome === "proposed"
++      ? copy.intake.proposed
++      : result.outcome === "started"
++        ? copy.intake.started
++        : result.outcome === "duplicate"
++          ? copy.intake.duplicate
++          : (result.reason ?? "");
++  return (
++    <p
++      role="status"
++      data-testid="factory-bug-result"
++      className="flex flex-wrap gap-x-2 text-foreground"
++    >
++      <span>{text}</span>
++      {result.outcome === "proposed" ? (
++        <Link to="/inbox" className="text-link hover:underline">
++          {copy.intake.openInbox}
++        </Link>
++      ) : null}
++      {result.run && result.outcome !== "proposed" ? (
++        <Link
++          to={`/autopilot/runs/${result.run.id}`}
++          className="text-link hover:underline"
++        >
++          {copy.intake.openRun}
++        </Link>
++      ) : null}
++    </p>
++  );
 +}
 diff --git a/src/factory/components/decision-card.tsx b/src/factory/components/decision-card.tsx
 new file mode 100644
@@ -1768,10 +1978,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..1d15f4b
+index 0000000..881d520
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1083 @@
+@@ -0,0 +1,1136 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1915,6 +2125,7 @@ index 0000000..1d15f4b
 +    policyBudget: "the policy's",
 +    by: (who: string) => `by ${who}`,
 +    runStates: {
++      proposed: "Waiting to be started",
 +      queued: "Waiting in line",
 +      spec: "Writing the spec",
 +      critic: "Reviewing the spec",
@@ -1966,6 +2177,8 @@ index 0000000..1d15f4b
 +      `Merging into ${base}. If ${base} moved since the run started, the merge is tested first.`,
 +    releaseAfter: (base: string, change: string) =>
 +      `Waiting for ${change} to finish releasing into ${base}. Releases into one branch go one at a time, so this one is merged onto it and tested again.`,
++    proposed:
++      "A request from outside the factory. Nothing runs until a person chooses Start in the Inbox.",
 +    queued: (position: number) =>
 +      `Waiting in line (${position === 1 ? "next" : `number ${position}`}): the policy lets queue.maxActiveRuns runs work at once. Runs waiting on a person don't count. It starts from the base branch as it is then.`,
 +    releasedHelp: (base: string, who: string, sha: string) =>
@@ -2076,8 +2289,30 @@ index 0000000..1d15f4b
 +      error: "Stopped on an error",
 +      integration_moved: "Integration branch moved",
 +      release: "Release",
++      intake: "New request",
 +    } as Record<string, string>,
 +    decidedToast: "Decision recorded",
++  },
++  intake: {
++    report: "Report a bug",
++    help: "It goes to the factory's intake: the policy (intake.bug) decides whether it waits for a person in the Inbox or starts a run.",
++    title: "What's wrong",
++    happened: "What happened",
++    expected: "What you expected (optional)",
++    steps: "Steps to reproduce (optional)",
++    send: "Send",
++    sending: "Sending…",
++    proposed: "Sent to the Inbox. A person decides whether Autopilot fixes it.",
++    started: "Autopilot started a run to fix it.",
++    duplicate: "That request is already being handled.",
++    openRun: "Open the run",
++    openInbox: "Open the Inbox",
++    sources: {
++      github: "GitHub issue",
++      webhook: "Request from",
++      bug: "Bug report",
++    } as Record<string, string>,
++    from: (what: string) => `From: ${what}`,
 +  },
 +  evidence: {
 +    title: "Evidence",
@@ -2090,6 +2325,7 @@ index 0000000..1d15f4b
 +      "Saves this evidence as a JSON file. The export is recorded in the audit log.",
 +    generated: (when: string) => `Generated ${when}`,
 +    labels: {
++      origin: "Requested by",
 +      policy: "Policy",
 +      autonomy: "Autonomy",
 +      cost: "Cost",
@@ -2445,6 +2681,7 @@ index 0000000..1d15f4b
 +    policyBudget: "de la política",
 +    by: (who) => `por ${who}`,
 +    runStates: {
++      proposed: "Esperando a que la inicien",
 +      queued: "En cola",
 +      spec: "Redactando la especificación",
 +      critic: "Revisando la especificación",
@@ -2496,6 +2733,8 @@ index 0000000..1d15f4b
 +      `Integrando en ${base}. Si ${base} cambió desde que empezó la ejecución, primero se prueba la integración.`,
 +    releaseAfter: (base, change) =>
 +      `Esperando a que ${change} termine de publicarse en ${base}. Las publicaciones en una rama van de una en una, así que esta se integra sobre aquella y se prueba de nuevo.`,
++    proposed:
++      "Una solicitud de fuera de la fábrica. No se ejecuta nada hasta que una persona elija Iniciar en la bandeja de entrada.",
 +    queued: (position) =>
 +      `En cola (${position === 1 ? "la siguiente" : `número ${position}`}): la política permite que trabajen queue.maxActiveRuns ejecuciones a la vez. Las que esperan a una persona no cuentan. Empieza desde la rama base tal como esté entonces.`,
 +    releasedHelp: (base, who, sha) =>
@@ -2607,8 +2846,31 @@ index 0000000..1d15f4b
 +      error: "Detenida por un error",
 +      integration_moved: "La rama de integración cambió",
 +      release: "Publicación",
++      intake: "Nueva solicitud",
 +    },
 +    decidedToast: "Decisión registrada",
++  },
++  intake: {
++    report: "Informar de un error",
++    help: "Va a la entrada de la fábrica: la política (intake.bug) decide si espera a una persona en la bandeja de entrada o inicia una ejecución.",
++    title: "Qué falla",
++    happened: "Qué pasó",
++    expected: "Qué esperaba (opcional)",
++    steps: "Pasos para reproducirlo (opcional)",
++    send: "Enviar",
++    sending: "Enviando…",
++    proposed:
++      "Enviado a la bandeja de entrada. Una persona decide si el piloto automático lo corrige.",
++    started: "El piloto automático inició una ejecución para corregirlo.",
++    duplicate: "Esa solicitud ya se está atendiendo.",
++    openRun: "Abrir la ejecución",
++    openInbox: "Abrir la bandeja de entrada",
++    sources: {
++      github: "Incidencia de GitHub",
++      webhook: "Solicitud de",
++      bug: "Informe de error",
++    },
++    from: (what) => `Origen: ${what}`,
 +  },
 +  evidence: {
 +    title: "Evidencia",
@@ -2621,6 +2883,7 @@ index 0000000..1d15f4b
 +      "Guarda esta evidencia como archivo JSON. La exportación queda en el registro de auditoría.",
 +    generated: (when) => `Generada ${when}`,
 +    labels: {
++      origin: "Solicitada por",
 +      policy: "Política",
 +      autonomy: "Autonomía",
 +      cost: "Coste",
@@ -2968,10 +3231,10 @@ index 0000000..a90f6d1
 +];
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..b7ebd75
+index 0000000..8d35419
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,316 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -3183,6 +3446,15 @@ index 0000000..b7ebd75
 +      action: "pause" | "resume" | "cancel";
 +      note?: string;
 +    }) => FactoryApi.runAction(v.id, v.action, v.note),
++    onSettled: () => invalidateAutopilot(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++export function useReportBug() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: FactoryApi.reportBug,
 +    onSettled: () => invalidateAutopilot(queryClient),
 +    meta: { disableToast: true },
 +  });
@@ -3515,10 +3787,10 @@ index 0000000..380b38f
 +}
 diff --git a/src/factory/routes/autopilot-evidence.tsx b/src/factory/routes/autopilot-evidence.tsx
 new file mode 100644
-index 0000000..34c36a7
+index 0000000..0926f61
 --- /dev/null
 +++ b/src/factory/routes/autopilot-evidence.tsx
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,624 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useParams } from "react-router";
@@ -3544,6 +3816,7 @@ index 0000000..34c36a7
 +} from "../components/factory-page";
 +import { formatWhen } from "../components/factory-badges";
 +import {
++  OriginLabel,
 +  RiskChip,
 +  RunStatePill,
 +  WorkOrderStatePill,
@@ -3695,6 +3968,11 @@ index 0000000..34c36a7
 +      <Item label={copy.pipeline.labels.state}>
 +        <RunStatePill state={run.state} />
 +      </Item>
++      {run.origin ? (
++        <Item label={copy.evidence.labels.origin}>
++          <OriginLabel origin={run.origin} />
++        </Item>
++      ) : null}
 +      <Item label={copy.evidence.labels.policy}>
 +        <span className="font-mono">{policy.actor}</span>
 +      </Item>
@@ -4139,10 +4417,10 @@ index 0000000..34c36a7
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..0b339ac
+index 0000000..0b4535c
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,891 @@
+@@ -0,0 +1,896 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -4176,6 +4454,7 @@ index 0000000..0b339ac
 +import { formatWhen } from "../components/factory-badges";
 +import {
 +  FINISHED_RUN_STATES,
++  OriginLabel,
 +  RiskChip,
 +  RunStatePill,
 +  WorkOrderStatePill,
@@ -4211,6 +4490,7 @@ index 0000000..0b339ac
 +/** How far the run has come: the stage it's in (or stopped in). */
 +function currentStage(run: RunDetail): Stage {
 +  switch (run.state) {
++    case "proposed":
 +    case "queued":
 +    case "spec":
 +    case "critic":
@@ -4300,6 +4580,7 @@ index 0000000..0b339ac
 +        <GitBranch className="size-3.5" aria-hidden />
 +        {run.integrationBranch}
 +      </span>
++      {run.origin ? <OriginLabel origin={run.origin} /> : null}
 +    </span>
 +  );
 +}
@@ -4554,6 +4835,8 @@ index 0000000..0b339ac
 +    text = run.releaseAfter
 +      ? copy.pipeline.releaseAfter(run.baseBranch, run.releaseAfter)
 +      : copy.pipeline.releasingHelp(run.baseBranch);
++  } else if (run.state === "proposed") {
++    text = copy.pipeline.proposed;
 +  } else if (run.state === "queued" && run.queuePosition) {
 +    text = copy.pipeline.queued(run.queuePosition);
 +  } else if (run.state === "released") {
@@ -5036,10 +5319,10 @@ index 0000000..0b339ac
 +}
 diff --git a/src/factory/routes/autopilot.tsx b/src/factory/routes/autopilot.tsx
 new file mode 100644
-index 0000000..86635c7
+index 0000000..b3c528f
 --- /dev/null
 +++ b/src/factory/routes/autopilot.tsx
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,381 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
@@ -5080,6 +5363,7 @@ index 0000000..86635c7
 +  formatMoney,
 +} from "../components/autopilot-badges";
 +import { factoryFieldClassName } from "../components/start-agent-modal";
++import { BugReport } from "../components/bug-report";
 +
 +export default function FactoryAutopilotRoute() {
 +  const copy = useFactoryCopy();
@@ -5107,7 +5391,10 @@ index 0000000..86635c7
 +          <div className="min-w-0 lg:col-span-2">
 +            <GoalForm status={status.data} />
 +          </div>
-+          <SetupStatus status={status.data} />
++          <div className="flex flex-col gap-4">
++            <SetupStatus status={status.data} />
++            <BugReport />
++          </div>
 +        </div>
 +        <section aria-labelledby="factory-runs-heading">
 +          <h2

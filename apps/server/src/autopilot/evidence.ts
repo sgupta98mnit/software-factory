@@ -131,6 +131,8 @@ export async function buildEvidence(ledger: Ledger, workspace: string, run: Run)
       state: run.state,
       createdBy: run.createdBy,
       createdAt: run.createdAt,
+      // The request it came from (a GitHub issue, a webhook, the bug form), or null for a run started on Home.
+      origin: run.origin,
       baseBranch: run.baseBranch,
       integrationBranch: run.integrationBranch,
       integrationSha: run.integrationSha,

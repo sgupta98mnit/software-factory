@@ -11,6 +11,7 @@ import matter from "gray-matter";
 import { canonicalJson, sha256 } from "../audit.js";
 import type { Gate } from "./gates.js";
 import { fileAt } from "./git.js";
+import { INTAKE_MODES, INTAKE_SOURCES, type IntakeMode } from "./intake.js";
 import type { AttemptRole, Autonomy, Risk, Severity } from "./ledger.js";
 import { BLOCKING } from "./review.js";
 
@@ -46,6 +47,11 @@ export interface Policy {
   selfHealing: { quietMinutes: number; rerunFailedGates: boolean; conflictRounds: number };
   /** Runs working at once (in spec, critic, building or releasing); more wait in line, oldest first. */
   queue: { maxActiveRuns: number };
+  /**
+   * Requests from outside, per source: ignored ("off"), a decision in the Inbox ("inbox") or a run ("run").
+   * githubLabel: the label an issue needs. autonomy: the most a run from intake gets.
+   */
+  intake: { github: IntakeMode; webhook: IntakeMode; bug: IntakeMode; githubLabel: string; autonomy: Autonomy };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -77,6 +83,7 @@ export const DEFAULT_POLICY: Policy = {
   release: { auto: false },
   selfHealing: { quietMinutes: 20, rerunFailedGates: true, conflictRounds: 3 },
   queue: { maxActiveRuns: 2 },
+  intake: { github: "inbox", webhook: "off", bug: "inbox", githubLabel: "autopilot", autonomy: "supervised" },
 };
 
 // ---- reading and checking policy.yml ----
@@ -141,6 +148,9 @@ const RULES: Record<string, Rule> = {
   "selfHealing.rerunFailedGates": flag,
   "selfHealing.conflictRounds": whole(0, 20),
   "queue.maxActiveRuns": whole(1, 50),
+  ...Object.fromEntries(INTAKE_SOURCES.map((source) => [`intake.${source}`, oneOf(INTAKE_MODES)])),
+  "intake.githubLabel": text,
+  "intake.autonomy": oneOf(AUTONOMY),
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */
