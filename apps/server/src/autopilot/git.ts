@@ -176,8 +176,8 @@ export async function commitPaths(dir: string, keep: (file: string) => boolean, 
 /**
  * Squashes everything after `base` into one commit (the same tree), so what
  * merges is exactly what was checked and nothing a later commit removed
- * (a secret, say) rides along in history. Returns the head; a branch with one
- * commit after `base`, or none, is left as it is.
+ * (a secret, say) rides along in history. Returns the head; a branch that's
+ * already one commit with `message`, or none, is left as it is.
  */
 export async function squash(dir: string, base: string, message: string): Promise<string> {
   // Commits that add up to nothing (work undone, empty commits) leave nothing to commit: back to base, and the caller says nothing was built.
@@ -187,7 +187,9 @@ export async function squash(dir: string, base: string, message: string): Promis
     return headSha(dir);
   }
   const count = Number((await git(dir, ["rev-list", "--count", `${base}..HEAD`])).stdout.trim());
-  if (count > 1) {
+  // A single commit gets the factory's message too: nothing scans commit messages, and the builder's would merge as written.
+  const theirs = count === 1 && (await git(dir, ["log", "-1", "--format=%B", "HEAD"])).stdout.trim() !== message;
+  if (count > 1 || theirs) {
     await git(dir, ["reset", "-q", "--soft", base]);
     await git(dir, ["commit", "-q", "-m", message]);
   }
@@ -225,24 +227,38 @@ export async function resetHard(dir: string, sha: string): Promise<void> {
   await git(dir, ["reset", "--hard", sha]);
 }
 
-/** Lines added and deleted per file between `base` and `head` (from their merge base). Binary files count 0. */
+/** Lines added and deleted per file between `base` and `head` (from their merge base). A binary file's lines are its newlines. */
 export async function diffStat(dir: string, base: string, head = "HEAD") {
   // -z: paths as they are. Without it git quotes one with a " or tab in it, and the policy's sensitive-path check would miss it.
   const out = (await git(dir, ["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", `${base}...${head}`])).stdout;
-  const files = out
-    .split("\0")
-    .filter(Boolean)
-    .map((line) => {
-      const [added = "0", deleted = "0", ...rest] = line.split("\t");
-      const count = (n: string) => (n === "-" ? 0 : Number(n));
-      return { path: rest.join("\t"), added: count(added), deleted: count(deleted) };
-    });
+  const files: { path: string; added: number; deleted: number }[] = [];
+  for (const line of out.split("\0").filter(Boolean)) {
+    const [added = "0", deleted = "0", ...rest] = line.split("\t");
+    const file = rest.join("\t");
+    // "-": git took it for binary, which a .gitattributes (or .git/info/attributes) can say of any file, so the policy's line limit would see 0.
+    files.push(added === "-" ? { path: file, ...(await textCount(dir, `${base}...${head}`, file)) } : { path: file, added: Number(added), deleted: Number(deleted) });
+  }
   return { files, linesChanged: files.reduce((sum, f) => sum + f.added + f.deleted, 0) };
+}
+
+/** One file's added and deleted lines, every byte taken as text (numstat ignores --text). */
+async function textCount(dir: string, range: string, file: string): Promise<{ added: number; deleted: number }> {
+  const out = (await git(dir, ["diff", "--unified=0", "--text", "--no-color", "--no-renames", "--no-ext-diff", "--no-textconv", range, "--", `:(literal)${file}`])).stdout;
+  let added = 0;
+  let deleted = 0;
+  let inHunk = false; // one file: only its header comes before the first hunk
+  for (const line of out.split("\n")) {
+    if (line.startsWith("@@ ")) inHunk = true;
+    else if (inHunk && line.startsWith("+")) added++;
+    else if (inHunk && line.startsWith("-")) deleted++;
+  }
+  return { added, deleted };
 }
 
 /** Every added line between `base` and `head` with its number in the new file, for the secret scan. */
 export async function addedLines(dir: string, base: string, head = "HEAD"): Promise<{ path: string; line: string; number: number }[]> {
-  const out = (await git(dir, ["diff", "--unified=0", "--no-color", "--no-renames", "--no-prefix", "--no-ext-diff", "--no-textconv", `${base}...${head}`])).stdout;
+  // --text: an agent's .gitattributes (or .git/info/attributes) marking code `binary` or `-diff` would hide its lines otherwise.
+  const out = (await git(dir, ["diff", "--unified=0", "--text", "--no-color", "--no-renames", "--no-prefix", "--no-ext-diff", "--no-textconv", `${base}...${head}`])).stdout;
   const lines: { path: string; line: string; number: number }[] = [];
   let file = "";
   let next = 0;

@@ -36,7 +36,9 @@ export function channelOf(url: string): Channel {
 /** The body each channel expects for a title and lines of text. */
 export function payload(channel: Channel, title: string, lines: string[], link: string): unknown {
   const text = [title, ...lines.map((l) => `• ${l}`), link].join("\n");
-  if (channel === "slack") return { text };
+  // Titles carry work-order names an agent wrote: escaped, so `<!channel>` or `<https://x|Open the Inbox>` are only text.
+  const slack = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  if (channel === "slack") return { text: [slack(title), ...lines.map((l) => `• ${slack(l)}`), link].join("\n") };
   if (channel === "teams") {
     // An Adaptive Card in the shape Teams Workflows and connectors both accept.
     return {

@@ -158,17 +158,28 @@ or its work orders move.
 ## 8. Scans
 
 - A builder's branch is squashed to one commit after `baseSha` when it
-  finishes (`squash`), so what merges is exactly what the gates and the
-  reviewer checked; a branch that no longer contains its `baseSha` goes back
-  to the builder.
+  finishes (`squash`, with the factory's message even when it's one commit),
+  so what merges is exactly what the gates and the reviewer checked: the
+  merge and `mergeCheck` take that commit (`checkedSha`, the builder's
+  result), never whatever the branch points to by then, since any agent can
+  move it. A branch that no longer contains its `baseSha` goes back to the
+  builder.
 - After the gates pass, `verify` scans the added lines for secrets (known key
-  and token formats, private keys, chat webhooks, hard-coded password-like
-  values with some entropy; lockfiles skipped). A finding is a repair round
+  and token formats, private keys, chat webhooks in every file; hard-coded
+  password-like values with some entropy, except in lockfiles, minified files
+  and source maps). Diffs read every file as text, so a `.gitattributes` or
+  `.git/info/attributes` saying `binary` or `-diff` hides neither lines from
+  the scan nor their count from `maxChangedLines`. A finding is a repair round
   that names the file, line and kind, never the value (`secret-scan` check,
   `autopilot.secrets_found` audit).
-- The dependency scan flags package.json changes a person should see: versions
-  that aren't exact, sources outside the npm registry, new install scripts.
-  It never blocks the build; `mergeCheck` scans again on the branch as it will
+- The dependency scan flags what a person should see: in package.json
+  (dependencies of every kind, peers, `overrides`, `resolutions`) versions
+  that aren't exact (a peer may give a range), sources outside the npm registry, `npm:` aliases and new
+  install scripts; npm lockfile entries resolved from anywhere but the npm
+  registry or a mirror the base's lockfile already uses; and any change to
+  `.npmrc`, `.yarnrc(.yml)` or `.pnpmfile.cjs`. A URL's credentials are left
+  out of findings (they reach the Inbox and the audit log).
+  It never blocks the build; `mergeCheck` scans again on the commit as it will
   merge and passes `secretFindings` and `dependencyFindings` to the policy,
   so either sends the merge to a person with the reason.
 
@@ -179,8 +190,10 @@ decision opens and nothing was alerted since the last digest; everything else
 waits for one digest a day at `policy.notify.digestHour` (local time) listing
 the open items nobody was told about. A digest resets the rule. Messages hold
 inbox titles and a link to the Inbox (`SF_PUBLIC_URL`), never goals, notes or
-the URL; each send is audited as `autopilot.notification_sent`. The markers
-live in the ledger's `meta` table (schema v4); a failed send is retried.
+the URL; each send is audited as `autopilot.notification_sent`. Titles hold
+names agents wrote, so Slack text is escaped (no `<!channel>`, no disguised
+links). The markers live in the ledger's `meta` table (schema v4); a failed
+send is retried.
 
 ## 10. Hidden acceptance tests (opt-in: `hiddenTests.enabled`)
 
@@ -196,6 +209,8 @@ live in the ledger's `meta` table (schema v4); a failed send is retried.
   Work orders wait in `verifying` until the validator has finished.
 - Failures reach the builder as `Scenario "X": A hidden acceptance test fails:
   <first assertion line>`; the output is a check for people.
+- The merge decision reads each test's latest run for the work order's last
+  builder (`hiddenResult`): one its repair fixed doesn't count as failing.
 - No tests written (the validator failed or wrote none) puts every merge in
   front of a person (`hiddenTestsMissing`).
 - `GET /runs/:id` includes `hiddenTests` (file, scenario, requires, sha256,
@@ -210,8 +225,10 @@ run-level `budget_reached` item (raise by half or double, or cancel), and
 Resume refuses until it's raised. A work order in `building` or `reviewing`
 that reaches `perWorkOrderUsd + budgetExtraUsd` has its conversations paused
 and goes to `needs_attention` with its own `budget_reached` item (raise by one
-more `perWorkOrderUsd`, skip, cancel); the rest of the run goes on. Raising is
-audited (`autopilot.budget_raised`). `GET /runs/:id` reports the effective
+more `perWorkOrderUsd`, skip, cancel); the rest of the run goes on. Its
+agents stay paused until that item is decided: a run's Resume only resumes
+work orders in `building` or `reviewing`, and a raise while the run is paused
+leaves them for its Resume. Raising is audited (`autopilot.budget_raised`). `GET /runs/:id` reports the effective
 budgets and `projectedCostUsd` (spent so far plus the merged average for each
 work order left).
 
@@ -248,7 +265,8 @@ the audit log, what an assessor asks for. Nothing in it is new state:
 
 - `traceability`: every `#### Scenario:` of the change's specs, as the
   released commit (or the integration tip) has them, with the hidden tests
-  for it (file, sha256 from the manifest, how often each ran and how it last
+  for it, matched by scenario and (when the test names one) requirement
+  (file, sha256 from the manifest, how often each ran and how it last
   ended) and the work orders it needs, each with who let it in: `{by, kind}`
   where `kind` is `policy` (`policy@<hash>`) or `person`.
 - `workOrders`: risk, controls, acceptance, approval, the merge sha, and

@@ -5,8 +5,9 @@
 //   tokens, private keys, webhook URLs) and hard-coded password-like values.
 //   A finding names the rule, file and line, never the secret itself.
 // - dependencies: package.json changes that pull code in a way a reviewer
-//   should see: a version that isn't exact, a source outside the npm registry,
-//   or a new install script.
+//   should see: a version that isn't exact, a source outside the npm registry
+//   (also in overrides and the lockfile), an alias or a new install script;
+//   and any change to the package manager's settings (.npmrc).
 //
 // Both are deterministic and offline. They're a floor, not a replacement for
 // a real scanner (gitleaks, npm audit) a team can add as a gate.
@@ -41,7 +42,11 @@ const SECRET_RULES: SecretRule[] = [
 /** `password = "..."` and friends with a literal value that doesn't look like a placeholder. */
 const ASSIGNED = /\b(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)\b["']?\s*[:=]\s*["'`]([^"'`\s]{8,})["'`]/i;
 const PLACEHOLDER = /^(?:x+|\*+|\.+|changeme|change-me|example|placeholder|password|secret|redacted|dummy|test|fake|sample|your[-_].*|<.*>|\$\{.*\}|%.*%|\{\{.*\}\})$/i;
-/** Files that hold hashes and fixtures rather than credentials. */
+/**
+ * Files full of hashes and generated names, where a password-like value is noise. Only the
+ * entropy check skips them: a known key format is a secret anywhere (a lockfile can hold a
+ * token in a git URL, and a builder can name any file .min.js).
+ */
 const SKIP_FILES = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|[^/]*\.lock|[^/]*\.min\.js|[^/]*\.map)$/i;
 
 /** Shannon entropy in bits per character: random secrets score high, words low. */
@@ -63,11 +68,11 @@ function entropy(text: string): number {
 export function scanSecrets(lines: { path: string; line: string; number?: number | null }[]): ScanFinding[] {
   const found: ScanFinding[] = [];
   for (const { path: file, line, number } of lines) {
-    if (SKIP_FILES.test(file)) continue;
     const at = number ?? null;
     for (const { rule, pattern } of SECRET_RULES) {
       if (pattern.test(line)) found.push({ rule, file, line: at, detail: `Looks like a ${rule.replaceAll("-", " ")}` });
     }
+    if (SKIP_FILES.test(file)) continue;
     const value = ASSIGNED.exec(line)?.[1];
     if (value && !PLACEHOLDER.test(value) && !/^(?:process\.env|import\.meta\.env|os\.environ)/.test(value) && entropy(value) >= 3) {
       if (!found.some((f) => f.file === file && f.line === at)) {
@@ -79,25 +84,50 @@ export function scanSecrets(lines: { path: string; line: string; number?: number
 }
 
 const MANIFEST = /(^|\/)package\.json$/;
-const DEPENDENCY_FIELDS = ["dependencies", "devDependencies", "optionalDependencies"];
-const INSTALL_SCRIPTS = ["preinstall", "install", "postinstall", "prepare"];
+const LOCKFILE = /(^|\/)(?:package-lock|npm-shrinkwrap)\.json$/;
+/** Package manager settings: a registry there serves every package, whatever package.json and the lockfile say. */
+const PM_CONFIG = /(^|\/)(?:\.npmrc|\.yarnrc|\.yarnrc\.yml|\.pnpmfile\.cjs)$/;
+// Every field a package is installed from: npm installs peers too, and overrides (npm) and resolutions (yarn) swap one anywhere in the tree.
+const DEPENDENCY_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "overrides", "resolutions"];
+// What `npm install` runs in the package itself, and "dependencies" after node_modules changes.
+const INSTALL_SCRIPTS = ["preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare", "dependencies"];
 const EXACT = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const OUTSIDE = /^(?:git(?:\+[a-z]+)?:|github:|gitlab:|bitbucket:|https?:|file:|link:|[\w.-]+\/[\w.-]+(?:#.*)?$)/i;
 
 type Manifest = Record<string, unknown> | null;
 const mapping = (v: unknown): Record<string, unknown> => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
+/** A source as findings show it: they reach the Inbox and the audit log, so a URL's credentials (https://user:token@host) stay out. */
+const shown = (source: string) => source.replace(/^([\w+.-]+:\/\/)(?!git@)[^/@\s]+@/, "$1***@");
+
+/** A field's name -> spec. npm overrides nest ({ "foo": { "bar": "1.0.0" } }): those read "foo > bar". */
+function specsOf(manifest: Manifest, field: string): Map<string, unknown> {
+  const out = new Map<string, unknown>();
+  const walk = (value: unknown, prefix: string) => {
+    for (const [name, spec] of Object.entries(mapping(value))) {
+      const key = prefix ? `${prefix} > ${name}` : name;
+      if (field === "overrides" && spec && typeof spec === "object") walk(spec, key);
+      else out.set(key, spec);
+    }
+  };
+  walk(manifest?.[field], "");
+  return out;
+}
 
 /** What a package.json change brings in that a person should look at, comparing `before` with `after`. */
 export function scanManifest(file: string, before: Manifest, after: Manifest): ScanFinding[] {
   const found: ScanFinding[] = [];
   for (const field of DEPENDENCY_FIELDS) {
-    const old = mapping(before?.[field]);
-    for (const [name, spec] of Object.entries(mapping(after?.[field]))) {
-      if (old[name] === spec) continue; // unchanged
+    const old = specsOf(before, field);
+    for (const [name, spec] of specsOf(after, field)) {
+      if (old.get(name) === spec) continue; // unchanged
       const version = typeof spec === "string" ? spec.trim() : "";
+      if (field === "overrides" && version.startsWith("$")) continue; // the version of that direct dependency, checked there
       if (OUTSIDE.test(version)) {
-        found.push({ rule: "dependency-source", file, line: null, detail: `${name} installs from outside the npm registry (${version})` });
-      } else if (!EXACT.test(version)) {
+        found.push({ rule: "dependency-source", file, line: null, detail: `${name} installs from outside the npm registry (${shown(version)})` });
+      } else if (/^npm:/i.test(version)) {
+        found.push({ rule: "dependency-alias", file, line: null, detail: `${name} installs another package under its name (${version})` });
+      } else if (!EXACT.test(version) && field !== "peerDependencies") {
+        // A peer's range is what the package works with; the version comes from whoever installs it.
         found.push({ rule: "dependency-unpinned", file, line: null, detail: `${name}@${version || "?"} isn't pinned to an exact version` });
       }
     }
@@ -111,7 +141,52 @@ export function scanManifest(file: string, before: Manifest, after: Manifest): S
   return found;
 }
 
-/** Dependency findings for every package.json among `files` between `base` and `head`. Unreadable JSON is a finding too. */
+/** Where an npm lockfile resolves each package from (`packages`, or v1's nested `dependencies`); links to this repo's own folders left out. */
+function resolvedOf(lock: Manifest): Map<string, string> {
+  const out = new Map<string, string>();
+  const add = (name: string, entry: unknown) => {
+    const { resolved, link } = mapping(entry);
+    if (typeof resolved === "string" && link !== true) out.set(name, resolved);
+  };
+  const walk = (deps: unknown, prefix: string) => {
+    for (const [name, entry] of Object.entries(mapping(deps))) {
+      add(`${prefix}${name}`, entry);
+      walk(mapping(entry).dependencies, `${prefix}${name} > `);
+    }
+  };
+  const packages = Object.entries(mapping(lock?.packages));
+  if (packages.length) packages.forEach(([name, entry]) => add(name, entry));
+  else walk(lock?.dependencies, "");
+  return out;
+}
+
+/** The host of a registry tarball URL over https (".../<name>/-/<name>-1.0.0.tgz"), else null. */
+function registryHost(url: string): string | null {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && /\/-\/[^/]+\.tgz$/.test(u.pathname) ? u.host : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What a lockfile change installs from somewhere new: `npm ci` takes the lockfile's word over
+ * package.json. The npm registry is fine, and so is a mirror the base's lockfile already uses.
+ */
+export function scanLockfile(file: string, before: Manifest, after: Manifest): ScanFinding[] {
+  const old = resolvedOf(before);
+  const known = new Set(["registry.npmjs.org", ...[...old.values()].map(registryHost).filter((h) => h !== null)]);
+  const found: ScanFinding[] = [];
+  for (const [name, url] of resolvedOf(after)) {
+    const host = registryHost(url);
+    if (old.get(name) === url || (host && known.has(host))) continue;
+    found.push({ rule: "dependency-source", file, line: null, detail: `${name} resolves from outside the npm registry (${shown(url)})` });
+  }
+  return found;
+}
+
+/** Dependency findings for every package.json, npm lockfile and package manager setting among `files` between `base` and `head`. Unreadable JSON is a finding too. */
 export async function scanDependencies(dir: string, base: string, head: string, files: string[]): Promise<ScanFinding[]> {
   const read = async (ref: string, file: string): Promise<Manifest | "invalid"> => {
     const text = await fileAt(dir, ref, file);
@@ -123,14 +198,20 @@ export async function scanDependencies(dir: string, base: string, head: string, 
     }
   };
   const found: ScanFinding[] = [];
-  for (const file of files.filter((f) => MANIFEST.test(f))) {
+  for (const file of files) {
+    if (PM_CONFIG.test(file)) {
+      found.push({ rule: "package-manager-config", file, line: null, detail: "Changes the package manager's settings (the registry it installs from, or scripts it runs)" });
+      continue;
+    }
+    const lockfile = LOCKFILE.test(file);
+    if (!lockfile && !MANIFEST.test(file)) continue;
     const after = await read(head, file);
     if (after === "invalid") {
-      found.push({ rule: "manifest-invalid", file, line: null, detail: "package.json isn't valid JSON" });
+      found.push({ rule: "manifest-invalid", file, line: null, detail: `${file.slice(file.lastIndexOf("/") + 1)} isn't valid JSON` });
       continue;
     }
     const before = await read(base, file);
-    found.push(...scanManifest(file, before === "invalid" ? null : before, after));
+    found.push(...(lockfile ? scanLockfile : scanManifest)(file, before === "invalid" ? null : before, after));
   }
   return found;
 }

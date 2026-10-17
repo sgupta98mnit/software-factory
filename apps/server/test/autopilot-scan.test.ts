@@ -35,7 +35,7 @@ test("scanSecrets: known credential formats and hard-coded secrets, never the se
   assert.match(text, /^src\/aws\.js:3: Looks like a aws access key \(aws-access-key\)$/m);
 });
 
-test("scanSecrets: placeholders, environment lookups, plain words and lockfiles are not secrets", () => {
+test("scanSecrets: placeholders, environment lookups, plain words and lockfile hashes are not secrets", () => {
   assert.deepEqual(
     scanSecrets([
       { path: "src/a.js", line: 'const password = "changeme";' },
@@ -44,7 +44,7 @@ test("scanSecrets: placeholders, environment lookups, plain words and lockfiles 
       { path: "src/a.js", line: 'const secret = "${SECRET}";' },
       { path: "src/a.js", line: 'const password = "aaaaaaaaaaaa";' }, // no entropy
       { path: "README.md", line: "Set the password in the vault." },
-      { path: "package-lock.json", line: `"integrity": "sha512-${"x".repeat(80)}", "token": "${GH}"` },
+      { path: "package-lock.json", line: `"integrity": "sha512-${"x".repeat(80)}", "auth_token": "Tr0ub4dor&3xK9"` }, // a known key format would count (autopilot-review-p3)
     ]),
     [],
   );

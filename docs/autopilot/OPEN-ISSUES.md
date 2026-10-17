@@ -44,11 +44,47 @@ run against the fake agent server), and the Phase 1 UI review.
 | --- | --- | --- |
 | 21 | medium | A builder whose commits added up to nothing (a repair that took its own work out again, or empty commits) stopped its work order on a raw `git commit` error ("nothing to commit"), because the squash tried to commit an unchanged tree. Fixed in "a work order whose commits add up to nothing goes back to its builder": the branch goes back to its base and the builder hears "Nothing was built", like a builder that never committed. |
 
+## Found by the review of Phase 3 (all fixed in "review fixes for Phase 3", tests in `autopilot-review-p3.test.ts`)
+
+| # | Severity | Issue |
+| --- | --- | --- |
+| 22 | high | The merge took the work order's branch as it was at merge time, not the commit the gates and reviewer checked. Any agent can move that ref, so a commit put on it after the review (or after a person approved the merge) went onto the integration branch unreviewed, recorded as that person's. The merge and `mergeCheck` now take the builder's squashed commit. |
+| 23 | high | A `.gitattributes` (committed) or `.git/info/attributes` (shows in no diff) marking code `binary` or `-diff` hid its added lines from the secret scan and counted it as 0 lines against `maxChangedLines`. Diffs read every file as text now. |
+| 24 | medium | The dependency scan missed `peerDependencies`, `overrides` and `resolutions`, the install scripts `prepublish`, `preprepare`, `postprepare` and `dependencies`, a lockfile entry resolved from anywhere (what `npm ci` installs), and a registry set in `.npmrc` or `.yarnrc`. An `npm:` alias was reported as "not pinned". |
+| 25 | medium | A dependency URL's credentials (`https://user:token@host/...`) went verbatim into findings: the check output, the merge approval and the audit log (`work_order_merged` reasons). |
+| 26 | medium | The secret scan skipped lockfiles, `*.min.js`, `*.map` and `*.lock` entirely, so a known token format there (a lockfile's authenticated git URL, a builder's `config.min.js`) went unflagged. Only the entropy check skips them now. |
+| 27 | medium | A run's Resume resumed every paused conversation, including those of a work order paused at its budget (or skipped there), which then spent with nothing holding them to a budget; raising a work order's budget while its run was paused resumed its agents with nobody polling them. |
+| 28 | low | `hiddenResult` counted every hidden-test run since the builder started, so a test that failed once and passed after the repair still put the merge in front of a person as "Hidden acceptance tests failed". |
+| 29 | low | Evidence matched hidden tests to scenarios by name only: a scenario with the same name under another requirement showed as covered. |
+| 30 | low | `squash` left a single commit's own message (never scanned) on what merges. |
+| 31 | low | Slack alerts posted agent-written work-order titles unescaped (`<!channel>`, `<https://x\|Open the Inbox>`). |
+
 ## Plausible, not fixed yet (tracked for later phases)
 
 - **A conversation paused by hand in Canvas** stays `running` in the ledger, and
   the watchdog leaves it alone (it only acts on `running` conversations). Nothing
   tells the run's people it's waiting on that pause.
+- **Hidden tests share a process with the builder's code.** An import that
+  calls `process.exit(0)` makes `node --test` pass the file (checked), and one
+  that patches `node:assert` does too; the same code can read
+  `.factory-hidden/` while it runs, and a committed `.factory-hidden` symlink
+  sends the copies elsewhere. Needs the sandbox below.
+- **The API has no authentication.** It listens on 127.0.0.1 only, but any
+  local process, agents included, can decide Inbox items, raise budgets, release
+  a run or read hidden-test output from `GET /runs/:id`. Agents in a sandbox
+  (no route to the host's loopback) close most of it; a per-user session token
+  between Canvas and the API closes the rest.
+- **Teams cards render markdown links** in titles; only Slack text is escaped.
+- **Release merges the integration branch by name** a moment after checking
+  its tip, and a done run whose integration branch moved can't be released
+  (there's no Restore at that stage).
+- **A pause the agent server refuses at a work order's budget** leaves that
+  conversation running, and nothing tries again; the change's budget still
+  stops it.
+- `release()` and `resume()` decide Inbox items without an
+  `autopilot.inbox_decided` record (the release or resume itself is audited).
+- After a restart the digest hour is the default (17) until `/status` or a
+  new run loads the policy.
 - **Repo-level git config is still the agents' to write.** Hooks and fsmonitor
   are off for the factory's git, but a `filter.<name>.clean` driver set in
   `.git/config` with a matching `.gitattributes` runs on `git add`. Gates also

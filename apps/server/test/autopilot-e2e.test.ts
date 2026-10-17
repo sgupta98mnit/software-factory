@@ -420,8 +420,10 @@ test("a merge step that throws stops only its work order with an error item; the
     await t.until(() => t.wo(run.id, 1).state === "awaiting_merge_approval");
     const tip = await headSha(t.workspace, run.integrationBranch);
     const wo = t.wo(run.id, 1);
-    const built = await headSha(t.workspace, wo.branch!);
-    await git(t.workspace, ["update-ref", "-d", `refs/heads/${wo.branch}`]); // git can't read the branch any more
+    // What merges is the commit its builder finished with (not the branch): git can't read that one any more.
+    const builder = t.ledger.listAttempts({ runId: run.id, workOrderId: wo.id, role: "builder" }).at(-1)!;
+    const built = builder.result as { sha: string };
+    t.ledger.updateAttempt(builder.id, { result: { ...built, sha: "0".repeat(40) } });
     await t.o.decide(t.item(run.id, "merge_approval", 1)!.id, { choice: "merge" }, "user:test");
     await t.step();
     assert.equal(t.wo(run.id, 1).state, "needs_attention");
@@ -431,7 +433,7 @@ test("a merge step that throws stops only its work order with an error item; the
     assert.equal(t.ledger.getRun(run.id)?.state, "building");
     assert.deepEqual(await auditOf(run.id, "autopilot.merge_reverted"), []); // nothing had landed
 
-    await git(t.workspace, ["update-ref", `refs/heads/${wo.branch}`, built]);
+    t.ledger.updateAttempt(builder.id, { result: built });
     await t.o.decide(t.item(run.id, "error", 1)!.id, { choice: "retry" }, "user:test");
     await t.until(() => t.ledger.getRun(run.id)?.state === "done");
     assert.equal(t.wo(run.id, 1).mergedBy, "user:test");

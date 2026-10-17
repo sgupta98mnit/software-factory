@@ -821,6 +821,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   const builders = (wo: WorkOrder) => ledger.listAttempts({ runId: wo.runId, workOrderId: wo.id, role: "builder" });
   const reviewers = (wo: WorkOrder) => ledger.listAttempts({ runId: wo.runId, workOrderId: wo.id, role: "reviewer" });
+  /** The commit the gates and the reviewer checked (the last builder's squash). Its branch is a ref any agent can move, so that's what merges. */
+  const checkedSha = (wo: WorkOrder) => (builders(wo).at(-1)?.result as { sha?: string } | null)?.sha ?? (wo.branch as string);
 
   function workOrderOf(item: InboxItem): WorkOrder {
     const wo = item.workOrderId ? ledger.getWorkOrder(item.workOrderId) : undefined;
@@ -1269,7 +1271,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const merging = ledger.listWorkOrders(run.id).find((w) => w.state === "merging" && w.preMergeSha === run.integrationSha && w.branch);
     if (!merging) return false;
     if (merging.mergeSha) return tip === merging.mergeSha;
-    const head = await headSha(workspace, merging.branch as string).catch(() => "");
+    const head = await headSha(workspace, checkedSha(merging)).catch(() => "");
     const parents = (await git(workspace, ["rev-list", "--parents", "-n", "1", tip])).stdout.trim().split(" ").slice(1);
     if (parents.length !== 2 || parents[0] !== run.integrationSha || parents[1] !== head) return false;
     const tree = (await git(workspace, ["rev-parse", `${tip}^{tree}`])).stdout.trim();
@@ -1386,8 +1388,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** Back to work where the budget stopped it: its state, and its paused conversations resumed. */
   async function resumeWorkOrder(wo: WorkOrder, actor: string) {
+    // In a paused run they wait for its Resume: until then nobody polls them or holds them to a budget.
+    const runPaused = ledger.getRun(wo.runId)?.state === "paused";
     for (const a of ledger.listAttempts({ runId: wo.runId, workOrderId: wo.id })) {
-      if (a.state !== "paused") continue;
+      if (a.state !== "paused" || runPaused) continue;
       await client.resume(a.conversationId).catch(warn);
       ledger.updateAttempt(a.id, { state: "running", seenRunning: false, lastSentAt: now() });
     }
@@ -1429,15 +1433,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /**
-   * The pinned policy's merge decision for a work order, from what its branch
-   * changes since base_sha (the integration sha it last started from) and
-   * the dependencies it adds. The same answer for as long as its branch
-   * doesn't change, wherever the integration branch has moved since.
+   * The pinned policy's merge decision for a work order, from what its
+   * checked commit changes since base_sha (the integration sha it last
+   * started from) and the dependencies it adds. The same answer until it's
+   * built again, wherever the integration branch (or its own) has moved since.
    */
   async function mergeCheck(run: Run, wo: WorkOrder) {
     const policy = pinnedPolicy(run);
     const base = wo.baseSha ?? ledger.getRun(run.id)?.integrationSha ?? run.integrationBranch;
-    const head = wo.branch as string;
+    const head = checkedSha(wo);
     const stat = await diffStat(workspace, base, head);
     const files = stat.files.map((f) => f.path);
     const review = reviewers(wo).at(-1)?.result as ReviewVerdict | null | undefined;
@@ -1460,10 +1464,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** Did the hidden tests the work order was held to pass at its last verification? null when none applied. */
   function hiddenResult(run: Run, wo: WorkOrder): boolean | null {
     const lastBuild = builders(wo).at(-1);
-    const hidden = ledger
-      .listChecks({ runId: run.id, workOrderId: wo.id })
-      .filter((c) => c.stage === "build" && c.name.startsWith("hidden:") && (!lastBuild || c.at >= lastBuild.startedAt));
-    return hidden.length ? hidden.every((c) => c.ok) : null;
+    // Each test's latest run: a repair round of the same builder fixes what an earlier one failed.
+    const latest = new Map<string, boolean>();
+    for (const c of ledger.listChecks({ runId: run.id, workOrderId: wo.id })) {
+      if (c.stage === "build" && c.name.startsWith("hidden:") && (!lastBuild || c.at >= lastBuild.startedAt)) latest.set(c.name, c.ok);
+    }
+    return latest.size ? [...latest.values()].every(Boolean) : null;
   }
 
   /** A person sees why the policy didn't merge it, and what it changes. */
@@ -1529,7 +1535,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (outcome && !outcome.aborted && tested) r = await settleMerge(dir, tested, pre, outcome);
     else {
       // Safe to repeat (after a restart, or a job that was stopped): a merge already made is found, not made twice.
-      const merge = await prepareMerge(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre);
+      const merge = await prepareMerge(dir, checkedSha(wo), `Merge ${key}: ${clip(wo.title, 72)}`, pre);
       if (merge.outcome === "ready") {
         ledger.updateWorkOrder(wo.id, { mergeSha: merge.sha }); // the one tip besides integrationSha the guard accepts
         prepared.set(jobKey, merge);
@@ -1966,8 +1972,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   async function unpause(run: Run, actor: string) {
+    // A work order's agents go on only where they work: not one over its budget (raising resumes them) or skipped.
+    const working = new Set(ledger.listWorkOrders(run.id).filter((w) => ["building", "reviewing"].includes(w.state)).map((w) => w.id));
     for (const a of ledger.listAttempts({ runId: run.id })) {
-      if (a.state !== "paused") continue;
+      if (a.state !== "paused" || (a.workOrderId && !working.has(a.workOrderId))) continue;
       await client.resume(a.conversationId).catch(warn);
       ledger.updateAttempt(a.id, { state: "running", seenRunning: false, lastSentAt: now() });
     }

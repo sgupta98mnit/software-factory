@@ -88,7 +88,8 @@ export async function buildEvidence(ledger: Ledger, workspace: string, run: Run)
   const byKey = new Map(workOrderEvidence.map((w) => [w.key, w]));
 
   const traceability = scenarios.map((s) => {
-    const tests = hidden.filter((t) => t.scenario === s.scenario);
+    // By requirement too, when the test names one: two requirements can each have a "Bad input" scenario.
+    const tests = hidden.filter((t) => t.scenario === s.scenario && (!t.requirement || t.requirement === s.requirement));
     const builtBy = [...new Set(tests.flatMap((t) => t.requires.map(key)))];
     return {
       ...s,
