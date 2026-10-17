@@ -90,6 +90,10 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 | `SF_AGENT_SERVER_URL` | `http://127.0.0.1:8000` | Where Autopilot reaches the OpenHands agent server (Canvas's address) |
 | `SF_AGENT_SERVER_KEY` | Canvas's saved key | The agent server's session key, if Canvas keeps it somewhere else |
 | `SF_AUTONOMY_CAP` | none | Highest Autopilot autonomy anyone can pick: `suggest`, `supervised` or `autonomous` |
+| `SF_NOTIFY_WEBHOOK` | none | A Slack or Teams incoming webhook (or any URL that takes JSON). The first decision that waits for a person is posted right away; later ones wait for one daily digest at the policy's `notify.digestHour` |
+| `SF_PUBLIC_URL` | `http://localhost:8000` | Where people open Canvas, for the Inbox link in alerts |
+| `SF_GATE_CONCURRENCY` | `2` | Gate runs at once across the factory |
+| `SF_GATE_ENV` | none | Comma-separated environment variables gates may see although they look like secrets |
 
 ## Autopilot policy
 

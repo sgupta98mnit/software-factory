@@ -38,6 +38,7 @@ Goal ─▶ spec agent ─▶ openspec validate --strict ─▶ commit ─▶ cr
 | `policy.ts` | `.factory/policy.yml` from the base branch, validation, `evaluateMerge` |
 | `prompts.ts` | Every brief and follow-up, rebuilt from the ledger |
 | `scan.ts` | Secret scan of added lines, dependency scan of package.json changes |
+| `notify.ts` | Slack/Teams webhook alerts: one alert, then a daily digest |
 | `routes.ts` | HTTP API under `/sf-api/autopilot` (§5) |
 | `../demo/` | Fake agent server and scripted agents (tests, `pnpm demo`) |
 
@@ -168,7 +169,17 @@ or its work orders move.
   merge and passes `secretFindings` and `dependencyFindings` to the policy,
   so either sends the merge to a person with the reason.
 
-## 9. Changes since the first build
+## 9. Alerts
+
+`SF_NOTIFY_WEBHOOK` (a secret, so environment only) gets one message when a
+decision opens and nothing was alerted since the last digest; everything else
+waits for one digest a day at `policy.notify.digestHour` (local time) listing
+the open items nobody was told about. A digest resets the rule. Messages hold
+inbox titles and a link to the Inbox (`SF_PUBLIC_URL`), never goals, notes or
+the URL; each send is audited as `autopilot.notification_sent`. The markers
+live in the ledger's `meta` table (schema v4); a failed send is retried.
+
+## 10. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

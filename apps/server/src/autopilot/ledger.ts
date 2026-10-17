@@ -273,6 +273,14 @@ const SCHEMA_V3 = `
 ALTER TABLE work_orders ADD COLUMN merge_sha TEXT;
 `;
 
+// v4: small factory-wide settings and markers (when the last alert and digest went out).
+const SCHEMA_V4 = `
+CREATE TABLE meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox"];
 
@@ -330,6 +338,7 @@ export function openLedger(file: string) {
   if (version < 1) transaction(() => db.exec(`${SCHEMA_V1}\nPRAGMA user_version = 1;`));
   if (version < 2) transaction(() => db.exec(`${SCHEMA_V2}\nPRAGMA user_version = 2;`));
   if (version < 3) transaction(() => db.exec(`${SCHEMA_V3}\nPRAGMA user_version = 3;`));
+  if (version < 4) transaction(() => db.exec(`${SCHEMA_V4}\nPRAGMA user_version = 4;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),
@@ -525,8 +534,25 @@ export function openLedger(file: string) {
     return Number(changes);
   }
 
+  /** Marks items as told about (an alert or a digest), so a digest doesn't repeat them. */
+  function markNotified(ids: number[], at: string) {
+    const stmt = db.prepare("UPDATE inbox SET notified_at = $at WHERE id = $id");
+    transaction(() => ids.forEach((id) => stmt.run({ id, at })));
+  }
+
   function openInboxCount(): number {
     return count("SELECT COUNT(*) AS n FROM inbox WHERE state = 'open'", {});
+  }
+
+  // Meta (key -> text)
+
+  function getMeta(key: string): string | null {
+    const row = db.prepare("SELECT value FROM meta WHERE key = $key").get({ key });
+    return row ? String(row.value) : null;
+  }
+
+  function setMeta(key: string, value: string) {
+    db.prepare("INSERT INTO meta (key, value) VALUES ($key, $value) ON CONFLICT(key) DO UPDATE SET value = $value").run({ key, value });
   }
 
   // Costs, summed from attempts
@@ -564,7 +590,10 @@ export function openLedger(file: string) {
     listInbox,
     decideInbox,
     dismissInbox,
+    markNotified,
     openInboxCount,
+    getMeta,
+    setMeta,
     runCost,
     workOrderCost,
     transaction,

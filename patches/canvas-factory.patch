@@ -91,10 +91,10 @@ index 0000000..cfc572e
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..c3499e3
+index 0000000..12415f8
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,476 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -442,6 +442,11 @@ index 0000000..c3499e3
 +    hash: string;
 +    error: string | null;
 +    autonomy: { default: Autonomy; max: Autonomy } | null;
++  };
++  /** Where alerts go (SF_NOTIFY_WEBHOOK), and the hour of the daily digest. */
++  notifications: {
++    channel: "slack" | "teams" | "json" | null;
++    digestHour: number;
 +  };
 +  openInbox: number;
 +  activeRuns: number;
@@ -1613,10 +1618,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..21da76f
+index 0000000..d9e9a1f
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,859 @@
+@@ -0,0 +1,875 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1737,6 +1742,15 @@ index 0000000..21da76f
 +    policyDefaults: (hash: string) =>
 +      `No .factory/policy.yml; using the default policy (policy@${hash})`,
 +    policyError: "The policy file has a problem, so no run can start:",
++    alertsOn: (channel: string, hour: number) =>
++      `Alerts go to ${channel}: one right away, then a digest at ${hour}:00`,
++    alertsOff:
++      "No team alerts. Set SF_NOTIFY_WEBHOOK to a Slack or Teams webhook.",
++    channels: {
++      slack: "Slack",
++      teams: "Teams",
++      json: "your webhook",
++    } as Record<string, string>,
 +    progress: (merged: number, total: number) => `${merged} of ${total} merged`,
 +    needsYou: (n: number) => (n === 1 ? "1 needs you" : `${n} need you`),
 +    cost: (cost: string, budget: string | null) =>
@@ -2041,6 +2055,7 @@ index 0000000..21da76f
 +      "autopilot.workspace_initialized": "Made the workspace a git repo",
 +      "autopilot.integration_restored": "Put the integration branch back",
 +      "autopilot.secrets_found": "The secret scan found something",
++      "autopilot.notification_sent": "Told the team",
 +    } as Record<string, string>,
 +  },
 +};
@@ -2160,6 +2175,11 @@ index 0000000..21da76f
 +      `Sin .factory/policy.yml; se usa la política predeterminada (policy@${hash})`,
 +    policyError:
 +      "El archivo de política tiene un problema, así que no puede empezar ninguna ejecución:",
++    alertsOn: (channel, hour) =>
++      `Las alertas van a ${channel}: una al momento y luego un resumen a las ${hour}:00`,
++    alertsOff:
++      "Sin alertas al equipo. Defina SF_NOTIFY_WEBHOOK con un webhook de Slack o Teams.",
++    channels: { slack: "Slack", teams: "Teams", json: "su webhook" },
 +    progress: (merged, total) => `${merged} de ${total} integradas`,
 +    needsYou: (n) => (n === 1 ? "1 le necesita" : `${n} le necesitan`),
 +    cost: (cost, budget) => (budget ? `${cost} de ${budget}` : cost),
@@ -2464,6 +2484,7 @@ index 0000000..21da76f
 +        "Convirtió el espacio de trabajo en repositorio git",
 +      "autopilot.integration_restored": "Restauró la rama de integración",
 +      "autopilot.secrets_found": "El análisis de secretos encontró algo",
++      "autopilot.notification_sent": "Avisó al equipo",
 +    },
 +  },
 +};
@@ -3875,14 +3896,15 @@ index 0000000..3d195a4
 +}
 diff --git a/src/factory/routes/autopilot.tsx b/src/factory/routes/autopilot.tsx
 new file mode 100644
-index 0000000..893d209
+index 0000000..3bd096a
 --- /dev/null
 +++ b/src/factory/routes/autopilot.tsx
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,371 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
 +import {
++  BellRing,
 +  CircleAlert,
 +  CircleCheck,
 +  GitBranch,
@@ -4116,7 +4138,7 @@ index 0000000..893d209
 +function SetupStatus({ status }: { status: AutopilotStatus | undefined }) {
 +  const copy = useFactoryCopy();
 +  if (!status) return null;
-+  const { agentServer, workspace, policy } = status;
++  const { agentServer, workspace, policy, notifications } = status;
 +  return (
 +    <aside
 +      aria-label={copy.autopilot.setup}
@@ -4158,6 +4180,19 @@ index 0000000..893d209
 +              : copy.autopilot.policyFile(policy.source, policy.hash)
 +        }
 +        hint={policy.error ?? undefined}
++      />
++      <SetupLine
++        ok
++        icon={<BellRing className="size-4" aria-hidden />}
++        text={
++          notifications.channel
++            ? copy.autopilot.alertsOn(
++                copy.autopilot.channels[notifications.channel] ??
++                  notifications.channel,
++                notifications.digestHour,
++              )
++            : copy.autopilot.alertsOff
++        }
 +      />
 +    </aside>
 +  );

@@ -238,6 +238,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
       },
       workspace: { path: workspace, isRepo: false, branch: null },
       policy: { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null, autonomy: { default: "supervised", max: "autonomous" } },
+      notifications: { channel: null, digestHour: 17 },
       openInbox: 0,
       activeRuns: 0,
     });

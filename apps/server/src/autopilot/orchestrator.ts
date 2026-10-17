@@ -57,6 +57,7 @@ import type {
   WorkOrder,
   WorkOrderState,
 } from "./ledger.js";
+import { channelOf, createNotifier } from "./notify.js";
 import { classify, OpenHandsError, type OpenHandsClient } from "./openhands.js";
 import {
   answerFollowUp,
@@ -93,6 +94,8 @@ export interface OrchestratorDeps {
   dataDir: string; // worktrees go in <dataDir>/worktrees/<runId>/
   /** How long an end state right after a message is distrusted (see classify). Tests use 0. */
   graceMs?: number;
+  /** For tests: the webhook alerts post with (default: the global fetch). */
+  notifyFetch?: typeof fetch;
 }
 
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
@@ -254,6 +257,18 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   const changed = (runId: string) => broadcast({ type: "autopilot.changed", runId });
+  // The digest hour of the last policy the factory loaded (a run created, or /status read it).
+  let digestHour = DEFAULT_POLICY.notify.digestHour;
+  const notifier = createNotifier({
+    ledger,
+    config: () => ({
+      webhook: process.env.SF_NOTIFY_WEBHOOK?.trim() || null,
+      inboxUrl: `${(process.env.SF_PUBLIC_URL ?? "http://localhost:8000").replace(/\/+$/, "")}/inbox`,
+      digestHour,
+    }),
+    record: (action, data) => audit(SYSTEM, action, "notifications", data).catch(() => undefined),
+    fetch: deps.notifyFetch,
+  });
   const record = (actor: string, action: string, runId: string, data: Record<string, unknown> = {}) => {
     audit(actor, action, runId, data).catch(() => undefined); // audit.ts logs write failures
   };
@@ -312,6 +327,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   function openItem(run: Run, kind: InboxKind, title: string, body: string, options: InboxOption[], workOrderId?: string): InboxItem {
     const item = ledger.openInbox({ runId: run.id, workOrderId, kind, title, body, options });
     record(SYSTEM, "autopilot.inbox_opened", run.id, { item: item.id, kind, ...(workOrderId ? { workOrder: workOrderId } : {}) });
+    // After this transaction commits: the notifier runs on its own queue and never throws.
+    queueMicrotask(() => void notifier.opened(item));
     return item;
   }
 
@@ -1333,13 +1350,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     for (const run of ledger.listRuns()) {
       if (!TERMINAL.has(run.state) && run.state !== "paused") launch(run.id, () => advance(run.id));
     }
+    void notifier.tick(); // the daily digest, when it's time
   }
 
-  /** Resolves when no step and no gate job is running (tests, shutdown). */
+  /** Resolves when no step, gate job or notification is running (tests, shutdown). */
   async function idle() {
     while (inflight.size || [...jobs.values()].some((j) => !j.outcome)) {
       await Promise.all([...inflight.values(), ...[...jobs.values()].map((j) => j.promise)]);
     }
+    await notifier.idle();
   }
 
   // ---- what people do ----
@@ -1388,6 +1407,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const baseBranch = (await currentBranch(workspace)) ?? "main";
     // The rules this run keeps to the end, from the base branch: an invalid policy.yml stops it here.
     const { policy, hash, source } = await loadPolicy(workspace, baseBranch);
+    digestHour = policy.notify.digestHour;
     const missing = await missingProfiles(policy);
     if (missing.length) throw new Error(`${source}: the agent server has no profile for ${missing.join(", ")}`);
     const requested = input.autonomy ?? policy.autonomy.default;
@@ -1604,6 +1624,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const autonomyOf = (p: Policy) => ({ default: clampAutonomy(p.autonomy.default, p.autonomy.max), max: clampAutonomy("autonomous", p.autonomy.max) });
     // A policy naming profiles the agent server lacks starts no run either, so it shows as the policy's error.
     const checked = async (p: { policy: Policy; hash: string; source: string }) => {
+      digestHour = p.policy.notify.digestHour;
       const missing = agent.reachable ? await missingProfiles(p.policy) : [];
       const error = missing.length ? `${p.source}: the agent server has no profile for ${missing.join(", ")}` : null;
       return { source: p.source, hash: p.hash, error, autonomy: autonomyOf(p.policy) as ReturnType<typeof autonomyOf> | null };
@@ -1611,10 +1632,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const policy = branch
       ? await loadPolicy(workspace, branch).then(checked, (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err), autonomy: null }))
       : await checked({ policy: DEFAULT_POLICY, hash: policyHash(DEFAULT_POLICY), source: "defaults" });
+    const webhook = process.env.SF_NOTIFY_WEBHOOK?.trim();
     return {
       agentServer: { url: client.baseUrl, ...agent },
       workspace: { path: workspace, isRepo, branch },
       policy,
+      notifications: { channel: webhook ? channelOf(webhook) : null, digestHour },
       openInbox: ledger.openInboxCount(),
       activeRuns: ledger.listRuns().filter((r) => !TERMINAL.has(r.state)).length,
     };
