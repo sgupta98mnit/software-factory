@@ -38,6 +38,12 @@ run against the fake agent server), and the Phase 1 UI review.
 | 19 | medium | A script placed in the change folder rode along in the spec commit; only the change's markdown and `.openspec.yaml` are committed now. |
 | 20 | low | A deleted integration worktree wasn't treated as "moved", and couldn't be put back; it is, and Restore recreates it. A pause the agent server refused marked the attempt paused anyway; it stays running and is polled after Resume. |
 
+## Found while clicking through Phase 3
+
+| # | Severity | Issue |
+| --- | --- | --- |
+| 21 | medium | A builder whose commits added up to nothing (a repair that took its own work out again, or empty commits) stopped its work order on a raw `git commit` error ("nothing to commit"), because the squash tried to commit an unchanged tree. Fixed in "a work order whose commits add up to nothing goes back to its builder": the branch goes back to its base and the builder hears "Nothing was built", like a builder that never committed. |
+
 ## Plausible, not fixed yet (tracked for later phases)
 
 - **No watchdog.** An agent-server outage keeps attempts `starting` and the run

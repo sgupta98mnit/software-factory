@@ -180,6 +180,12 @@ export async function commitPaths(dir: string, keep: (file: string) => boolean, 
  * commit after `base`, or none, is left as it is.
  */
 export async function squash(dir: string, base: string, message: string): Promise<string> {
+  // Commits that add up to nothing (work undone, empty commits) leave nothing to commit: back to base, and the caller says nothing was built.
+  const tree = async (ref: string) => (await git(dir, ["rev-parse", `${ref}^{tree}`])).stdout.trim();
+  if ((await tree("HEAD")) === (await tree(base))) {
+    await git(dir, ["reset", "-q", "--soft", base]);
+    return headSha(dir);
+  }
   const count = Number((await git(dir, ["rev-list", "--count", `${base}..HEAD`])).stdout.trim());
   if (count > 1) {
     await git(dir, ["reset", "-q", "--soft", base]);

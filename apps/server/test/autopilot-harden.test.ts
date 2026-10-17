@@ -1,7 +1,7 @@
 // Regression tests for the defects in docs/autopilot/OPEN-ISSUES.md. Each test
 // names the issue it holds fixed.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -574,6 +574,38 @@ test("review: a script in the change folder isn't part of the spec commit; a del
     await t.o.decide(item.id, { choice: "restore" }, "user:test");
     assert.equal(existsSync(run.integrationDir!), true);
     await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+  } finally {
+    await t.close();
+  }
+});
+
+test("review: a builder whose repair undoes all its work gets 'Nothing was built' and another round, not a git error", async () => {
+  const t = await setup(
+    byRole({
+      builder: (conv) => {
+        const round = conv.messages.length;
+        if (round === 1) {
+          writeFileSync(path.join(conv.workingDir, "package.json"), PKG);
+          writeFileSync(path.join(conv.workingDir, "wo-1.test.js"), 'import { test } from "node:test";\ntest("WO-1", () => { throw new Error("not yet"); });\n');
+          return { response: "Built it.", cost: 0.1 };
+        }
+        if (round === 2) {
+          // "Fixes" the failing test by taking everything out again.
+          for (const f of ["package.json", "wo-1.test.js"]) rmSync(path.join(conv.workingDir, f));
+          return { response: "Removed the failing test.", cost: 0.1 };
+        }
+        return build(conv);
+      },
+    }),
+  );
+  try {
+    const run = await t.buildingRun(1);
+    await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+    assert.deepEqual(t.states(run.id), ["1:merged"]);
+    assert.deepEqual(t.ledger.listInbox({ state: "all", runId: run.id }).map((i) => i.kind), ["release"]);
+    const messages = t.fake.conversations.get(t.builders(run.id, 1)[0]!.conversationId)!.messages;
+    assert.equal(messages.length, 3);
+    assert.match(messages[2]!, /Nothing was built: the branch has no changes/);
   } finally {
     await t.close();
   }

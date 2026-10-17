@@ -23,6 +23,7 @@ import {
   mergeInto,
   removeWorktree,
   resetHard,
+  squash,
 } from "../src/autopilot/git.js";
 
 const tmp = (name: string) => mkdtempSync(path.join(tmpdir(), `sf-git-${name}-`));
@@ -105,6 +106,31 @@ test("discardChanges throws away edits and new files but keeps installed package
   assert.equal(readFileSync(path.join(r, "a.txt"), "utf8"), "one\ntwo\nthree\n");
   assert.equal(existsSync(path.join(r, "stray.txt")), false);
   assert.equal(existsSync(path.join(r, "pkg", "node_modules", "dep", "index.js")), true);
+});
+
+test("squash: one commit for the work; none when the commits add up to nothing (a builder that undid its own work)", async () => {
+  const r = await repo();
+  const base = await headSha(r);
+  writeFileSync(path.join(r, "b.txt"), "b\n");
+  await commitAll(r, "one");
+  writeFileSync(path.join(r, "c.txt"), "c\n");
+  await commitAll(r, "two");
+  const sha = await squash(r, base, "WO-1: both");
+  assert.equal((await git(r, ["rev-list", "--count", `${base}..HEAD`])).stdout.trim(), "1");
+  assert.equal(sha, await headSha(r));
+  assert.equal(await fileAt(r, "HEAD", "c.txt"), "c\n");
+
+  // Two commits that cancel out, and an empty one: nothing to squash, the branch goes back to base.
+  const base2 = await headSha(r);
+  writeFileSync(path.join(r, "a.txt"), "changed\n");
+  await commitAll(r, "change");
+  writeFileSync(path.join(r, "a.txt"), "one\ntwo\nthree\n");
+  await commitAll(r, "change back");
+  assert.equal(await squash(r, base2, "WO-2: nothing"), base2);
+  assert.equal(await headSha(r), base2);
+  assert.equal(await isClean(r), true);
+  await git(r, ["commit", "-q", "--allow-empty", "-m", "empty"]);
+  assert.equal(await squash(r, base2, "WO-2: nothing"), base2);
 });
 
 test("merge: clean merges commit, conflicts abort and list the files; mergeInto leaves the markers", async () => {
