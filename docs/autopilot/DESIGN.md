@@ -444,7 +444,35 @@ recorded. The release decision lists the pages and embeds the screenshots. A
 failed preview gives the release item a reason and keeps `release.auto` from
 releasing; a person can still release.
 
-## 20. Changes since the first build
+## 20. Learning
+
+- `findLessons` (learning.ts) runs across every run in the ledger:
+  - `gate:<name>`: a gate whose first run in a work order failed (flaky passes
+    count as passing; hidden tests and the factory's scans excluded), with a
+    command from the pinned policy's gates or `npm run <script>`;
+  - `secrets`: work orders the secret scan caught;
+  - `deps-pinned`: dependency scans that found unpinned versions.
+
+  At `learning.threshold` (default 3) or more, after a run finishes,
+  `learn()` opens a `lesson` item for each key not asked about before (table
+  `lessons`, ledger v13), audited as `autopilot.lesson_proposed`.
+- Accept: `commitToBase` writes the line into AGENTS.md on the base branch
+  under "Learned by the Software Factory" (`withLesson`) in a detached
+  worktree. It commits as "agents: … (<person>)", then moves the branch with
+  the same compare-and-swap as a release. The result is recorded on the
+  lesson and as `lesson_accepted` with the sha. Decline records
+  `lesson_declined`. Either way the key isn't proposed again.
+- `askMergeApproval` now records the reasons with the move to
+  `awaiting_merge_approval`. `buildInsights` groups runs by policy hash and
+  counts policy and person merges, release failures and flaky gate runs. It
+  groups reasons by kind (`reasonKind`: numbers and details dropped) and pairs
+  each ask with its work order's next merge-approval item to count merged,
+  sent back and skipped (audit timestamps are written in queue order, so
+  pairing is by order, not time). Plain-language `notes` mark rules people
+  always override and rules that catch real problems. Served as
+  `GET /insights` and `GET /lessons`.
+
+## 21. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

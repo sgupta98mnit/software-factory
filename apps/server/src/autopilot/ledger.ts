@@ -57,7 +57,8 @@ export type InboxKind =
   | "release"
   | "intake"
   | "replan_approval"
-  | "spec_revision";
+  | "spec_revision"
+  | "lesson";
 export type Risk = "low" | "medium" | "high";
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -122,6 +123,20 @@ export interface SpecRevision {
   sha?: string | null;
   /** approval: the change folder's tree the new plan comes from. */
   tree?: string;
+}
+
+/** A line proposed for the workspace's AGENTS.md, and what a person did with it. */
+export interface Lesson {
+  key: string; // what it's about: "gate:lint", "secrets", "deps-pinned"
+  line: string; // the bullet for AGENTS.md
+  count: number; // how often the mistake was seen when it was proposed
+  state: "open" | "accepted" | "declined";
+  runId: string | null;
+  itemId: number | null;
+  proposedAt: string;
+  decidedBy: string | null;
+  decidedAt: string | null;
+  sha: string | null; // the base branch commit that added it
 }
 
 export interface WorkOrder {
@@ -384,6 +399,22 @@ const SCHEMA_V12 = `
 ALTER TABLE runs ADD COLUMN preview TEXT;
 `;
 
+// v13: lessons: lines for the workspace's AGENTS.md, from mistakes builders keep making.
+const SCHEMA_V13 = `
+CREATE TABLE lessons (
+  key TEXT PRIMARY KEY,
+  line TEXT NOT NULL,
+  count INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  run_id TEXT REFERENCES runs(id),
+  item_id INTEGER,
+  proposed_at TEXT NOT NULL,
+  decided_by TEXT,
+  decided_at TEXT,
+  sha TEXT
+);
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
@@ -450,6 +481,7 @@ export function openLedger(file: string) {
   if (version < 10) transaction(() => db.exec(`${SCHEMA_V10}\nPRAGMA user_version = 10;`));
   if (version < 11) transaction(() => db.exec(`${SCHEMA_V11}\nPRAGMA user_version = 11;`));
   if (version < 12) transaction(() => db.exec(`${SCHEMA_V12}\nPRAGMA user_version = 12;`));
+  if (version < 13) transaction(() => db.exec(`${SCHEMA_V13}\nPRAGMA user_version = 13;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),
@@ -671,6 +703,33 @@ export function openLedger(file: string) {
 
   // Meta (key -> text)
 
+  // Lessons for AGENTS.md
+
+  function listLessons(): Lesson[] {
+    return all<Lesson>("SELECT * FROM lessons ORDER BY proposed_at DESC");
+  }
+
+  function getLesson(key: string): Lesson | undefined {
+    return one<Lesson>("SELECT * FROM lessons WHERE key = $key", { key });
+  }
+
+  function addLesson(lesson: Pick<Lesson, "key" | "line" | "count" | "runId" | "itemId">): Lesson {
+    db.prepare("INSERT INTO lessons (key, line, count, state, run_id, item_id, proposed_at) VALUES ($key, $line, $count, 'open', $run_id, $item_id, $at)").run({
+      key: lesson.key,
+      line: lesson.line,
+      count: lesson.count,
+      run_id: lesson.runId,
+      item_id: lesson.itemId,
+      at: now(),
+    });
+    return getLesson(lesson.key) as Lesson;
+  }
+
+  function decideLesson(key: string, patch: { state: "accepted" | "declined"; by: string; sha?: string | null }): Lesson {
+    db.prepare("UPDATE lessons SET state = $state, decided_by = $by, decided_at = $at, sha = $sha WHERE key = $key").run({ key, state: patch.state, by: patch.by, at: now(), sha: patch.sha ?? null });
+    return getLesson(key) as Lesson;
+  }
+
   function getMeta(key: string): string | null {
     const row = db.prepare("SELECT value FROM meta WHERE key = $key").get({ key });
     return row ? String(row.value) : null;
@@ -721,6 +780,10 @@ export function openLedger(file: string) {
     openInboxCount,
     getMeta,
     setMeta,
+    listLessons,
+    getLesson,
+    addLesson,
+    decideLesson,
     runCost,
     workOrderCost,
     transaction,

@@ -9,7 +9,8 @@ import type { Attempt, InboxItem, Run, WorkOrder } from "./ledger.js";
 import type { Orchestrator } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
 import { buildEvidence } from "./evidence.js";
-import { audit } from "../audit.js";
+import { audit, listAudit } from "../audit.js";
+import { buildInsights } from "./learning.js";
 import { INTAKE_SOURCES, signatureOk, type IntakeSource } from "./intake.js";
 
 // Work-order states that count as in progress.
@@ -253,6 +254,10 @@ export function createAutopilotRoutes(o: Orchestrator) {
     const { note } = await body<{ note?: string }>(c);
     return c.json(summary(await o.reviseSpec(run.id, note ?? "", LOCAL_USER)));
   });
+
+  // What the factory has learned: per policy hash, how its merge rules fared; and the AGENTS.md lessons.
+  app.get("/insights", (c) => c.json(buildInsights(ledger, listAudit(Number.MAX_SAFE_INTEGER))));
+  app.get("/lessons", (c) => c.json(ledger.listLessons()));
 
   app.get("/inbox", (c) => {
     const s = c.req.query("state");

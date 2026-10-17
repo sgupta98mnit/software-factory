@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..5c25ee2
+index 0000000..e1764dc
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,683 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -434,7 +434,8 @@ index 0000000..5c25ee2
 +  | "release"
 +  | "intake"
 +  | "replan_approval"
-+  | "spec_revision";
++  | "spec_revision"
++  | "lesson";
 +
 +export interface InboxItem {
 +  id: number;
@@ -2012,10 +2013,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..fd160a9
+index 0000000..d6e8489
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1178 @@
+@@ -0,0 +1,1180 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2345,6 +2346,7 @@ index 0000000..fd160a9
 +      intake: "New request",
 +      replan_approval: "Re-plan",
 +      spec_revision: "Spec change stopped",
++      lesson: "Lesson for AGENTS.md",
 +    } as Record<string, string>,
 +    decidedToast: "Decision recorded",
 +  },
@@ -2923,6 +2925,7 @@ index 0000000..fd160a9
 +      intake: "Nueva solicitud",
 +      replan_approval: "Nueva planificación",
 +      spec_revision: "Cambio de especificación detenido",
++      lesson: "Lección para AGENTS.md",
 +    },
 +    decidedToast: "Decisión registrada",
 +  },

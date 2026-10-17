@@ -21,6 +21,7 @@ import { tools } from "../tools.js";
 import { detectGates, gateFindings, runGates, type GateResult, type GatesOutcome } from "./gates.js";
 import {
   addDetachedWorktree,
+  fileAt,
   addWorktree,
   changedFiles,
   commitAll,
@@ -95,6 +96,7 @@ import {
 } from "./spec.js";
 import { diffPlan, planWorkOrders } from "./waves.js";
 import { runPreview, type PreviewResult } from "./preview.js";
+import { findLessons, withLesson } from "./learning.js";
 
 export interface OrchestratorDeps {
   ledger: Ledger;
@@ -167,6 +169,10 @@ const REPLAN: InboxOption[] = [
 const REVISION_FAILED: InboxOption[] = [
   { id: "retry", label: "Try again", tone: "primary" },
   { id: "drop", label: "Drop the spec change" },
+];
+const LESSON: InboxOption[] = [
+  { id: "accept", label: "Add it to AGENTS.md", tone: "primary" },
+  { id: "decline", label: "Don't add it" },
 ];
 const RUN_PAUSED: InboxOption[] = [
   { id: "resume", label: "Resume", tone: "primary" },
@@ -1773,7 +1779,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       "Send back tells its builder what to change (write it in the note). Skip lets the work orders that depend on it go ahead without it.",
     ].join("\n");
     ledger.transaction(() => {
-      moveWorkOrder(wo, "awaiting_merge_approval");
+      // The reasons are kept with the move, so insights can tell what people do with each kind.
+      moveWorkOrder(wo, "awaiting_merge_approval", { data: { reasons: check.reasons.map((r) => clip(r, 300)) } });
       openItem(run, "merge_approval", `Merge WO-${wo.seq} of ${run.change}: ${wo.title}`, body, MERGE, wo.id);
     });
   }
@@ -1953,6 +1960,58 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       data: { branch: run.integrationBranch, sha, costUsd: ledger.runCost(run.id), merged, skipped: wos.length - merged },
     });
     if (merged) await offerRelease(done);
+    await learn(done).catch(warn);
+  }
+
+  // ---- learning: lines for AGENTS.md from mistakes builders keep making ----
+
+  /** After a run: a lesson a person hasn't been asked about yet goes to the Inbox (learning.ts). */
+  async function learn(run: Run) {
+    const policy = pinnedPolicy(run);
+    if (!policy.learning.proposals) return;
+    for (const lesson of findLessons(ledger, policy.learning.threshold)) {
+      if (ledger.getLesson(lesson.key)) continue; // asked before, whatever the answer
+      const body = [
+        `Builders in this workspace keep making the same mistake (${lesson.count} work orders, most recently ${lesson.seen.map((s) => `\`${s}\``).join(", ")}). The factory proposes adding this line to \`AGENTS.md\` on \`${run.baseBranch}\`, which every agent reads:`,
+        "",
+        `> ${mdText(lesson.line)}`,
+        "",
+        `Adding it commits that one line to \`${run.baseBranch}\` in your name (under "Learned by the Software Factory"). If you don't add it, the factory won't propose it again.`,
+      ].join("\n");
+      ledger.transaction(() => {
+        const item = openItem(run, "lesson", `Add to AGENTS.md: ${clip(lesson.line, 90)}`, body, LESSON);
+        ledger.addLesson({ key: lesson.key, line: lesson.line, count: lesson.count, runId: run.id, itemId: item.id });
+        record(SYSTEM, "autopilot.lesson_proposed", run.id, { key: lesson.key, count: lesson.count });
+      });
+    }
+  }
+
+  /**
+   * One file changed on the base branch, as a person's decision (a lesson
+   * accepted): committed in a detached worktree, then the branch moves only if
+   * it's still where that started, like a release.
+   */
+  async function commitToBase(base: string, file: string, edit: (text: string | null) => string, message: string): Promise<string> {
+    const ref = `refs/heads/${base}`;
+    const tip = await headSha(workspace, ref);
+    const dir = path.join(worktrees, `_base-${randomBytes(3).toString("hex")}`);
+    await addDetachedWorktree(workspace, dir, tip);
+    try {
+      writeFileSync(path.join(dir, file), edit(await fileAt(workspace, ref, file)));
+      await git(dir, ["add", "--", file]);
+      await git(dir, ["commit", "-q", "-m", message]);
+      const sha = await headSha(dir);
+      if ((await currentBranch(workspace)) === base) {
+        if ((await git(workspace, ["diff", "--quiet", "HEAD"], { allowFail: true })).code !== 0) throw new Error(`The workspace has uncommitted changes on \`${base}\`. Commit or stash them, then try again.`);
+        if ((await headSha(workspace)) !== tip) throw new Error(`\`${base}\` moved meanwhile. Try again.`);
+        await git(workspace, ["merge", "--ff-only", "-q", sha]);
+      } else {
+        await git(workspace, ["update-ref", ref, sha, tip]);
+      }
+      return sha;
+    } finally {
+      await removeWorktree(workspace, dir).catch(warn);
+    }
   }
 
   // ---- release: the integration branch into the base branch ----
@@ -2515,6 +2574,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         await endRevision(run);
         record(actor, "autopilot.spec_revision_dropped", run.id, {});
         return;
+      case "lesson:accept": {
+        const lesson = ledger.listLessons().find((l) => l.itemId === item.id);
+        if (!lesson || lesson.state !== "open") throw new Error("This lesson isn't waiting for a decision.");
+        const sha = await commitToBase(run.baseBranch, "AGENTS.md", (text) => withLesson(text, lesson.line), `agents: ${clip(lesson.line, 60)} (${actor.replace(/^user:/, "")})`);
+        ledger.decideLesson(lesson.key, { state: "accepted", by: actor, sha });
+        record(actor, "autopilot.lesson_accepted", run.id, { key: lesson.key, base: run.baseBranch, sha });
+        return;
+      }
+      case "lesson:decline": {
+        const lesson = ledger.listLessons().find((l) => l.itemId === item.id);
+        if (lesson) ledger.decideLesson(lesson.key, { state: "declined", by: actor });
+        record(actor, "autopilot.lesson_declined", run.id, { key: lesson?.key ?? null });
+        return;
+      }
       case "intake:start":
         // In line like any new run: it starts (and gets its branch) when the queue has room.
         if (run.state !== "proposed") throw new Error(`This run isn't waiting to be started (it's ${run.state}).`);
