@@ -10,6 +10,7 @@ import { killAllGates } from "./autopilot/gates.js";
 import { openLedger } from "./autopilot/ledger.js";
 import { OpenHandsClient } from "./autopilot/openhands.js";
 import { createOrchestrator } from "./autopilot/orchestrator.js";
+import { createRegistry, createRegistryRoutes } from "./autopilot/registry.js";
 import { createAutopilotRoutes } from "./autopilot/routes.js";
 import { getWorkOrder, linkConversation, listWorkOrders, setStatus, watchBacklog } from "./backlog.js";
 import { changeBrief, workOrderBrief } from "./briefs.js";
@@ -103,13 +104,17 @@ app.get("/audit/verify", (c) => c.json(verifyAudit()));
 
 // ---- autopilot: goal -> spec -> plan -> build, with agents on the OpenHands agent server ----
 const ledger = openLedger(AUTOPILOT_DB);
-const autopilot = createOrchestrator({
-  ledger,
-  client: new OpenHandsClient({ baseUrl: AGENT_SERVER_URL, apiKey: agentServerKey }),
-  workspace: WORKSPACE,
-  dataDir: DATA_DIR,
-});
+const client = new OpenHandsClient({ baseUrl: AGENT_SERVER_URL, apiKey: agentServerKey });
+const autopilot = createOrchestrator({ ledger, client, workspace: WORKSPACE, dataDir: DATA_DIR });
 app.route("/autopilot", createAutopilotRoutes(autopilot));
+// Other projects: /workspaces, and each one's Autopilot API at /w/<id>/autopilot (the default's is /autopilot).
+const registry = createRegistry({
+  dataDir: DATA_DIR,
+  client,
+  defaultEntry: { name: path.basename(WORKSPACE), path: WORKSPACE, addedBy: "SF_WORKSPACE", addedAt: new Date(0).toISOString() },
+  defaultOrchestrator: autopilot,
+});
+app.route("/", createRegistryRoutes(registry, LOCAL_USER));
 
 watchBacklog();
 try {
@@ -125,14 +130,14 @@ try {
 serve({ fetch: app.fetch, port: PORT, hostname: HOST }, () => {
   console.log(`Factory API on http://${HOST}:${PORT}/sf-api`);
   console.log(`Workspace: ${WORKSPACE}${existsSync(WORKSPACE) ? "" : "  (missing!)"}`);
-  autopilot.start(3000);
+  registry.start(3000);
 });
 void audit("system", "server.started", "server", { workspace: path.basename(WORKSPACE) });
 
 // Stop scheduling, stop running gates, and let queued audit records reach the disk (a few seconds at most) before exiting.
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.once(sig, () => {
-    autopilot.stop();
+    void registry.stop();
     killAllGates();
     void Promise.race([auditIdle(), new Promise((resolve) => setTimeout(resolve, 3000))]).finally(() => {
       ledger.close();

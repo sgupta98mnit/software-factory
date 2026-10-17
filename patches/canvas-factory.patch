@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..e1764dc
+index 0000000..ff02037
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,683 @@
+@@ -0,0 +1,749 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -455,6 +455,8 @@ index 0000000..e1764dc
 +  /** The run's OpenSpec change, and "WO-N" when the item is about a work order. */
 +  change: string | null;
 +  workOrderKey: string | null;
++  /** The workspace it belongs to (the Inbox lists every workspace's). */
++  workspace?: { id: string; name: string };
 +}
 +
 +/** A hidden acceptance test the run's validator wrote, and how it last ran. */
@@ -500,7 +502,7 @@ index 0000000..e1764dc
 +}
 +
 +export const previewImageUrl = (runId: string, file: string) =>
-+  `${FACTORY_API_BASE}/autopilot/runs/${encodeURIComponent(runId)}/preview/${encodeURIComponent(file)}`;
++  `${FACTORY_API_BASE}${ap(`/runs/${encodeURIComponent(runId)}/preview/${encodeURIComponent(file)}`)}`;
 +
 +export interface AgentProfileSummary {
 +  id: string;
@@ -592,6 +594,60 @@ index 0000000..e1764dc
 +
 +const post = <T>(path: string, body: unknown = {}) =>
 +  request<T>(path, { method: "POST", body: JSON.stringify(body) });
++
++// ---- the workspace Autopilot pages work on ----
++//
++// One factory can serve several projects (GET /workspaces). The one picked
++// on Home is kept in this browser; every Autopilot call goes to its API
++// (the default workspace's is /autopilot, the others' /w/<id>/autopilot).
++
++const WORKSPACE_KEY = "sf-workspace";
++let selected = (() => {
++  try {
++    return localStorage.getItem(WORKSPACE_KEY) || "default";
++  } catch {
++    return "default";
++  }
++})();
++const workspaceListeners = new Set<() => void>();
++
++export const selectedWorkspace = () => selected;
++
++export function selectWorkspace(id: string) {
++  if (id === selected) return;
++  selected = id;
++  try {
++    localStorage.setItem(WORKSPACE_KEY, id);
++  } catch {
++    // private window: it lasts for this tab
++  }
++  workspaceListeners.forEach((fn) => fn());
++}
++
++export function onWorkspaceChange(fn: () => void) {
++  workspaceListeners.add(fn);
++  return () => {
++    workspaceListeners.delete(fn);
++  };
++}
++
++const autopilotIn = (ws: string) =>
++  ws === "default" ? "/autopilot" : `/w/${encodeURIComponent(ws)}/autopilot`;
++/** A path in the selected workspace's Autopilot API. */
++const ap = (p: string) => `${autopilotIn(selected)}${p}`;
++
++export interface WorkspaceSummary {
++  id: string;
++  name: string;
++  path: string;
++  default: boolean;
++  exists: boolean;
++  activeRuns: number;
++  queuedRuns: number;
++  openInbox: number;
++  addedBy: string;
++  addedAt: string;
++}
 +
 +/** Who let something in: a person, or the policy (`policy@<hash>`). */
 +export interface EvidenceApproval {
@@ -699,7 +755,7 @@ index 0000000..e1764dc
 +
 +/** Where the browser saves a run's evidence as a JSON file (the API records the export). */
 +export const evidenceDownloadUrl = (id: string) =>
-+  `${FACTORY_API_BASE}/autopilot/runs/${encodeURIComponent(id)}/evidence?download=1`;
++  `${FACTORY_API_BASE}${ap(`/runs/${encodeURIComponent(id)}/evidence?download=1`)}`;
 +
 +export const FactoryApi = {
 +  health: () => request<FactoryHealth>("/health"),
@@ -741,43 +797,53 @@ index 0000000..e1764dc
 +  audit: () => request<AuditEvent[]>("/audit"),
 +  verifyAudit: () => request<AuditVerification>("/audit/verify"),
 +
-+  autopilotStatus: () => request<AutopilotStatus>("/autopilot/status"),
-+  runs: () => request<RunSummary[]>("/autopilot/runs"),
++  autopilotStatus: () => request<AutopilotStatus>(ap("/status")),
++  runs: () => request<RunSummary[]>(ap("/runs")),
 +  run: (id: string) =>
-+    request<RunDetail>(`/autopilot/runs/${encodeURIComponent(id)}`),
++    request<RunDetail>(ap(`/runs/${encodeURIComponent(id)}`)),
 +  createRun: (body: {
 +    goal: string;
 +    autonomy?: Autonomy;
 +    budgetUsd?: number | null;
-+  }) => post<RunSummary>("/autopilot/runs", body),
++  }) => post<RunSummary>(ap("/runs"), body),
 +  runAction: (
 +    id: string,
 +    action: "pause" | "resume" | "cancel",
 +    note?: string,
 +  ) =>
 +    post<RunSummary>(
-+      `/autopilot/runs/${encodeURIComponent(id)}/${action}`,
++      ap(`/runs/${encodeURIComponent(id)}/${action}`),
 +      note ? { note } : {},
 +    ),
 +  release: (id: string) =>
-+    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/release`),
++    post<RunSummary>(ap(`/runs/${encodeURIComponent(id)}/release`)),
 +  reviseSpec: (id: string, note: string) =>
-+    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/revise`, {
-+      note,
-+    }),
++    post<RunSummary>(ap(`/runs/${encodeURIComponent(id)}/revise`), { note }),
 +  reportBug: (body: {
 +    title: string;
 +    happened: string;
 +    expected?: string;
 +    steps?: string;
-+  }) => post<IntakeResult>("/autopilot/intake/bug", body),
++  }) => post<IntakeResult>(ap("/intake/bug"), body),
 +  evidence: (id: string) =>
-+    request<Evidence>(`/autopilot/runs/${encodeURIComponent(id)}/evidence`),
++    request<Evidence>(ap(`/runs/${encodeURIComponent(id)}/evidence`)),
++  /** Every workspace's items, each with its workspace. */
 +  inbox: (state: "open" | "decided" | "all" = "open") =>
-+    request<InboxItem[]>(`/autopilot/inbox?state=${state}`),
-+  inboxCount: () => request<{ open: number }>("/autopilot/inbox/count"),
-+  decide: (id: number, body: { choice: string; note?: string }) =>
-+    post<InboxItem>(`/autopilot/inbox/${id}/decide`, body),
++    request<InboxItem[]>(`/workspaces/inbox?state=${state}`),
++  inboxCount: () => request<{ open: number }>("/workspaces/inbox/count"),
++  /** An item belongs to its workspace's API (the selected one when it doesn't say). */
++  decide: (
++    id: number,
++    body: { choice: string; note?: string },
++    workspace?: string,
++  ) =>
++    post<InboxItem>(
++      `${autopilotIn(workspace ?? selected)}/inbox/${id}/decide`,
++      body,
++    ),
++  workspaces: () => request<WorkspaceSummary[]>("/workspaces"),
++  addWorkspace: (body: { name: string; path: string }) =>
++    post<WorkspaceSummary>("/workspaces", body),
 +};
 diff --git a/src/factory/components/approve-modal.tsx b/src/factory/components/approve-modal.tsx
 new file mode 100644
@@ -1253,10 +1319,10 @@ index 0000000..0115891
 +}
 diff --git a/src/factory/components/decision-card.tsx b/src/factory/components/decision-card.tsx
 new file mode 100644
-index 0000000..6fc67af
+index 0000000..7ce78e0
 --- /dev/null
 +++ b/src/factory/components/decision-card.tsx
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,190 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link } from "react-router";
@@ -1266,7 +1332,7 @@ index 0000000..6fc67af
 +import { cn } from "#/utils/utils";
 +import type { InboxItem, InboxOption } from "../api";
 +import { useFactoryCopy } from "../copy";
-+import { useDecide } from "../hooks";
++import { useDecide, useWorkspaces } from "../hooks";
 +import { formatWhen } from "./factory-badges";
 +import { approverName } from "./autopilot-badges";
 +import { FactoryError } from "./factory-page";
@@ -1296,6 +1362,7 @@ index 0000000..6fc67af
 +  const copy = useFactoryCopy();
 +  const { i18n } = useTranslation("openhands");
 +  const decide = useDecide();
++  const manyWorkspaces = (useWorkspaces().data?.length ?? 1) > 1;
 +  const [note, setNote] = React.useState("");
 +  const [confirming, setConfirming] = React.useState<string | null>(null);
 +  const [missingNote, setMissingNote] = React.useState<string | null>(null);
@@ -1319,7 +1386,12 @@ index 0000000..6fc67af
 +      return;
 +    }
 +    decide.mutate(
-+      { id: item.id, choice: option.id, note: note.trim() || undefined },
++      {
++        id: item.id,
++        choice: option.id,
++        note: note.trim() || undefined,
++        workspace: item.workspace?.id,
++      },
 +      { onSuccess: () => displaySuccessToast(copy.inbox.decidedToast) },
 +    );
 +  };
@@ -1343,9 +1415,14 @@ index 0000000..6fc67af
 +        {item.workOrderKey ? (
 +          <span className="font-mono">{item.workOrderKey}</span>
 +        ) : null}
++        {showRun && item.workspace && manyWorkspaces ? (
++          <span data-testid="factory-inbox-workspace">
++            {item.workspace.name}
++          </span>
++        ) : null}
 +        {showRun && item.change ? (
 +          <Link
-+            to={`/autopilot/runs/${item.runId}`}
++            to={`/autopilot/runs/${item.runId}${item.workspace ? `?w=${encodeURIComponent(item.workspace.id)}` : ""}`}
 +            className="font-mono text-link hover:underline"
 +          >
 +            {item.change}
@@ -2011,12 +2088,165 @@ index 0000000..3b39060
 +    </ModalBackdrop>
 +  );
 +}
+diff --git a/src/factory/components/workspace-switcher.tsx b/src/factory/components/workspace-switcher.tsx
+new file mode 100644
+index 0000000..ea4084e
+--- /dev/null
++++ b/src/factory/components/workspace-switcher.tsx
+@@ -0,0 +1,147 @@
++import React from "react";
++import { useSearchParams } from "react-router";
++import { FolderPlus } from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { useFactoryCopy } from "../copy";
++import {
++  useAddWorkspace,
++  useSelectWorkspace,
++  useSelectedWorkspace,
++  useWorkspaces,
++} from "../hooks";
++import { FactoryError } from "./factory-page";
++import { factoryFieldClassName } from "./start-agent-modal";
++
++/**
++ * A link's `?w=<workspace>` picks that workspace (the Inbox links each run
++ * in its own). True while the switch is under way, so the page waits
++ * rather than asking the wrong workspace for the run.
++ */
++export function useWorkspaceFromLink(): boolean {
++  const [params] = useSearchParams();
++  const wanted = params.get("w");
++  const selected = useSelectedWorkspace();
++  const select = useSelectWorkspace();
++  React.useEffect(() => {
++    if (wanted && wanted !== selected) select(wanted);
++  }, [wanted, selected, select]);
++  return Boolean(wanted && wanted !== selected);
++}
++
++/** `?w=` for a link to a run in the selected workspace (nothing for the default one). */
++export function useWorkspaceQuery(): string {
++  const selected = useSelectedWorkspace();
++  return selected === "default" ? "" : `?w=${encodeURIComponent(selected)}`;
++}
++
++/** Home's workspace picker, and the form that adds one. */
++export function WorkspaceSwitcher() {
++  const copy = useFactoryCopy();
++  const workspaces = useWorkspaces();
++  const selected = useSelectedWorkspace();
++  const select = useSelectWorkspace();
++  const add = useAddWorkspace();
++  const [adding, setAdding] = React.useState(false);
++  const [name, setName] = React.useState("");
++  const [folder, setFolder] = React.useState("");
++  const id = React.useId();
++  const list = workspaces.data ?? [];
++
++  return (
++    <div className="flex flex-wrap items-center gap-2">
++      {list.length > 1 ? (
++        <label className="flex items-center gap-2 text-sm text-muted">
++          {copy.workspace.label}
++          <select
++            data-testid="factory-workspace-select"
++            className={factoryFieldClassName}
++            value={selected}
++            onChange={(e) => select(e.target.value)}
++          >
++            {list.map((w) => (
++              <option key={w.id} value={w.id}>
++                {w.exists ? w.name : `${w.name} ${copy.workspace.missing}`}
++              </option>
++            ))}
++          </select>
++        </label>
++      ) : null}
++      {adding ? (
++        <form
++          className="flex basis-full flex-col gap-2 rounded-xl border border-border-subtle bg-surface px-4 py-3"
++          onSubmit={(event) => {
++            event.preventDefault();
++            add.mutate(
++              { name: name.trim(), path: folder.trim() },
++              {
++                onSuccess: (w) => {
++                  setAdding(false);
++                  setName("");
++                  setFolder("");
++                  select(w.id);
++                },
++              },
++            );
++          }}
++        >
++          <label
++            htmlFor={`${id}-name`}
++            className="text-sm font-medium text-foreground"
++          >
++            {copy.workspace.name}
++          </label>
++          <input
++            id={`${id}-name`}
++            data-testid="factory-workspace-name"
++            className={factoryFieldClassName}
++            value={name}
++            maxLength={60}
++            onChange={(e) => setName(e.target.value)}
++          />
++          <label
++            htmlFor={`${id}-path`}
++            className="text-sm font-medium text-foreground"
++          >
++            {copy.workspace.path}
++          </label>
++          <input
++            id={`${id}-path`}
++            data-testid="factory-workspace-path"
++            className={factoryFieldClassName}
++            value={folder}
++            onChange={(e) => setFolder(e.target.value)}
++          />
++          <p className="text-xs text-muted">{copy.workspace.pathHelp}</p>
++          <div className="flex gap-2">
++            <BrandButton
++              testId="factory-workspace-add"
++              type="submit"
++              variant="primary"
++              isDisabled={!name.trim() || !folder.trim() || add.isPending}
++            >
++              {add.isPending ? copy.workspace.adding : copy.workspace.addButton}
++            </BrandButton>
++            <BrandButton
++              type="button"
++              variant="tertiary"
++              onClick={() => setAdding(false)}
++            >
++              {copy.common.cancel}
++            </BrandButton>
++          </div>
++          <FactoryError error={add.error} />
++        </form>
++      ) : (
++        <BrandButton
++          testId="factory-workspace-new"
++          type="button"
++          variant="secondary"
++          onClick={() => setAdding(true)}
++          startContent={<FolderPlus className="size-4" aria-hidden />}
++        >
++          {copy.workspace.add}
++        </BrandButton>
++      )}
++    </div>
++  );
++}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..d6e8489
+index 0000000..4c75702
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1180 @@
+@@ -0,0 +1,1202 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2349,6 +2579,17 @@ index 0000000..d6e8489
 +      lesson: "Lesson for AGENTS.md",
 +    } as Record<string, string>,
 +    decidedToast: "Decision recorded",
++  },
++  workspace: {
++    label: "Workspace",
++    add: "Add a workspace",
++    name: "Name",
++    path: "Folder on this machine",
++    pathHelp:
++      "An absolute path to the project's folder. It gets a ledger of its own, follows the policy on its own base branch, and becomes a git repo with its first run.",
++    addButton: "Add",
++    adding: "Adding…",
++    missing: "(folder missing)",
 +  },
 +  intake: {
 +    report: "Report a bug",
@@ -2929,6 +3170,17 @@ index 0000000..d6e8489
 +    },
 +    decidedToast: "Decisión registrada",
 +  },
++  workspace: {
++    label: "Espacio de trabajo",
++    add: "Añadir un espacio de trabajo",
++    name: "Nombre",
++    path: "Carpeta en este equipo",
++    pathHelp:
++      "Una ruta absoluta a la carpeta del proyecto. Tiene su propio registro, sigue la política de su propia rama base y se convierte en un repositorio git con su primera ejecución.",
++    addButton: "Añadir",
++    adding: "Añadiendo…",
++    missing: "(carpeta no encontrada)",
++  },
 +  intake: {
 +    report: "Informar de un error",
 +    help: "Va a la entrada de la fábrica: la política (intake.bug) decide si espera a una persona en la bandeja de entrada o inicia una ejecución.",
@@ -3310,10 +3562,10 @@ index 0000000..a90f6d1
 +];
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..a89ef34
+index 0000000..3e5bd41
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,379 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -3326,6 +3578,9 @@ index 0000000..a89ef34
 +  FactoryApi,
 +  FactoryOfflineError,
 +  isNotFound,
++  onWorkspaceChange,
++  selectWorkspace,
++  selectedWorkspace,
 +  type Autonomy,
 +} from "./api";
 +
@@ -3345,6 +3600,7 @@ index 0000000..a89ef34
 +    ["factory", "autopilot", "runs", id, "evidence"] as const,
 +  inbox: (state: string) => ["factory", "autopilot", "inbox", state] as const,
 +  inboxCount: ["factory", "autopilot", "inbox-count"] as const,
++  workspaces: ["factory", "workspaces"] as const,
 +};
 +
 +// Don't hammer a server that isn't running (the offline card has a retry
@@ -3558,11 +3814,60 @@ index 0000000..a89ef34
 +  });
 +}
 +
++// ---- workspaces ----
++
++/** The workspace Autopilot pages work on (kept in this browser). */
++export const useSelectedWorkspace = () =>
++  React.useSyncExternalStore(
++    onWorkspaceChange,
++    selectedWorkspace,
++    () => "default",
++  );
++
++/** Switch workspace: every Autopilot query starts over against its API. */
++export function useSelectWorkspace() {
++  const queryClient = useQueryClient();
++  return React.useCallback(
++    (id: string) => {
++      if (id === selectedWorkspace()) return;
++      selectWorkspace(id);
++      void queryClient.resetQueries({ queryKey: FACTORY_QUERY_KEYS.autopilot });
++    },
++    [queryClient],
++  );
++}
++
++export const useWorkspaces = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.workspaces,
++    queryFn: FactoryApi.workspaces,
++    retry,
++    meta: { disableToast: true },
++  });
++
++export function useAddWorkspace() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: FactoryApi.addWorkspace,
++    onSettled: () =>
++      queryClient.invalidateQueries({
++        queryKey: FACTORY_QUERY_KEYS.workspaces,
++      }),
++    meta: { disableToast: true },
++  });
++}
++
 +export function useDecide() {
 +  const queryClient = useQueryClient();
 +  return useMutation({
-+    mutationFn: (v: { id: number; choice: string; note?: string }) =>
-+      FactoryApi.decide(v.id, { choice: v.choice, note: v.note }),
++    mutationFn: (v: {
++      id: number;
++      choice: string;
++      note?: string;
++      /** The item's workspace, when it isn't the selected one (the Inbox lists them all). */
++      workspace?: string;
++    }) =>
++      FactoryApi.decide(v.id, { choice: v.choice, note: v.note }, v.workspace),
 +    onSettled: () => invalidateAutopilot(queryClient),
 +    meta: { disableToast: true },
 +  });
@@ -3876,10 +4181,10 @@ index 0000000..380b38f
 +}
 diff --git a/src/factory/routes/autopilot-evidence.tsx b/src/factory/routes/autopilot-evidence.tsx
 new file mode 100644
-index 0000000..0926f61
+index 0000000..9816ea7
 --- /dev/null
 +++ b/src/factory/routes/autopilot-evidence.tsx
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,626 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useParams } from "react-router";
@@ -3898,6 +4203,7 @@ index 0000000..0926f61
 +import { evidenceDownloadUrl, isNotFound } from "../api";
 +import { useFactoryCopy } from "../copy";
 +import { useEvidence } from "../hooks";
++import { useWorkspaceFromLink } from "../components/workspace-switcher";
 +import {
 +  FactoryError,
 +  FactoryLoading,
@@ -3921,7 +4227,8 @@ index 0000000..0926f61
 +export default function FactoryAutopilotEvidenceRoute() {
 +  const copy = useFactoryCopy();
 +  const { runId } = useParams();
-+  const evidence = useEvidence(runId);
++  const switching = useWorkspaceFromLink();
++  const evidence = useEvidence(switching ? undefined : runId);
 +  const data = evidence.data;
 +
 +  return (
@@ -4506,10 +4813,10 @@ index 0000000..0926f61
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..c0df715
+index 0000000..45959b9
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,1064 @@
+@@ -0,0 +1,1067 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -4560,6 +4867,7 @@ index 0000000..c0df715
 +  formatMoney,
 +} from "../components/autopilot-badges";
 +import { DecisionCard } from "../components/decision-card";
++import { useWorkspaceFromLink } from "../components/workspace-switcher";
 +import { FactoryMarkdown } from "../components/factory-markdown";
 +
 +type Stage = "spec" | "plan" | "build" | "verify" | "integrate" | "done";
@@ -4617,7 +4925,9 @@ index 0000000..c0df715
 +  const copy = useFactoryCopy();
 +  const { runId, workOrderKey } = useParams();
 +  const navigate = useNavigate();
-+  const run = useRun(runId);
++  // A link from another workspace's item switches to it first.
++  const switching = useWorkspaceFromLink();
++  const run = useRun(switching ? undefined : runId);
 +  const data = run.data;
 +  const selected = data?.workOrders.find(
 +    (w) => w.key.toLowerCase() === workOrderKey?.toLowerCase(),
@@ -5576,10 +5886,10 @@ index 0000000..c0df715
 +}
 diff --git a/src/factory/routes/autopilot.tsx b/src/factory/routes/autopilot.tsx
 new file mode 100644
-index 0000000..b3c528f
+index 0000000..809ad4b
 --- /dev/null
 +++ b/src/factory/routes/autopilot.tsx
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,388 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
@@ -5621,6 +5931,10 @@ index 0000000..b3c528f
 +} from "../components/autopilot-badges";
 +import { factoryFieldClassName } from "../components/start-agent-modal";
 +import { BugReport } from "../components/bug-report";
++import {
++  WorkspaceSwitcher,
++  useWorkspaceQuery,
++} from "../components/workspace-switcher";
 +
 +export default function FactoryAutopilotRoute() {
 +  const copy = useFactoryCopy();
@@ -5642,6 +5956,7 @@ index 0000000..b3c528f
 +        void runs.refetch();
 +        void status.refetch();
 +      }}
++      actions={<WorkspaceSwitcher />}
 +    >
 +      <div className="mx-auto flex max-w-5xl flex-col gap-8 px-6 py-6">
 +        <div className="grid gap-6 lg:grid-cols-3">
@@ -5681,6 +5996,7 @@ index 0000000..b3c528f
 +  const copy = useFactoryCopy();
 +  const navigate = useNavigate();
 +  const create = useCreateRun();
++  const query = useWorkspaceQuery();
 +  const [goal, setGoal] = React.useState("");
 +  const [budget, setBudget] = React.useState("");
 +  const [picked, setPicked] = React.useState<Autonomy | null>(null);
@@ -5697,7 +6013,7 @@ index 0000000..b3c528f
 +    if (!goal.trim() || budgetInvalid) return;
 +    create.mutate(
 +      { goal: goal.trim(), autonomy, budgetUsd },
-+      { onSuccess: (run) => navigate(`/autopilot/runs/${run.id}`) },
++      { onSuccess: (run) => navigate(`/autopilot/runs/${run.id}${query}`) },
 +    );
 +  };
 +
@@ -5919,12 +6235,13 @@ index 0000000..b3c528f
 +
 +function RunRow({ run }: { run: RunSummary }) {
 +  const copy = useFactoryCopy();
++  const query = useWorkspaceQuery();
 +  const { i18n } = useTranslation("openhands");
 +  const money = (usd: number) => formatMoney(usd, i18n.language);
 +  const waiting = WAITING_RUN_STATES.has(run.state) || run.openInbox > 0;
 +  return (
 +    <Link
-+      to={`/autopilot/runs/${run.id}`}
++      to={`/autopilot/runs/${run.id}${query}`}
 +      data-testid={`factory-run-${run.id}`}
 +      className={cn(
 +        "flex flex-col gap-1.5 rounded-xl border bg-surface px-4 py-3 hover:bg-surface-raised focus:outline-none focus-visible:ring-2 focus-visible:ring-focus",
@@ -5963,7 +6280,7 @@ index 0000000..b3c528f
 +}
 diff --git a/src/factory/routes/inbox.tsx b/src/factory/routes/inbox.tsx
 new file mode 100644
-index 0000000..2fd3a80
+index 0000000..0c1d21c
 --- /dev/null
 +++ b/src/factory/routes/inbox.tsx
 @@ -0,0 +1,73 @@
@@ -6034,7 +6351,7 @@ index 0000000..2fd3a80
 +          </p>
 +        ) : null}
 +        {items.map((item) => (
-+          <DecisionCard key={item.id} item={item} />
++          <DecisionCard key={`${item.workspace?.id}:${item.id}`} item={item} />
 +        ))}
 +      </div>
 +    </FactoryPage>

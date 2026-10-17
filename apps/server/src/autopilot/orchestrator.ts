@@ -198,6 +198,37 @@ const warn = (err: unknown) => console.warn(`[autopilot] ${errorText(err)}`);
 // Plain text inside a markdown body: a sensitive-path glob's double stars must not turn bold.
 const mdText = (text: string) => text.replace(/[\\`*_[\]<>#|~]/g, (c) => `\\${c}`);
 
+// Gate jobs at once across the factory, every workspace's orchestrator included (SF_GATE_CONCURRENCY, default 2).
+const gatePool = { capacity: 2, inUse: 0, waiting: [] as (() => void)[] };
+
+/** A gate slot, or false when the job is stopped while it waits (so Pause never waits behind another run's gate). */
+function slot(signal: AbortSignal) {
+  return new Promise<boolean>((resolve) => {
+    if (signal.aborted) return resolve(false);
+    if (gatePool.inUse < gatePool.capacity) {
+      gatePool.inUse++;
+      return resolve(true);
+    }
+    const take = () => {
+      signal.removeEventListener("abort", give);
+      gatePool.inUse++;
+      resolve(true);
+    };
+    const give = () => {
+      const i = gatePool.waiting.indexOf(take);
+      if (i >= 0) gatePool.waiting.splice(i, 1);
+      resolve(false);
+    };
+    gatePool.waiting.push(take);
+    signal.addEventListener("abort", give, { once: true });
+  });
+}
+
+function freeSlot() {
+  gatePool.inUse--;
+  while (gatePool.inUse < gatePool.capacity && gatePool.waiting.length) gatePool.waiting.shift()?.();
+}
+
 export function createOrchestrator(deps: OrchestratorDeps) {
   const { ledger, client, workspace } = deps;
   const graceMs = deps.graceMs ?? 20_000;
@@ -221,34 +252,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
   const jobs = new Map<string, Job>(); // "<workOrderId>#build" | "<workOrderId>#integrate"
   const prepared = new Map<string, Extract<Prepared, { outcome: "ready" }>>(); // a merge's job key -> the merge it tests
-  const GATE_SLOTS = Math.max(1, Number(process.env.SF_GATE_CONCURRENCY) || 2); // gate jobs at once, factory-wide
-  let gateSlots = GATE_SLOTS;
-  const waiting: (() => void)[] = [];
-  /** A gate slot, or false when the job is stopped while it waits (so Pause never waits behind another run's gate). */
-  const slot = (signal: AbortSignal) =>
-    new Promise<boolean>((resolve) => {
-      if (signal.aborted) return resolve(false);
-      if (gateSlots > 0) {
-        gateSlots--;
-        return resolve(true);
-      }
-      const take = () => {
-        signal.removeEventListener("abort", give);
-        gateSlots--;
-        resolve(true);
-      };
-      const give = () => {
-        const i = waiting.indexOf(take);
-        if (i >= 0) waiting.splice(i, 1);
-        resolve(false);
-      };
-      waiting.push(take);
-      signal.addEventListener("abort", give, { once: true });
-    });
-  const freeSlot = () => {
-    gateSlots++;
-    waiting.shift()?.();
-  };
+  gatePool.capacity = Math.max(1, Number(process.env.SF_GATE_CONCURRENCY) || 2);
 
   function startJob(runId: string, key: string, work: (signal: AbortSignal) => Promise<GatesOutcome>) {
     const controller = new AbortController();

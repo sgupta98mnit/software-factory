@@ -499,7 +499,36 @@ releasing; a person can still release.
   always override and rules that catch real problems. Served as
   `GET /insights` and `GET /lessons`.
 
-## 21. Changes since the first build
+## 21. Workspace registry
+
+registry.ts. `SF_WORKSPACE` is workspace `default`, with its ledger at
+`data/autopilot.db` as before. `POST /workspaces {name, path}` registers
+another project:
+
+- the name becomes the id (slug), unique;
+- the path must be an existing absolute folder, not inside the data folder
+  (or containing it), and not already registered (compared by realpath);
+- it's audited as `workspace.registered`.
+
+Each added workspace gets `data/workspaces/<id>/` (ledger, worktrees, hidden
+tests, previews) and an orchestrator of its own, started with the others; its
+runs pin the policy from its own base branch. `/w/<id>/autopilot/*` forwards
+to that workspace's Autopilot routes (`/autopilot` stays the default's).
+`GET /workspaces` lists them with run and Inbox counts.
+`GET /workspaces/inbox` merges every workspace's items, each tagged with its
+workspace, and `/workspaces/inbox/count` sums them. `DELETE /workspaces/:id`
+refuses the default and any workspace with unfinished runs; otherwise it
+stops the orchestrator, closes the ledger, keeps the data and audits
+`workspace.removed`. The list lives in `data/workspaces.json`, written
+atomically. Gate slots are one pool for the whole factory.
+
+In Canvas, the selected workspace is kept in localStorage (`sf-workspace`)
+and every Autopilot call goes to its API. Switching resets the Autopilot
+queries. A link's `?w=<id>` switches to that workspace before the page asks
+for the run. The Inbox and its badge use the combined endpoints, and a
+decision goes to its item's own workspace.
+
+## 22. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a
