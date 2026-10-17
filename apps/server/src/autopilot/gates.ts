@@ -23,6 +23,8 @@ export interface GateResult {
   durationMs: number;
   output: string; // the tail, at most OUTPUT_LIMIT chars
   timedOut: boolean;
+  /** Failed, then passed when run again (runGates' rerunFailed). */
+  flaky?: boolean;
 }
 
 export const NO_GATES = "No gates: add a test script (package.json) or list gates in .factory/policy.yml";
@@ -171,21 +173,38 @@ export interface GatesOutcome {
   aborted: boolean;
 }
 
+const INSTALL = /(^|:)install$/;
+
+/** One gate's two runs as one result: the second decides, and the output says what happened. */
+function ranAgain(first: GateResult, second: GateResult): GateResult {
+  const how = first.exitCode === null ? "couldn't start" : `exit code ${first.exitCode}`;
+  const note = second.ok
+    ? `\n[Flaky: it failed the first time (${how}) and passed when run again. The first run ended with the output above the line.]`
+    : "\n[Run again once in case it was flaky: it failed both times.]";
+  const body = second.ok ? `${first.output.slice(-1500)}\n${"-".repeat(40)}\n${second.output}` : second.output;
+  return { ...second, durationMs: first.durationMs + second.durationMs, output: `${body.slice(-(OUTPUT_LIMIT - note.length))}${note}`, ...(second.ok ? { flaky: true } : {}) };
+}
+
 /**
  * Runs the gates one after another in `dir`. A failing install stops the
  * rest, since nothing after it can pass. No gates at all is a failure too.
- * `signal` stops the gate that's running and the rest.
+ * `signal` stops the gate that's running and the rest. With `rerunFailed`,
+ * a gate that fails (not an install, not a timeout) runs once more: a pass
+ * then counts, marked flaky, so a flaky test costs a minute, not a repair.
  */
-export async function runGates(dir: string, gates: Gate[], opts: { signal?: AbortSignal } = {}): Promise<GatesOutcome> {
+export async function runGates(dir: string, gates: Gate[], opts: { signal?: AbortSignal; rerunFailed?: boolean } = {}): Promise<GatesOutcome> {
   if (!gates.length) {
     return { ok: false, aborted: false, results: [{ name: "gates", run: "", ok: false, exitCode: null, durationMs: 0, output: NO_GATES, timedOut: false }] };
   }
   const results: GateResult[] = [];
   for (const gate of gates) {
     if (opts.signal?.aborted) break;
-    const result = await runGate(dir, gate, opts.signal);
+    let result = await runGate(dir, gate, opts.signal);
+    if (!result.ok && opts.rerunFailed && !result.timedOut && !INSTALL.test(gate.name) && !opts.signal?.aborted) {
+      result = ranAgain(result, await runGate(dir, gate, opts.signal));
+    }
     results.push(result);
-    if (!result.ok && /(^|:)install$/.test(gate.name)) break;
+    if (!result.ok && INSTALL.test(gate.name)) break;
   }
   const aborted = !!opts.signal?.aborted;
   return { ok: !aborted && results.every((r) => r.ok), results, aborted };

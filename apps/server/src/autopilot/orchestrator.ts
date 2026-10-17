@@ -579,7 +579,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /** A follow-up message to an existing conversation; the agent starts on it right away. */
-  async function sendFollowUp(a: Attempt, text: string, reason: string) {
+  async function sendFollowUp(a: Attempt, text: string, reason: string, opts: { free?: boolean } = {}) {
     try {
       await client.send(a.conversationId, text);
     } catch (err) {
@@ -588,7 +588,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       await client.resume(a.conversationId).catch(warn);
     }
     const events = await client.eventCount(a.conversationId).catch(() => null);
-    ledger.updateAttempt(a.id, { state: "running", turns: a.turns + 1, seenRunning: false, lastSentAt: now(), finishedAt: null, progressAt: now(), events, nudgedAt: null });
+    ledger.updateAttempt(a.id, { state: "running", turns: a.turns + 1, freeTurns: a.freeTurns + (opts.free ? 1 : 0), seenRunning: false, lastSentAt: now(), finishedAt: null, progressAt: now(), events, nudgedAt: null });
     record(SYSTEM, "autopilot.followup_sent", a.runId, { role: a.role, attempt: a.id, conversationId: a.conversationId, turn: a.turns + 1, reason });
     changed(a.runId);
   }
@@ -1029,10 +1029,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** The gates, then (when they pass) the hidden tests in `tests`, as one outcome. */
   async function gatesThenHidden(run: Run, dir: string, tests: HiddenTest[], signal: AbortSignal): Promise<GatesOutcome> {
-    const gates = await runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal });
+    const rerunFailed = pinnedPolicy(run).selfHealing.rerunFailedGates;
+    const gates = await runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal, rerunFailed });
     if (!gates.ok || !tests.length) return gates;
     const manifest = new Map(tests.map((t) => [t.file, t.sha256]));
-    const hidden = await runHiddenTests(dir, testsDir(run), tests, pinnedPolicy(run).hiddenTests.run, manifest, signal);
+    const hidden = await runHiddenTests(dir, testsDir(run), tests, pinnedPolicy(run).hiddenTests.run, manifest, signal, { rerunFailed });
     const results = [...gates.results, ...hidden.map((h) => h.result)];
     return { ok: !signal.aborted && results.every((r) => r.ok), results, aborted: signal.aborted };
   }
@@ -1071,6 +1072,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       ok: results.every((r) => r.ok),
       gates: results.map((r) => r.name),
       failed: results.filter((r) => !r.ok).map((r) => r.name),
+      ...(results.some((r) => r.flaky) ? { flaky: results.filter((r) => r.flaky).map((r) => r.name) } : {}),
     });
     changed(run.id);
   }
@@ -1144,7 +1146,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * back to the same builder twice, then to one fresh builder in a new
    * worktree, then to a person, whose retry allows one more fresh builder.
    */
-  async function repair(run: Run, wo: WorkOrder, findings: Finding[]) {
+  async function repair(run: Run, wo: WorkOrder, findings: Finding[], opts: { conflict?: boolean } = {}) {
     // Builders whose conversation the agent server lost (an outage, a restart) aren't the work order's
     // failures: up to two of them don't count, so an agent server that keeps losing them still runs out.
     const everyone = builders(wo);
@@ -1153,10 +1155,16 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const last = all.at(-1);
     const data = { workOrder: `WO-${wo.seq}`, findings: findings.length };
     const limits = pinnedPolicy(run).repair;
+    // A merge conflict comes from another work order's merge, not this builder's work: it has rounds of its own.
+    const free = !!opts.conflict && wo.conflictRounds < pinnedPolicy(run).selfHealing.conflictRounds;
     // A conversation that never started, or is gone from the agent server, can't take a follow-up.
-    if (last && !(last.result as { error?: string } | null)?.error && last.turns < 1 + limits.sameConversation) {
-      await sendFollowUp(last, repairMessage(findings), "repair");
-      moveWorkOrder(wo, "building", { patch: { findings }, action: "autopilot.repair_requested", data: { ...data, builder: all.length, turn: last.turns + 1 } });
+    if (last && !(last.result as { error?: string } | null)?.error && (free || last.turns - last.freeTurns < 1 + limits.sameConversation)) {
+      await sendFollowUp(last, repairMessage(findings), free ? "conflict" : "repair", { free });
+      moveWorkOrder(wo, "building", {
+        patch: { findings, ...(free ? { conflictRounds: wo.conflictRounds + 1 } : {}) },
+        action: "autopilot.repair_requested",
+        data: { ...data, builder: all.length, turn: last.turns + 1, ...(free ? { conflictRound: wo.conflictRounds + 1 } : {}) },
+      });
       return;
     }
     const retries = ledger
@@ -1549,7 +1557,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     else record(SYSTEM, "autopilot.merge_reverted", run.id, { workOrder: key, resetTo: pre });
     const tip = await headSha(dir);
     await mergeInto(wo.worktree as string, run.integrationBranch);
-    await repair(run, ledger.updateWorkOrder(wo.id, { baseSha: tip, preMergeSha: null, mergeSha: null }), r.findings);
+    await repair(run, ledger.updateWorkOrder(wo.id, { baseSha: tip, preMergeSha: null, mergeSha: null }), r.findings, { conflict: r.outcome === "conflict" });
   }
 
   /** A merge step threw: an untested merge comes off the integration branch, and the work order waits for a person (retry merges again). */
@@ -1683,7 +1691,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       releases.set(run.id, prepared);
       const untouched = (await git(workspace, ["merge-base", baseTip, tip])).stdout.trim() === baseTip;
       if (!untouched) {
-        startJob(run.id, key, (signal) => runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal }));
+        startJob(run.id, key, (signal) => runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal, rerunFailed: pinnedPolicy(run).selfHealing.rerunFailedGates }));
         return;
       }
     } else {

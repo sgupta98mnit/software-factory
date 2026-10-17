@@ -296,6 +296,18 @@ filename="evidence-<change>-<run>.json"` and records
 - **Cold starts**: `classify` takes `progressed` (events grew since the
   message, read only for `idle` never seen running). `idle` with no new events
   waits up to 3 minutes instead of the 20 s grace; `finished` is unchanged.
+- **Flaky gates** (`selfHealing.rerunFailedGates`, default on): `runGates`
+  runs a failed gate (not an install, not a timeout) once more. A pass then
+  counts, with `flaky: true` and both outputs in the check, and
+  `autopilot.gates_run` lists it under `flaky`. Two failures say so in the
+  output. This covers work-order gates, hidden tests, integration re-tests and
+  the release test.
+- **Merge conflicts** (`selfHealing.conflictRounds`, default 3): a conflict
+  goes back to the builder as a follow-up that doesn't count against
+  `repair.sameConversation` (`attempts.free_turns`) and moves
+  `work_orders.conflict_rounds` (ledger v8). Past the cap, conflicts are
+  ordinary repairs. A failing re-test after a clean merge is still a
+  repair.
 - `pinnedPolicy` fills in settings added after a run was pinned with their
   defaults, so older runs keep working as the policy grows.
 

@@ -1,7 +1,7 @@
 // Self-healing: the watchdog for quiet agents, agent-server outages, and
 // agents restarted once before anyone is asked.
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -38,9 +38,13 @@ function hang() {
   return { gate, release };
 }
 
-async function setup(handler: FakeHandler, opts: { quietMs?: number; port?: number; notify?: unknown[] } = {}) {
+async function setup(handler: FakeHandler, opts: { quietMs?: number; port?: number; notify?: unknown[]; policy?: string } = {}) {
   const workspace = mkdtempSync(path.join(tmpdir(), "sf-heal-ws-"));
   writeFileSync(path.join(workspace, "README.md"), "# Demo\n");
+  if (opts.policy) {
+    mkdirSync(path.join(workspace, ".factory"));
+    writeFileSync(path.join(workspace, ".factory", "policy.yml"), opts.policy);
+  }
   await ensureRepo(workspace);
   const dataDir = mkdtempSync(path.join(dataRoot, "case-"));
   const fake = await startFakeOpenHands({ onMessage: handler, port: opts.port });
@@ -71,6 +75,7 @@ async function setup(handler: FakeHandler, opts: { quietMs?: number; port?: numb
       ledger.addWorkOrders(run.id, Array.from({ length: n }, (_, i) => ({ seq: i + 1, title: `Task ${i + 1}`, acceptance: [`Criterion ${i + 1}`], controls: [], dependsOn: [], wave: 1, risk: "low" as const })));
       return ledger.updateRun(run.id, { state: "building" });
     },
+    states: (runId: string) => ledger.listWorkOrders(runId).map((w) => `${w.seq}:${w.state}`),
     builders: (runId: string, seq: number) => ledger.listAttempts({ runId, workOrderId: `${runId}/WO-${seq}`, role: "builder" }),
     async close() {
       o.stop();
@@ -221,4 +226,76 @@ test("pinnedPolicy: a setting added after a run was pinned reads as its default"
   assert.deepEqual(pinned.release, { auto: false });
   assert.equal(pinned.autoMerge.maxChangedLines, 50);
   assert.equal(pinnedPolicy({ policy: null }), DEFAULT_POLICY);
+});
+
+test("a gate that fails once and passes when run again counts as passed, marked flaky; with rerunFailedGates off it goes to the builder", async () => {
+  for (const rerun of [true, false]) {
+    const marker = path.join(mkdtempSync(path.join(tmpdir(), "sf-flaky-")), "ran");
+    const t = await setup(
+      (conv) => {
+        if (conv.tags.sfrole !== "builder") return { response: PASS, cost: 0.02 };
+        if (conv.messages.length > 1) return { response: "Looked again; nothing to change." };
+        writeFileSync(path.join(conv.workingDir, "package.json"), PKG);
+        // Fails the first time it ever runs, passes after: a flaky test.
+        const body = `const m = ${JSON.stringify(marker)}; if (!existsSync(m)) { writeFileSync(m, "1"); throw new Error("timing"); }`;
+        writeFileSync(path.join(conv.workingDir, "flaky.test.js"), `import { test } from "node:test";\nimport { existsSync, writeFileSync } from "node:fs";\ntest("flaky", () => { ${body} });\n`);
+        return { response: "Built it.", cost: 0.1 };
+      },
+      { policy: rerun ? undefined : "selfHealing: { rerunFailedGates: false }\n" },
+    );
+    try {
+      const run = await t.buildingRun(1);
+      await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+      const builder = t.builders(run.id, 1)[0]!;
+      const checks = t.ledger.listChecks({ runId: run.id, workOrderId: `${run.id}/WO-1` }).filter((c) => c.stage === "build" && c.name === "test");
+      if (rerun) {
+        assert.equal(t.fake.conversations.get(builder.conversationId)?.messages.length, 1, "no repair round for a flaky test");
+        assert.deepEqual(checks.map((c) => c.ok), [true]);
+        assert.match(checks[0]!.output, /\[Flaky: it failed the first time \(exit code 1\) and passed when run again\./);
+        const runs = (await auditOf(run.id, "autopilot.gates_run")).filter((e) => e.data.stage === "build");
+        assert.deepEqual(runs.map((e) => e.data.flaky), [["test"]]);
+      } else {
+        assert.equal(t.fake.conversations.get(builder.conversationId)?.messages.length, 2);
+        assert.deepEqual(checks.map((c) => c.ok), [false, true]);
+      }
+    } finally {
+      await t.close();
+    }
+  }
+});
+
+test("merge conflicts have rounds of their own: with no repair rounds at all, the builder still resolves one; with conflictRounds 0 it's a failure", async () => {
+  const builder: FakeHandler = (conv) => {
+    if (conv.tags.sfrole !== "builder") return { response: PASS, cost: 0.02 };
+    const shared = path.join(conv.workingDir, "shared.txt");
+    if (conv.messages.length === 1) {
+      writeFileSync(shared, `from WO-${conv.tags.sfwo}\n`);
+      return build(conv);
+    }
+    assert.match(readFileSync(shared, "utf8"), /<<<<<<</);
+    writeFileSync(shared, "from WO-1\nfrom WO-2\n");
+    return { response: "Resolved the conflict." };
+  };
+  const t = await setup(builder, { policy: "repair: { sameConversation: 0, fresh: 0 }\n" });
+  try {
+    const run = await t.buildingRun(2);
+    await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+    assert.deepEqual(t.states(run.id), ["1:merged", "2:merged"]);
+    const [conflicted] = (await auditOf(run.id, "autopilot.merge_conflicted")).map((e) => Number(String(e.data.workOrder).slice(3)));
+    const b = t.builders(run.id, conflicted!)[0]!;
+    assert.deepEqual([b.turns, b.freeTurns], [2, 1]);
+    assert.equal(t.ledger.getWorkOrder(`${run.id}/WO-${conflicted}`)?.conflictRounds, 1);
+    assert.deepEqual((await auditOf(run.id, "autopilot.repair_requested")).map((e) => e.data.conflictRound), [1]);
+  } finally {
+    await t.close();
+  }
+
+  const capped = await setup(builder, { policy: "repair: { sameConversation: 0, fresh: 0 }\nselfHealing: { conflictRounds: 0 }\n" });
+  try {
+    const run = await capped.buildingRun(2);
+    await capped.until(() => capped.ledger.listInbox({ runId: run.id }).some((i) => i.kind === "work_order_failed"));
+    assert.match(capped.ledger.listInbox({ runId: run.id }).find((i) => i.kind === "work_order_failed")!.body, /conflicts in: shared\.txt/);
+  } finally {
+    await capped.close();
+  }
 });

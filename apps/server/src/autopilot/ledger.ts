@@ -116,6 +116,7 @@ export interface WorkOrder {
   mergeSha: string | null; // the merge commit the factory made and is testing; the only tip besides integrationSha it accepts
   findings: Finding[] | null; // what triggered the latest repair
   budgetExtraUsd: number;
+  conflictRounds: number; // merge-conflict rounds so far, outside the repair limits
   mergedBy: string | null; // "policy@<hash>" or "user:<name>"
   updatedAt: string;
 }
@@ -129,6 +130,7 @@ export interface Attempt {
   agentProfile: string | null;
   state: AttemptState;
   turns: number; // user messages sent; 1 = the initial brief
+  freeTurns: number; // of those, merge-conflict rounds, which the repair limits don't count
   seenRunning: boolean; // saw status "running" since the last message
   lastSentAt: string;
   costUsd: number; // the conversation's latest accumulated cost
@@ -327,6 +329,12 @@ ALTER TABLE attempts ADD COLUMN events INTEGER;
 ALTER TABLE attempts ADD COLUMN nudged_at TEXT;
 `;
 
+// v8: merge-conflict rounds outside the repair limits.
+const SCHEMA_V8 = `
+ALTER TABLE work_orders ADD COLUMN conflict_rounds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE attempts ADD COLUMN free_turns INTEGER NOT NULL DEFAULT 0;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
@@ -388,6 +396,7 @@ export function openLedger(file: string) {
   if (version < 5) transaction(() => db.exec(`${SCHEMA_V5}\nPRAGMA user_version = 5;`));
   if (version < 6) transaction(() => db.exec(`${SCHEMA_V6}\nPRAGMA user_version = 6;`));
   if (version < 7) transaction(() => db.exec(`${SCHEMA_V7}\nPRAGMA user_version = 7;`));
+  if (version < 8) transaction(() => db.exec(`${SCHEMA_V8}\nPRAGMA user_version = 8;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

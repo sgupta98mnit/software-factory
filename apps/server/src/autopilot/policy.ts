@@ -38,8 +38,12 @@ export interface Policy {
   notify: { digestHour: number };
   /** Release into the base branch on its own (autonomous runs only). Off: a person's click, the default. */
   release: { auto: boolean };
-  /** The watchdog: minutes a working agent may show no progress (no new events or cost) before it's nudged; as long again and it's stopped. */
-  selfHealing: { quietMinutes: number };
+  /**
+   * quietMinutes: the watchdog; minutes a working agent may show no progress (no new events or cost) before it's nudged, as long again and it's stopped.
+   * rerunFailedGates: a failed gate runs once more, and a pass then counts (recorded as flaky).
+   * conflictRounds: merge-conflict rounds a work order gets on top of `repair` (the conflict comes from another work order's merge).
+   */
+  selfHealing: { quietMinutes: number; rerunFailedGates: boolean; conflictRounds: number };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -69,7 +73,7 @@ export const DEFAULT_POLICY: Policy = {
   hiddenTests: { enabled: false, run: "node --test" },
   notify: { digestHour: 17 },
   release: { auto: false },
-  selfHealing: { quietMinutes: 20 },
+  selfHealing: { quietMinutes: 20, rerunFailedGates: true, conflictRounds: 3 },
 };
 
 // ---- reading and checking policy.yml ----
@@ -131,6 +135,8 @@ const RULES: Record<string, Rule> = {
   "notify.digestHour": whole(0, 23),
   "release.auto": flag,
   "selfHealing.quietMinutes": whole(1, 1440),
+  "selfHealing.rerunFailedGates": flag,
+  "selfHealing.conflictRounds": whole(0, 20),
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */

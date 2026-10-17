@@ -98,6 +98,7 @@ export async function runHiddenTests(
   run: string,
   manifest: Map<string, string>,
   signal?: AbortSignal,
+  opts: { rerunFailed?: boolean } = {},
 ): Promise<HiddenResult[]> {
   const target = path.join(dir, HIDDEN_DIR);
   const results: HiddenResult[] = [];
@@ -115,7 +116,7 @@ export async function runHiddenTests(
       mkdirSync(path.dirname(copy), { recursive: true });
       cpSync(source, copy);
       const file = `${HIDDEN_DIR}/${t.file}`;
-      const { results: [result] } = await runGates(dir, [{ name: `hidden:${t.file}`, run: `${run} ${JSON.stringify(file)}`, timeoutSec: 300 }], { signal });
+      const { results: [result] } = await runGates(dir, [{ name: `hidden:${t.file}`, run: `${run} ${JSON.stringify(file)}`, timeoutSec: 300 }], { signal, rerunFailed: opts.rerunFailed });
       if (result) results.push({ test: t, result });
     }
   } finally {
