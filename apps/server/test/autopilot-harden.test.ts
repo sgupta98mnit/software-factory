@@ -238,3 +238,37 @@ test("#1: a deleted integration branch stops the run the same way, and putting i
     await t.close();
   }
 });
+
+test("#5: when three failing work orders pause the run, the agents still working are paused too, and resume with it", async () => {
+  let release!: () => void;
+  const slow = new Promise<void>((resolve) => (release = resolve));
+  const t = await setup(
+    byRole({
+      builder: async (conv) => {
+        if (conv.tags.sfwo === "1") await slow; // still working when the run pauses
+        return build(conv);
+      },
+    }),
+  );
+  try {
+    const run = await t.o.createRun({ goal: "Add claim status lookup", autonomy: "supervised", actor: "user:test" });
+    t.ledger.addWorkOrders(run.id, [1, 2, 3, 4].map((seq) => ({ seq, title: `Task ${seq}`, acceptance: ["It works"], controls: [], dependsOn: [], wave: 1, risk: "low" as const })));
+    t.ledger.updateRun(run.id, { state: "building" });
+    // WO-2..4 can't get a worktree (a ref in the way of their branch names); WO-1 dispatches first and keeps working.
+    for (const seq of [2, 3, 4]) await git(t.workspace, ["update-ref", `refs/heads/${run.integrationBranch}--wo-${seq}/blocker`, run.integrationSha!]);
+    await t.o.tick();
+    await t.o.idle();
+    assert.equal(t.ledger.getRun(run.id)?.state, "paused");
+    const [builder] = t.builders(run.id, 1);
+    assert.equal(builder?.state, "paused");
+    assert.equal(t.fake.conversations.get(builder!.conversationId)?.status, "paused");
+
+    release();
+    await t.fake.settled();
+    await t.o.resume(run.id, { actor: "user:test" });
+    assert.equal(t.builders(run.id, 1)[0]?.state, "running");
+  } finally {
+    release();
+    await t.close();
+  }
+});

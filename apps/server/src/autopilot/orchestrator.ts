@@ -226,8 +226,21 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return item;
   }
 
-  /** A step failed: pause the run and ask a person (retry or cancel). */
-  function failed(runId: string, err: unknown) {
+  /**
+   * Pauses the run's working conversations on the agent server, so a paused
+   * run stops spending. Ones still "starting" were never started; they start
+   * when the run resumes.
+   */
+  async function pauseAgents(runId: string) {
+    for (const a of ledger.listAttempts({ runId })) {
+      if (a.state !== "running") continue;
+      await client.pause(a.conversationId).catch(warn);
+      ledger.updateAttempt(a.id, { state: "paused" });
+    }
+  }
+
+  /** A step failed: pause the run and its agents, and ask a person (retry or cancel). */
+  async function failed(runId: string, err: unknown) {
     if (unreachable(err)) return;
     console.error(`[autopilot] ${runId}:`, err);
     const run = ledger.getRun(runId);
@@ -243,6 +256,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         data: { error: clip(message) },
       });
     });
+    await pauseAgents(runId);
   }
 
   // ---- attempts (one agent conversation each) ----
@@ -1130,6 +1144,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (run?.state === "spec") await specStep(run);
     else if (run?.state === "critic") await criticStep(run);
     else if (run?.state === "building") await buildStep(run);
+    // The step paused the run (three work orders failing, a moved integration branch): its agents stop too.
+    if (run?.state !== "paused" && ledger.getRun(runId)?.state === "paused") await pauseAgents(runId);
   }
 
   /** Cheap: hands each live run to advance(), skipping runs that are still busy. */
@@ -1266,18 +1282,16 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return locked(runId, async () => {
       const run = mustRun(runId);
       if (TERMINAL.has(run.state) || run.state === "paused") throw new Error(`The run is already ${run.state}.`);
-      for (const a of ledger.listAttempts({ runId })) {
-        if (a.state !== "running") continue;
-        await client.pause(a.conversationId).catch(warn);
-        ledger.updateAttempt(a.id, { state: "paused" });
-      }
       const note = opts.note?.trim();
-      return moveRun(run, "paused", {
+      // The run first: a crash before its agents are paused leaves them running and polled after Resume, never orphaned.
+      const paused = moveRun(run, "paused", {
         patch: { resumeState: run.state, pausedReason: note || `Paused by ${opts.actor}` },
         actor: opts.actor,
         action: "autopilot.run_paused",
         data: { note: note ? clip(note) : null },
       });
+      await pauseAgents(runId);
+      return paused;
     });
   }
 
