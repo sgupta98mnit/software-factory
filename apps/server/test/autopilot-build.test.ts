@@ -189,28 +189,24 @@ test("plan and dispatch: tasks.md becomes waves; three builders start at once in
     await t.step(2);
     assert.equal(t.ledger.listAttempts({ runId: run.id, role: "builder" }).length, 3);
 
+    // A free slot isn't enough: WO-4 waits until all of 1-3 are merged, then builds on top of them.
     builders.open();
-    await t.until(() => states(t, run.id).filter((s) => s.endsWith(":ready")).length === 3);
-    assert.deepEqual(states(t, run.id), ["1:ready", "2:ready", "3:ready", "4:pending"]);
+    await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+    assert.deepEqual(states(t, run.id), ["1:merged", "2:merged", "3:merged", "4:merged"]);
+    const log = (await git(t.workspace, ["log", "--format=%s", run.integrationBranch])).stdout;
+    const wo4 = t.ledger.getWorkOrder(`${run.id}/WO-4`)!;
     for (const seq of [1, 2, 3]) {
       const wo = t.ledger.getWorkOrder(`${run.id}/WO-${seq}`)!;
-      const subject = (await git(t.workspace, ["log", "-1", "--format=%s", wo.branch!])).stdout.trim();
-      assert.equal(subject, `WO-${seq}: ${wo.title}`);
-      assert.match((await fileAt(t.workspace, wo.branch!, `wo-${seq}.txt`)) ?? "", /built by/);
+      assert.ok(log.includes(`WO-${seq}: ${wo.title}`), `WO-${seq} commit`);
+      assert.match((await fileAt(t.workspace, wo4.baseSha!, `wo-${seq}.txt`)) ?? "", /built by/);
     }
-    assert.equal(await headSha(t.workspace, run.integrationBranch), tip); // nothing merged yet
-
-    // A free slot isn't enough: WO-4 waits until all of 1-3 are merged or skipped.
-    t.ledger.updateWorkOrder(`${run.id}/WO-1`, { state: "merged" });
-    await t.step(2);
-    assert.equal(t.ledger.getWorkOrder(`${run.id}/WO-4`)?.state, "pending");
-    t.ledger.updateWorkOrder(`${run.id}/WO-2`, { state: "skipped" });
-    t.ledger.updateWorkOrder(`${run.id}/WO-3`, { state: "merged" });
-    await t.until(() => t.ledger.getWorkOrder(`${run.id}/WO-4`)?.state === "ready");
 
     await flushAudit();
-    const events = listAudit().filter((e) => e.subject === run.id);
-    assert.equal(events.filter((e) => e.action === "autopilot.work_order_dispatched").length, 4);
+    const events = listAudit(5000).filter((e) => e.subject === run.id);
+    const dispatched = events.filter((e) => e.action === "autopilot.work_order_dispatched");
+    assert.equal(dispatched.length, 4);
+    const at = (action: string, wo: string) => events.findIndex((e) => e.action === action && e.data.workOrder === wo); // newest first
+    for (const wo of ["WO-1", "WO-2", "WO-3"]) assert.ok(at("autopilot.work_order_dispatched", "WO-4") < at("autopilot.work_order_merged", wo), wo);
     const plannedEvent = events.find((e) => e.action === "autopilot.work_orders_planned");
     assert.deepEqual([plannedEvent?.data.workOrders, plannedEvent?.data.waves], [4, 2]);
   } finally {
@@ -296,8 +292,9 @@ test("a builder that keeps failing goes to the inbox after its repair rounds: re
 
     await t.o.decide(failedItem()!.id, { choice: "skip" }, "user:test");
     assert.equal(existsSync(first.worktree!), false);
-    await t.until(() => t.ledger.getWorkOrder(`${run.id}/WO-2`)?.state === "ready");
-    assert.deepEqual(states(t, run.id), ["1:skipped", "2:ready"]);
+    await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+    assert.deepEqual(states(t, run.id), ["1:skipped", "2:merged"]);
+    assert.equal(await branchExists(t.workspace, first.branch!), true); // a skipped work order's branch keeps what it did
     await flushAudit();
     const decided = listAudit().filter((e) => e.subject === run.id && e.action === "autopilot.work_order_state_changed" && e.actor === "user:test");
     assert.deepEqual(decided.map((e) => e.data.to).reverse(), ["pending", "skipped"]);

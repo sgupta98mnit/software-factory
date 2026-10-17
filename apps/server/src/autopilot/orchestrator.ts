@@ -3,7 +3,9 @@
 // approval (by autonomy) -> building: one builder per work order, each in its
 // own worktree and branch from the integration tip, a few at a time. Built
 // work goes through the factory's gates and a reviewer; what fails goes back
-// to the builder (repair), then to a fresh builder, then to a person.
+// to the builder (repair), then to a fresh builder, then to a person. Work
+// that passes is merged into the integration branch one work order at a
+// time and tested again there; when everything is merged, the run is done.
 // Every step reads its state from the ledger, does one side effect (an agent
 // call, git, openspec) and writes the new state, so the factory can stop at
 // any point and carry on after a restart.
@@ -16,21 +18,24 @@ import path from "node:path";
 import { audit, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
-import { detectGates, gateFindings, runGates } from "./gates.js";
+import { detectGates, gateFindings, runGates, type GateResult } from "./gates.js";
 import {
   addWorktree,
   commitAll,
   currentBranch,
   deleteBranch,
+  diffStat,
   discardChanges,
   ensureRepo,
   git,
   headSha,
   isClean,
   isRepoRoot,
+  mergeInto,
   removeWorktree,
   resetHard,
 } from "./git.js";
+import { mergeAndTest, mergeDecision } from "./integrator.js";
 import type {
   Attempt,
   AttemptRole,
@@ -121,6 +126,11 @@ const WO_ERROR: InboxOption[] = [
   { id: "retry", label: "Retry", tone: "primary" },
   { id: "skip", label: "Skip this work order" },
   { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const MERGE: InboxOption[] = [
+  { id: "merge", label: "Merge", tone: "primary" },
+  { id: "send_back", label: "Send back to the builder", needsNote: true },
+  { id: "skip", label: "Skip this work order" },
 ];
 const RUN_PAUSED: InboxOption[] = [
   { id: "resume", label: "Resume", tone: "primary" },
@@ -538,11 +548,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /**
    * Moves each work order one step (builder stopped -> gates -> reviewer ->
-   * ready, or a repair), then dispatches what's ready. A step that throws
-   * stops only its work order, which goes to a person.
+   * ready, or a repair), merges one, then dispatches what's ready. A step
+   * that throws stops only its work order, which goes to a person.
    */
   async function buildStep(run: Run) {
-    // ponytail: one work order's gates per step, so polling and a person's action wait for one gate run at most; give gates their own task if suites get slow.
+    // ponytail: one work order's gates and one merge's integration gates per step, so polling and a person's action wait for two gate runs at most; give gates their own task if suites get slow.
     let gated = false;
     for (const wo of ledger.listWorkOrders(run.id)) {
       try {
@@ -557,6 +567,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       }
       if (ledger.getRun(run.id)?.state !== "building") return; // too many failures paused it
     }
+    await integrateStep(run);
+    if (ledger.getRun(run.id)?.state !== "building") return; // done, or too many failures paused it
     // Pending work orders whose dependencies are merged or skipped, in wave order, while there's room.
     const wos = ledger.listWorkOrders(run.id);
     const stateOf = new Map(wos.map((w) => [w.seq, w.state]));
@@ -633,16 +645,27 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function verify(run: Run, wo: WorkOrder) {
     const dir = wo.worktree as string;
     const { ok, results } = await runGates(dir, detectGates(dir));
-    ledger.transaction(() => {
-      for (const r of results) {
-        ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: r.name, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, output: r.output });
-      }
-    });
-    record(SYSTEM, "autopilot.gates_run", run.id, { workOrder: `WO-${wo.seq}`, ok, gates: results.map((r) => r.name), failed: results.filter((r) => !r.ok).map((r) => r.name) });
-    changed(run.id);
+    recordGates(run, wo, "build", results);
     if (!ok) return repair(run, wo, gateFindings(results));
     await discardChanges(dir); // what the gates left (build output), so anything left after the review is the reviewer's
     await startReviewer(run, wo);
+  }
+
+  /** One check per gate, and one audit record for the lot. */
+  function recordGates(run: Run, wo: WorkOrder, stage: "build" | "integrate", results: GateResult[]) {
+    ledger.transaction(() => {
+      for (const r of results) {
+        ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage, name: r.name, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, output: r.output });
+      }
+    });
+    record(SYSTEM, "autopilot.gates_run", run.id, {
+      workOrder: `WO-${wo.seq}`,
+      stage,
+      ok: results.every((r) => r.ok),
+      gates: results.map((r) => r.name),
+      failed: results.filter((r) => !r.ok).map((r) => r.name),
+    });
+    changed(run.id);
   }
 
   /** Write-ahead like dispatch: the attempt and the move to reviewing, then the agent server. */
@@ -784,6 +807,141 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
   }
 
+  // ---- integrate stage: one merge at a time ----
+
+  /**
+   * Merges one approved work order per step into the integration branch,
+   * lowest wave and seq first, and tests it there on top of what's merged.
+   * When every work order is merged or skipped, the run is done.
+   */
+  async function integrateStep(run: Run) {
+    const { auto, reasons } = mergeDecision(run.autonomy);
+    const wos = ledger.listWorkOrders(run.id);
+    if (!auto) for (const wo of wos) if (wo.state === "ready") await askMergeApproval(run, wo, reasons);
+    // A merge a restart interrupted first, then one already approved, then (by policy) the next ready one.
+    const ready = wos.find((w) => w.state === "ready");
+    const next =
+      wos.find((w) => w.state === "merging" && w.preMergeSha) ??
+      wos.find((w) => w.state === "merging") ??
+      (auto && ready ? moveWorkOrder(ready, "merging", { actor: POLICY_ACTOR, patch: { preMergeSha: null }, data: { reasons } }) : undefined);
+    if (next) await integrate(run, next).catch((err) => integrateFailed(run, next, err));
+    for (const wo of ledger.listWorkOrders(run.id)) if (wo.state === "merged" && wo.worktree) await cleanUp(run, wo);
+    if (ledger.getRun(run.id)?.state === "building" && ledger.listWorkOrders(run.id).every((w) => DONE_WO.has(w.state))) await finish(run);
+  }
+
+  /** Suggest mode: a person sees what a work order changes before it merges. */
+  async function askMergeApproval(run: Run, wo: WorkOrder, reasons: string[]) {
+    const { files, linesChanged } = await diffStat(workspace, run.integrationBranch, wo.branch as string);
+    const list = files.slice(0, 30).map((f) => `- \`${f.path}\` (+${f.added} -${f.deleted})`);
+    if (files.length > 30) list.push(`- and ${files.length - 30} more`);
+    const body = [
+      `**WO-${wo.seq}: ${wo.title}** passed its gates and review. Merging brings \`${wo.branch}\` into \`${run.integrationBranch}\`, where the gates run again.`,
+      "",
+      "### Why it needs you",
+      bullets(reasons),
+      "",
+      `### ${files.length} file(s), ${linesChanged} line(s) changed`,
+      ...list,
+      "",
+      "Send back tells its builder what to change (write it in the note). Skip lets the work orders that depend on it go ahead without it.",
+    ].join("\n");
+    ledger.transaction(() => {
+      moveWorkOrder(wo, "awaiting_merge_approval");
+      openItem(run, "merge_approval", `Merge WO-${wo.seq} of ${run.change}: ${wo.title}`, body, MERGE, wo.id);
+    });
+  }
+
+  /** Who lets a work order merge: the policy, or the person who approved it. Never merged without one on record. */
+  function mergeActor(run: Run, wo: WorkOrder): string {
+    if (mergeDecision(run.autonomy).auto) return POLICY_ACTOR;
+    const approval = ledger
+      .listInbox({ state: "decided", runId: run.id })
+      .find((i) => i.workOrderId === wo.id && i.kind === "merge_approval" && i.decision === "merge");
+    if (!approval?.decidedBy) throw new Error(`WO-${wo.seq} has no merge approval on record.`);
+    return approval.decidedBy;
+  }
+
+  /**
+   * Merge, re-test, then merged; or the integration branch goes back to where
+   * it was and the work order back to its builder, its branch brought up to
+   * date with the integration branch (a conflict's markers left for it to
+   * resolve). That counts as a repair round.
+   */
+  async function integrate(run: Run, wo: WorkOrder) {
+    const dir = run.integrationDir as string;
+    const actor = mergeActor(run, wo);
+    const key = `WO-${wo.seq}`;
+    // Saved before merging, so a restart (or a failure) knows where the integration branch was.
+    let pre = wo.preMergeSha;
+    if (!pre) {
+      pre = await headSha(dir);
+      ledger.updateWorkOrder(wo.id, { preMergeSha: pre });
+    }
+    const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre);
+    if (r.results.length) recordGates(run, wo, "integrate", r.results);
+    if (r.outcome === "merged") {
+      moveWorkOrder(wo, "merged", {
+        actor,
+        patch: { mergedBy: actor },
+        action: "autopilot.work_order_merged",
+        data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons: mergeDecision(run.autonomy).reasons },
+      });
+      return;
+    }
+    if (r.outcome === "conflict") record(SYSTEM, "autopilot.merge_conflicted", run.id, { workOrder: key, conflicts: r.conflicts });
+    else record(SYSTEM, "autopilot.merge_reverted", run.id, { workOrder: key, resetTo: pre });
+    const tip = await headSha(dir);
+    await mergeInto(wo.worktree as string, run.integrationBranch);
+    await repair(run, ledger.updateWorkOrder(wo.id, { baseSha: tip, preMergeSha: null }), r.findings);
+  }
+
+  /** A merge step threw: an untested merge comes off the integration branch, and the work order waits for a person (retry merges again). */
+  async function integrateFailed(run: Run, wo: WorkOrder, err: unknown) {
+    if (unreachable(err)) return; // the next step merges or sends it back again
+    const pre = ledger.getWorkOrder(wo.id)?.preMergeSha;
+    if (pre) await resetIntegration(run, wo, pre, SYSTEM);
+    ledger.updateWorkOrder(wo.id, { preMergeSha: null });
+    workOrderError(run, wo, err);
+  }
+
+  /** Puts the integration branch back to `pre` (also ending a half-done merge), audited when a merge had landed on it. */
+  async function resetIntegration(run: Run, wo: WorkOrder, pre: string, actor: string) {
+    const dir = run.integrationDir as string;
+    const landed = (await headSha(dir)) !== pre;
+    await resetHard(dir, pre);
+    if (landed) record(actor, "autopilot.merge_reverted", run.id, { workOrder: `WO-${wo.seq}`, resetTo: pre });
+  }
+
+  /** A merged work order's worktree and branch go; its commits live on in the integration branch. A failure is tried again next step. */
+  async function cleanUp(run: Run, wo: WorkOrder) {
+    try {
+      await removeWorktree(workspace, wo.worktree as string);
+      if (wo.branch) await deleteBranch(workspace, wo.branch);
+    } catch (err) {
+      return warn(err);
+    }
+    ledger.updateWorkOrder(wo.id, { worktree: null });
+    record(SYSTEM, "autopilot.branch_cleaned", run.id, { workOrder: `WO-${wo.seq}`, branch: wo.branch });
+    changed(run.id);
+  }
+
+  /**
+   * Every work order is merged or skipped. The integration branch is the
+   * deliverable: its worktree goes, the branch stays. With nothing merged
+   * (every work order skipped) there's nothing to deliver, and the run failed.
+   */
+  async function finish(run: Run) {
+    const wos = ledger.listWorkOrders(run.id);
+    const merged = wos.filter((w) => w.state === "merged").length;
+    const sha = await headSha(workspace, run.integrationBranch);
+    if (run.integrationDir) await removeWorktree(workspace, run.integrationDir);
+    moveRun(run, merged ? "done" : "failed", {
+      patch: { integrationDir: null, resumeState: null },
+      action: merged ? "autopilot.run_completed" : "autopilot.run_failed",
+      data: { branch: run.integrationBranch, sha, costUsd: ledger.runCost(run.id), merged, skipped: wos.length - merged },
+    });
+  }
+
   // ---- the scheduler ----
 
   /** Starts or polls the run's agents, then takes its next step. */
@@ -874,6 +1032,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       await client.pause(a.conversationId).catch(warn);
       ledger.updateAttempt(a.id, { state: "cancelled", finishedAt: now() });
     }
+    // A merge a restart interrupted before its gates ran doesn't stay on the deliverable.
+    const merging = ledger.listWorkOrders(run.id).find((w) => w.state === "merging" && w.preMergeSha);
+    if (merging?.preMergeSha && run.integrationDir) await resetIntegration(run, merging, merging.preMergeSha, actor).catch(warn);
     for (const wo of ledger.listWorkOrders(run.id)) {
       if (wo.worktree) await removeWorktree(workspace, wo.worktree).catch(warn);
       if (wo.branch) await deleteBranch(workspace, wo.branch).catch(warn);
@@ -978,6 +1139,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         // Back in the queue: dispatch gives it a fresh worktree, and wo.findings go into the new brief.
         moveWorkOrder(workOrderOf(item), "pending", { actor, patch: { resumeState: null } });
         return;
+      case "merge_approval:merge":
+        // Queued: a later step merges it, one merge at a time, and runs the gates again.
+        moveWorkOrder(workOrderOf(item), "merging", { actor, patch: { preMergeSha: null } });
+        return;
+      case "merge_approval:send_back":
+        await repair(run, workOrderOf(item), [{ source: "review", severity: "high", title: "A person asks for changes before this merges", detail: note ?? "" }]);
+        return;
+      case "merge_approval:skip":
       case "error:skip":
       case "work_order_failed:skip": {
         const wo = workOrderOf(item);

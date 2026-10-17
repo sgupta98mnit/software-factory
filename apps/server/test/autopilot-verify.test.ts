@@ -20,6 +20,8 @@ const CLAUDE: FakeProfile = { id: "11111111-1111-4111-8111-111111111111", name: 
 const CODEX: FakeProfile = { id: "22222222-2222-4222-8222-222222222222", name: "codex", agent_kind: "acp", acp_server: "codex" };
 const PASS = 'Reviewed.\n\n```json\n{"verdict":"pass","findings":[]}\n```';
 const flushAudit = () => audit("test", "test.flush", "test");
+/** Runs here are in suggest mode, so work that passes verify waits for a merge approval, worktree and branch intact. */
+const PASSED = "awaiting_merge_approval";
 
 /** Plays a builder: a tiny node:test package whose one test passes only when `sum` adds. */
 function writePackage(dir: string, body: "a + b" | "a - b") {
@@ -66,7 +68,7 @@ async function setup(handler: FakeHandler) {
     },
     /** A run in building with independent work orders 1..n, skipping the spec stage. */
     async buildingRun(n = 1) {
-      const run = await o.createRun({ goal: "Add claim status lookup", autonomy: "supervised", actor: "user:test" });
+      const run = await o.createRun({ goal: "Add claim status lookup", autonomy: "suggest", actor: "user:test" });
       const seqs = Array.from({ length: n }, (_, i) => i + 1);
       ledger.addWorkOrders(run.id, seqs.map((seq) => ({ seq, title: `Task ${seq}`, acceptance: [`Criterion ${seq}.1`], controls: [], dependsOn: [], wave: 1, risk: "low" as const })));
       return ledger.updateRun(run.id, { state: "building" });
@@ -86,7 +88,7 @@ const auditOf = async (runId: string, action: string) => {
     .reverse();
 };
 
-test("verify: passing code -> gates pass -> a reviewer from another vendor passes it -> ready; the reviewer's edits and commit are thrown away", async () => {
+test("verify: passing code -> gates pass -> a reviewer from another vendor passes it -> merge approval; the reviewer's edits and commit are thrown away", async () => {
   const t = await setup(
     byRole({
       builder: (conv) => writePackage(conv.workingDir, "a + b"),
@@ -102,7 +104,7 @@ test("verify: passing code -> gates pass -> a reviewer from another vendor passe
   );
   try {
     const run = await t.buildingRun();
-    await t.until(() => t.wo(run.id).state === "ready");
+    await t.until(() => t.wo(run.id).state === PASSED);
     const wo = t.wo(run.id);
     assert.deepEqual(t.checks(run.id), ["test:ok", "reviewer-edits-discarded:failed"]);
 
@@ -143,7 +145,7 @@ test("repair: a failing test goes back to the same builder with the gate's outpu
   );
   try {
     const run = await t.buildingRun();
-    await t.until(() => t.wo(run.id).state === "ready");
+    await t.until(() => t.wo(run.id).state === PASSED);
     const builders = t.attempts(run.id, "builder");
     assert.equal(builders.length, 1);
     assert.equal(builders[0]?.turns, 2);
@@ -191,7 +193,7 @@ test("repair: still failing after two follow-ups goes to a fresh builder in a re
 
     fixed = true;
     await t.o.decide(item.id, { choice: "retry" }, "user:test");
-    await t.until(() => t.wo(run.id).state === "ready");
+    await t.until(() => t.wo(run.id).state === PASSED);
     assert.deepEqual(t.attempts(run.id, "builder").map((a) => a.turns), [3, 3, 1]);
   } finally {
     await t.close();
@@ -221,7 +223,7 @@ test("repair: a reviewer's critical finding goes back to the builder, clustered 
   try {
     const run = await t.buildingRun();
     runId = run.id;
-    await t.until(() => t.wo(run.id).state === "ready");
+    await t.until(() => t.wo(run.id).state === PASSED);
     const [builder] = t.attempts(run.id, "builder");
     assert.equal(builder?.turns, 2);
     const followUp = t.conv(builder?.conversationId).messages[1] ?? "";
@@ -259,7 +261,7 @@ test("a reviewer with no readable verdict, even when asked again, stops only its
 
     readable = true;
     await t.o.decide(item.id, { choice: "retry" }, "user:test");
-    await t.until(() => t.wo(run.id).state === "ready");
+    await t.until(() => t.wo(run.id).state === PASSED);
     assert.equal(t.attempts(run.id, "reviewer").length, 2);
     assert.equal(t.attempts(run.id, "builder").length, 1); // the build wasn't redone
 
@@ -301,7 +303,7 @@ test("three work orders needing attention pause the run with a run_paused item; 
     await t.o.decide(paused.id, { choice: "resume" }, "user:test");
     assert.equal(t.ledger.getRun(run.id)?.state, "building");
     await t.o.decide(wo1Item.id, { choice: "skip" }, "user:test");
-    await t.until(() => t.wo(run.id, 4).state === "ready");
+    await t.until(() => t.wo(run.id, 4).state === PASSED);
     assert.equal(t.ledger.getRun(run.id)?.state, "building"); // no new failure, no new pause
 
     const pauses = await auditOf(run.id, "autopilot.run_paused");
@@ -325,7 +327,7 @@ test("a dispatch that throws stops only its work order, with an error item whose
 
     await git(t.workspace, ["update-ref", `refs/heads/${run.integrationBranch}`, tip]);
     await t.o.decide(item.id, { choice: "retry" }, "user:test");
-    await t.until(() => t.wo(run.id).state === "ready");
+    await t.until(() => t.wo(run.id).state === PASSED);
   } finally {
     await t.close();
   }
