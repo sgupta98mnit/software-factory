@@ -114,7 +114,7 @@ autoMerge:
   dependencyAllowlist: []
 ```
 
-A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing`, `budget`, `hiddenTests` and `notify` are accepted for features still to come.
+A work order merges without a person only when its gates and review passed, the factory's secret scan found nothing in the lines it adds, its dependency scan found nothing (versions not pinned exactly, packages from outside the npm registry, new install scripts), it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing`, `budget`, `hiddenTests` and `notify` are accepted for features still to come.
 
 ## Working on the Canvas side
 

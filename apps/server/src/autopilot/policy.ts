@@ -195,6 +195,7 @@ export interface MergeFacts {
   hiddenTestsOk: boolean | null; // null: not run
   reviewPassed: boolean; // a pass verdict with no finding of a blocking severity
   secretFindings: number;
+  dependencyFindings: string[]; // what the dependency scan flagged (unpinned, outside the registry, install scripts)
   files: string[]; // paths the work order changes
   linesChanged: number;
   newDependencies: string[]; // package names its package.json files add
@@ -237,6 +238,7 @@ export function evaluateMerge(policy: Policy, facts: MergeFacts): { auto: boolea
   if (facts.secretFindings > 0) reasons.push(`The secret scan found ${facts.secretFindings} possible secret(s) in the added lines.`);
   const unlisted = facts.newDependencies.filter((d) => !autoMerge.dependencyAllowlist.some((p) => p === d || path.posix.matchesGlob(d, p)));
   if (unlisted.length) reasons.push(`New dependencies not on the allowlist: ${some(unlisted)}.`);
+  if (facts.dependencyFindings.length) reasons.push(`The dependency scan found: ${some(facts.dependencyFindings, 5)}.`);
   const sensitive = facts.files.flatMap((f) => {
     const pattern = sensitiveMatch(f, autoMerge.sensitivePaths);
     return pattern ? [`${f} (${pattern})`] : [];

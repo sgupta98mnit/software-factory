@@ -127,7 +127,7 @@ test("merge: clean merges commit, conflicts abort and list the files; mergeInto 
   assert.equal(first.ok, true);
   assert.equal((await git(integration, ["log", "-1", "--format=%s"])).stdout.trim(), "Merge WO-1");
   assert.deepEqual(await diffStat(integration, base), { files: [{ path: "a.txt", added: 1, deleted: 1 }], linesChanged: 2 });
-  assert.deepEqual(await addedLines(integration, base), [{ path: "a.txt", line: "TWO" }]);
+  assert.deepEqual(await addedLines(integration, base), [{ path: "a.txt", line: "TWO", number: 2 }]);
 
   const second = await merge(integration, "autopilot-wo/x/wo-2", "Merge WO-2");
   assert.deepEqual(second, { ok: false, conflicts: ["a.txt"] });

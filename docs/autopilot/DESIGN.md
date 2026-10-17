@@ -37,6 +37,7 @@ Goal ─▶ spec agent ─▶ openspec validate --strict ─▶ commit ─▶ cr
 | `integrator.ts` | Merge into the integration worktree, gates again, reset on failure |
 | `policy.ts` | `.factory/policy.yml` from the base branch, validation, `evaluateMerge` |
 | `prompts.ts` | Every brief and follow-up, rebuilt from the ledger |
+| `scan.ts` | Secret scan of added lines, dependency scan of package.json changes |
 | `routes.ts` | HTTP API under `/sf-api/autopilot` (§5) |
 | `../demo/` | Fake agent server and scripted agents (tests, `pnpm demo`) |
 
@@ -144,7 +145,24 @@ or its work orders move.
   profile the policy names that doesn't exist) stops a run as a whole, once.
 - The API binds to 127.0.0.1 and rejects other Host headers.
 
-## 8. Changes since the first build
+## 8. Scans
+
+- A builder's branch is squashed to one commit after `baseSha` when it
+  finishes (`squash`), so what merges is exactly what the gates and the
+  reviewer checked; a branch that no longer contains its `baseSha` goes back
+  to the builder.
+- After the gates pass, `verify` scans the added lines for secrets (known key
+  and token formats, private keys, chat webhooks, hard-coded password-like
+  values with some entropy; lockfiles skipped). A finding is a repair round
+  that names the file, line and kind, never the value (`secret-scan` check,
+  `autopilot.secrets_found` audit).
+- The dependency scan flags package.json changes a person should see: versions
+  that aren't exact, sources outside the npm registry, new install scripts.
+  It never blocks the build; `mergeCheck` scans again on the branch as it will
+  merge and passes `secretFindings` and `dependencyFindings` to the policy,
+  so either sends the merge to a person with the reason.
+
+## 9. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

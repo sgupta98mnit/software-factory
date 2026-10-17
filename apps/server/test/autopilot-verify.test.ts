@@ -75,7 +75,12 @@ async function setup(handler: FakeHandler) {
     },
     wo: (runId: string, seq = 1) => ledger.getWorkOrder(`${runId}/WO-${seq}`)!,
     attempts: (runId: string, role: "builder" | "reviewer", seq = 1) => ledger.listAttempts({ runId, workOrderId: `${runId}/WO-${seq}`, role }),
-    checks: (runId: string, seq = 1) => ledger.listChecks({ runId, workOrderId: `${runId}/WO-${seq}` }).map((c) => `${c.name}:${c.ok ? "ok" : "failed"}`),
+    // Gate results (the secret and dependency scans have their own tests in autopilot-scan.test.ts).
+    checks: (runId: string, seq = 1) =>
+      ledger
+        .listChecks({ runId, workOrderId: `${runId}/WO-${seq}` })
+        .filter((c) => !c.name.endsWith("-scan"))
+        .map((c) => `${c.name}:${c.ok ? "ok" : "failed"}`),
     conv: (id: string | undefined) => fake.conversations.get(id ?? "") as FakeConversation,
   };
   return t;

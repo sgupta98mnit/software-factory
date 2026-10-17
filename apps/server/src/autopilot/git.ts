@@ -152,6 +152,21 @@ export async function commitPaths(dir: string, paths: string[], message: string)
   return headSha(dir);
 }
 
+/**
+ * Squashes everything after `base` into one commit (the same tree), so what
+ * merges is exactly what was checked and nothing a later commit removed
+ * (a secret, say) rides along in history. Returns the head; a branch with one
+ * commit after `base`, or none, is left as it is.
+ */
+export async function squash(dir: string, base: string, message: string): Promise<string> {
+  const count = Number((await git(dir, ["rev-list", "--count", `${base}..HEAD`])).stdout.trim());
+  if (count > 1) {
+    await git(dir, ["reset", "-q", "--soft", base]);
+    await git(dir, ["commit", "-q", "-m", message]);
+  }
+  return headSha(dir);
+}
+
 /** Files with uncommitted changes (new, changed or deleted), installed packages left out. */
 export async function changedFiles(dir: string): Promise<string[]> {
   const out = (await git(dir, ["status", "--porcelain", "-z", "--untracked-files=all", "--", ".", ":(exclude,glob)**/node_modules/**"])).stdout;
@@ -192,14 +207,20 @@ export async function diffStat(dir: string, base: string, head = "HEAD") {
   return { files, linesChanged: files.reduce((sum, f) => sum + f.added + f.deleted, 0) };
 }
 
-/** Every added line between `base` and `head`, for the secret scan. */
-export async function addedLines(dir: string, base: string, head = "HEAD"): Promise<{ path: string; line: string }[]> {
-  const out = (await git(dir, ["diff", "--unified=0", "--no-color", "--no-renames", `${base}...${head}`])).stdout;
-  const lines: { path: string; line: string }[] = [];
+/** Every added line between `base` and `head` with its number in the new file, for the secret scan. */
+export async function addedLines(dir: string, base: string, head = "HEAD"): Promise<{ path: string; line: string; number: number }[]> {
+  const out = (await git(dir, ["diff", "--unified=0", "--no-color", "--no-renames", "--no-prefix", `${base}...${head}`])).stdout;
+  const lines: { path: string; line: string; number: number }[] = [];
   let file = "";
+  let next = 0;
+  let inHunk = false; // an added line "++ x" shows as "+++ x": only a header before the first hunk
   for (const line of out.split("\n")) {
-    if (line.startsWith("+++ ")) file = line.slice(4).replace(/^b\//, "");
-    else if (line.startsWith("+") && file !== "/dev/null") lines.push({ path: file, line: line.slice(1) });
+    if (line.startsWith("diff --git ")) inHunk = false;
+    else if (!inHunk && line.startsWith("+++ ")) file = line.slice(4);
+    else if (line.startsWith("@@ ")) {
+      inHunk = true;
+      next = Number(/\+(\d+)/.exec(line)?.[1] ?? 0);
+    } else if (inHunk && line.startsWith("+") && file !== "/dev/null") lines.push({ path: file, line: line.slice(1), number: next++ });
   }
   return lines;
 }

@@ -1613,10 +1613,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..ec1f3ef
+index 0000000..21da76f
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,859 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2040,6 +2040,7 @@ index 0000000..ec1f3ef
 +      "autopilot.inbox_decided": "Decided",
 +      "autopilot.workspace_initialized": "Made the workspace a git repo",
 +      "autopilot.integration_restored": "Put the integration branch back",
++      "autopilot.secrets_found": "The secret scan found something",
 +    } as Record<string, string>,
 +  },
 +};
@@ -2462,6 +2463,7 @@ index 0000000..ec1f3ef
 +      "autopilot.workspace_initialized":
 +        "Convirtió el espacio de trabajo en repositorio git",
 +      "autopilot.integration_restored": "Restauró la rama de integración",
++      "autopilot.secrets_found": "El análisis de secretos encontró algo",
 +    },
 +  },
 +};

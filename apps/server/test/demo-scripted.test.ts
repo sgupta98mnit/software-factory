@@ -40,7 +40,7 @@ test("scripted agents: a valid spec first time, WO-2 repaired after its test fai
 
     await until(() => !!open("merge_approval"));
     assert.match(open("merge_approval")!.body, /Changes sensitive paths: src\/auth\/check\.js/);
-    const wo2 = ledger.listChecks({ runId: run.id, workOrderId: `${run.id}/WO-2` }).filter((c) => c.stage === "build");
+    const wo2 = ledger.listChecks({ runId: run.id, workOrderId: `${run.id}/WO-2` }).filter((c) => c.stage === "build" && c.name === "test");
     assert.deepEqual(wo2.map((c) => c.ok), [false, true]); // the deliberate bug, then the repair
     await o.decide(open("merge_approval")!.id, { choice: "merge" }, "user:test");
 

@@ -32,11 +32,15 @@ import {
   git,
   headSha,
   isClean,
+  addedLines,
+  isAncestor,
   isRepoRoot,
   mergeInto,
   removeWorktree,
   resetHard,
+  squash,
 } from "./git.js";
+import { describeFindings, scanDependencies, scanSecrets, type ScanFinding } from "./scan.js";
 import { prepareMerge, settleMerge, type MergeResult, type Prepared } from "./integrator.js";
 import type {
   Attempt,
@@ -755,8 +759,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const where = branch ? `branch \`${branch}\`` : "a detached HEAD";
       return repair(run, wo, [{ source: "agent", severity: "high", title: `The work is on ${where}, not on \`${wo.branch}\``, detail: `Bring your commits back to \`${wo.branch}\` and work only there.` }]);
     }
-    const sha = (await commitAll(dir, `WO-${wo.seq}: ${clip(wo.title, 72)}`)) ?? (await headSha(dir));
-    if (sha === wo.baseSha) {
+    const message = `WO-${wo.seq}: ${clip(wo.title, 72)}`;
+    await commitAll(dir, message);
+    const base = wo.baseSha as string;
+    if (!(await isAncestor(dir, base, "HEAD"))) {
+      return repair(run, wo, [{ source: "agent", severity: "high", title: `The branch no longer contains ${base.slice(0, 10)}, the integration commit it started from`, detail: `Don't reset or rebase \`${wo.branch}\`. Bring ${base.slice(0, 10)} back into it (git merge ${base.slice(0, 10)}) and keep your work on top.` }]);
+    }
+    // One commit per work order: what merges is exactly what the gates and the reviewer checked.
+    const sha = await squash(dir, base, message);
+    if (sha === base) {
       return repair(run, wo, [{ source: "agent", severity: "high", title: "Nothing was built: the branch has no changes", detail: "Build the work order with its tests, then commit." }]);
     }
     ledger.transaction(() => {
@@ -778,9 +789,30 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const { ok, results } = outcome;
     recordGates(run, wo, "build", results);
     if (!ok) return repair(run, wo, gateFindings(results));
+    // The factory's own scans of what the work order adds: a secret goes back to the builder; dependency
+    // findings are recorded here and decided at merge time by the policy (or a person).
+    const base = wo.baseSha as string;
+    const secrets = scanSecrets(await addedLines(dir, base, "HEAD"));
+    ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: "secret-scan", ok: !secrets.length, exitCode: secrets.length ? 1 : 0, output: secrets.length ? describeFindings(secrets) : "No secrets in the added lines." });
+    if (secrets.length) {
+      record(SYSTEM, "autopilot.secrets_found", run.id, { workOrder: `WO-${wo.seq}`, findings: secrets.length, rules: [...new Set(secrets.map((f) => f.rule))] });
+      return repair(run, wo, secretRepairs(secrets));
+    }
+    const deps = await scanDependencies(dir, base, "HEAD", (await diffStat(dir, base, "HEAD")).files.map((f) => f.path));
+    ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: "dependency-scan", ok: !deps.length, exitCode: deps.length ? 1 : 0, output: deps.length ? `A person decides these at merge time:\n${describeFindings(deps)}` : "No dependency changes to look at." });
     await discardChanges(dir); // what the gates left (build output), so anything left after the review is the reviewer's
     await startReviewer(run, wo);
   }
+
+  /** What the builder hears about secrets: where and what kind, never the value. */
+  const secretRepairs = (found: ScanFinding[]): Finding[] =>
+    found.map((f) => ({
+      source: "gate",
+      severity: "critical",
+      title: `Secret scan: ${f.file}${f.line ? `:${f.line}` : ""}: ${f.detail}`,
+      detail: "Remove it and read it from the environment or a secret store instead. The factory squashes your commits, so it won't stay in history.",
+      file: f.file,
+    }));
 
   /** One check per gate, and one audit record for the lot. */
   function recordGates(run: Run, wo: WorkOrder, stage: "build" | "integrate", results: GateResult[]) {
@@ -1053,7 +1085,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       gatesOk: true, // a work order is ready only once its gates have passed (verify)
       hiddenTestsOk: null, // not run yet (C11)
       reviewPassed: !!review?.verdict && passed(review, policy.review.blocking),
-      secretFindings: 0, // no secret scan yet (C10)
+      // Scanned again here, on the branch as it will merge (verify scanned the worktree).
+      secretFindings: scanSecrets(await addedLines(workspace, base, head)).length,
+      dependencyFindings: (await scanDependencies(workspace, base, head, files)).map((f) => `${f.file}: ${f.detail}`),
       files,
       linesChanged: stat.linesChanged,
       newDependencies: await newDependencies(workspace, base, head, files),

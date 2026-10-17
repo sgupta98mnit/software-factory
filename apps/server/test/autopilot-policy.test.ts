@@ -139,6 +139,7 @@ const OK: MergeFacts = {
   hiddenTestsOk: true,
   reviewPassed: true,
   secretFindings: 0,
+  dependencyFindings: [],
   files: ["src/sum.js", "src/sum.test.js"],
   linesChanged: 40,
   newDependencies: [],
@@ -157,6 +158,7 @@ test("evaluateMerge: auto only when every check holds; each one that doesn't is 
     [{ reviewPassed: false }, "The review didn't pass, or found something critical or high."],
     [{ secretFindings: 2 }, "The secret scan found 2 possible secret(s) in the added lines."],
     [{ newDependencies: ["left-pad"] }, "New dependencies not on the allowlist: left-pad."],
+    [{ dependencyFindings: ["package.json: zod@^3.0.0 isn't pinned to an exact version"] }, "The dependency scan found: package.json: zod@^3.0.0 isn't pinned to an exact version."],
     [{ files: ["src/sum.js", "src/auth/login.ts"] }, "Changes sensitive paths: src/auth/login.ts (**/auth/**)."],
     [{ linesChanged: 400 }, "Changes 400 lines; the policy merges fewer than 400 on its own."],
   ];
