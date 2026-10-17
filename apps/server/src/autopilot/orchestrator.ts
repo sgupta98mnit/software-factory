@@ -1103,6 +1103,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const dir = rev.dir as string;
     if (rev.stage === "writing") {
       const a = latest(run.id, "spec");
+      // A restart whose fresh agent couldn't be started (the agent server looked away) starts it now.
+      if (a && restarted(a)) return startAgent(ledger.getRun(run.id) ?? run, "spec");
       if (!a || ACTIVE.has(a.state) || a.state === "paused" || handled(a)) return;
       if (a.state !== "finished") {
         const why = await whyStopped(a, "The spec agent");

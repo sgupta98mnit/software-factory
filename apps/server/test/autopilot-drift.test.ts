@@ -204,3 +204,39 @@ test("a spec change that stops twice waits for a person; Drop leaves the spec an
     await t.close();
   }
 });
+
+test("a revising spec agent that crashes, and whose fresh agent can't start at that moment, still gets its one restart", async () => {
+  const scripted = scriptedAgents({ noBugs: true });
+  let crashed: string | undefined;
+  const t = await setup(async (conv, text) => {
+    if (conv.tags.sfrole === "spec" && conv.messages[0]?.includes("<change-request>")) {
+      if (!crashed) {
+        crashed = conv.id;
+        return { response: "Crashed.", status: "error" as const };
+      }
+      return { response: "Nothing to change after all." };
+    }
+    return scripted(conv, text);
+  });
+  try {
+    const run = await t.o.createRun({ goal: "Let applicants check a claim's status", autonomy: "supervised", actor: "user:po" });
+    await t.until(() => t.ledger.getRun(run.id)?.state === "building");
+    await t.o.reviseSpec(run.id, "Make the status page bilingual.", "user:po");
+    // Right after the crash is seen, the agent server refuses the profile lookup once.
+    let armed = false;
+    t.fake.setFault((method, p) => {
+      if (crashed && method === "GET" && p === `/api/conversations/${crashed}`) armed = true;
+      if (armed && method === "GET" && p === "/api/agent-profiles") {
+        armed = false;
+        t.fake.setFault(undefined);
+        return [503, { detail: "Service Unavailable" }];
+      }
+      return undefined;
+    });
+    await t.until(() => t.ledger.getRun(run.id)?.revision === null && t.ledger.listAttempts({ runId: run.id, role: "spec" }).length === 3, 60);
+    assert.deepEqual((await auditOf(run.id, "autopilot.agent_restarted")).map((e) => e.data.role), ["spec"]);
+    assert.equal((await auditOf(run.id, "autopilot.spec_revision_unchanged")).length, 1);
+  } finally {
+    await t.close();
+  }
+});
