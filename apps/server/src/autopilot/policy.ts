@@ -50,7 +50,14 @@ export const DEFAULT_POLICY: Policy = {
   gates: null,
   autoMerge: {
     maxChangedLines: 400,
-    sensitivePaths: ["**/auth/**", "**/crypto/**", "infra/**", "**/*.tf", "Dockerfile", ".github/**", ".gitlab-ci.yml", ".factory/**", "AGENTS.md", "CLAUDE.md", "**/migrations/**"],
+    sensitivePaths: [
+      "**/auth/**", "**/auth.*", "**/crypto/**", "**/*crypto*", "**/migrations/**",
+      ".env", ".env.local", ".env.*.local", ".env.production", ".env.development", "**/*.pem", "**/*.key",
+      "infra/**", "**/terraform/**", "**/*.tf", "**/*.tfvars", "**/k8s/**", "**/helm/**",
+      "Dockerfile*", "docker-compose*.yml", "docker-compose*.yaml",
+      "**/.github/**", ".gitlab/**", ".gitlab-ci.yml", "Jenkinsfile",
+      ".factory/**", "AGENTS.md", "CLAUDE.md",
+    ],
     dependencyAllowlist: [],
   },
   budget: { perWorkOrderUsd: 5, perChangeUsd: 30 },

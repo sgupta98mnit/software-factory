@@ -371,3 +371,50 @@ test("#4: gates run outside the run's lock: Pause and Cancel come back at once w
     await t.close();
   }
 });
+
+const { DEFAULT_POLICY, sensitiveMatch } = await import("../src/autopilot/policy.js");
+const { createAutopilotRoutes } = await import("../src/autopilot/routes.js");
+
+test("#12: the default sensitive paths catch common sensitive files without flagging ordinary ones", () => {
+  const caught = ["src/crypto.js", "lib/auth.ts", "Dockerfile.prod", "deploy/docker-compose.prod.yml", ".env", "api/.env.local", "Jenkinsfile", ".gitlab/ci.yml", "packages/web/.github/workflows/ci.yml", "certs/server.pem", "infra/main.tf", "prod.tfvars", "k8s/deploy.yaml"];
+  const ordinary = ["src/config/env.ts", "src/author.js", ".env.example", "README.md", "src/routes.ts", "docs/environment.md"];
+  for (const f of caught) assert.ok(sensitiveMatch(f, DEFAULT_POLICY.autoMerge.sensitivePaths), `${f} should need a person`);
+  for (const f of ordinary) assert.equal(sensitiveMatch(f, DEFAULT_POLICY.autoMerge.sensitivePaths), undefined, `${f} shouldn't`);
+});
+
+test("#11: dotenv files with real values are never committed, by ensureRepo or by commitAll; templates are", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "sf-harden-env-ws-"));
+  for (const f of [".env", ".env.local", ".env.example", "app.js"]) writeFileSync(path.join(dir, f), "X=1\n");
+  await ensureRepo(dir);
+  const tracked = () => git(dir, ["ls-files"]).then((r) => r.stdout.trim().split("\n").sort());
+  assert.deepEqual(await tracked(), [".env.example", "app.js"]);
+  mkdirSync(path.join(dir, "api"));
+  writeFileSync(path.join(dir, "api", ".env.production"), "SECRET=1\n");
+  writeFileSync(path.join(dir, "api", "server.js"), "x\n");
+  await commitAll(dir, "more");
+  assert.deepEqual(await tracked(), [".env.example", "api/server.js", "app.js"]);
+});
+
+test("#9: the ETA counts rounds per remaining wave, and is null for a run that isn't building", async () => {
+  const t = await setup(byRole({}));
+  try {
+    const run = await t.buildingRun(0);
+    const wo = (seq: number, wave: number, state: string) => ({ seq, title: `T${seq}`, acceptance: ["x"], controls: [], dependsOn: [], wave, risk: "low" as const, state: state as "pending" });
+    t.ledger.addWorkOrders(run.id, [wo(1, 1, "merged"), wo(2, 1, "merged"), wo(3, 2, "pending"), wo(4, 2, "building"), wo(5, 3, "pending")]);
+    // WO-1 took 60 s and WO-2 120 s from first builder to merge: median 90 s.
+    const started = (seq: number, ago: number) => {
+      const a = t.ledger.addAttempt({ runId: run.id, workOrderId: `${run.id}/WO-${seq}`, role: "builder", conversationId: `c${seq}` });
+      const merged = Date.parse(t.ledger.getWorkOrder(`${run.id}/WO-${seq}`)!.updatedAt);
+      t.ledger.updateAttempt(a.id, { startedAt: new Date(merged - ago).toISOString() });
+    };
+    started(1, 60_000);
+    started(2, 120_000);
+    const app = createAutopilotRoutes(t.o);
+    const eta = async () => ((await (await app.request(`/runs/${run.id}`)).json()) as { etaMs: number | null }).etaMs;
+    assert.equal(await eta(), 90_000 * 2); // wave 2 (two, parallel 3) is one round, wave 3 another
+    t.ledger.updateRun(run.id, { state: "done" });
+    assert.equal(await eta(), null);
+  } finally {
+    await t.close();
+  }
+});

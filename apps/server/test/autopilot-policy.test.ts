@@ -130,7 +130,7 @@ test("policyHash: the same rules always hash the same, however the file writes t
   assert.notEqual(policyHash(a), policyHash(parsePolicy("parallel: 2\nrepair: { fresh: 0, sameConversation: 2 }\n")));
   assert.equal(policyHash(parsePolicy("parallel: 3\n")), policyHash(DEFAULT_POLICY)); // the defaults, written out
   // Pinned: changing a default changes the actor of every new run's policy approvals. Update this on purpose.
-  assert.equal(policyHash(DEFAULT_POLICY), "6a4216da9355");
+  assert.equal(policyHash(DEFAULT_POLICY), "db1746b4103c"); // wider sensitivePaths (OPEN-ISSUES #12)
 });
 
 const OK: MergeFacts = {
@@ -180,12 +180,14 @@ test("sensitiveMatch: the default sensitive paths, whatever the case, in dot fol
     ["src/Auth/Login.ts", "**/auth/**"],
     [".config/auth/keys.json", "**/auth/**"],
     ["lib/crypto/aes.ts", "**/crypto/**"],
+    ["src/crypto.js", "**/*crypto*"],
     ["infra/network/vpc.yml", "infra/**"],
     ["modules/vpc.tf", "**/*.tf"],
     ["main.tf", "**/*.tf"],
-    ["Dockerfile", "Dockerfile"],
-    ["services/api/Dockerfile", "Dockerfile"],
-    [".github/workflows/ci.yml", ".github/**"],
+    ["Dockerfile", "Dockerfile*"],
+    ["services/api/Dockerfile", "Dockerfile*"],
+    ["Dockerfile.dev", "Dockerfile*"],
+    [".github/workflows/ci.yml", "**/.github/**"],
     [".gitlab-ci.yml", ".gitlab-ci.yml"],
     [".factory/policy.yml", ".factory/**"],
     ["AGENTS.md", "AGENTS.md"],
@@ -193,7 +195,7 @@ test("sensitiveMatch: the default sensitive paths, whatever the case, in dot fol
     ["db/migrations/001_init.sql", "**/migrations/**"],
   ];
   for (const [file, pattern] of sensitive) assert.equal(sensitiveMatch(file, sensitivePaths), pattern, file);
-  for (const file of ["src/author.ts", "src/routes/authors.ts", "docs/infra/README.md", "infrastructure.md", "Dockerfile.dev", "README.md", "package.json"]) {
+  for (const file of ["src/author.ts", "src/routes/authors.ts", "docs/infra/README.md", "infrastructure.md", "README.md", "package.json"]) {
     assert.equal(sensitiveMatch(file, sensitivePaths), undefined, file);
   }
 });

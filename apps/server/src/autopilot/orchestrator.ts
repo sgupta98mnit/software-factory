@@ -1030,7 +1030,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const next = wos.find((w) => w.state === "merging" && w.preMergeSha) ?? wos.find((w) => w.state === "merging");
     if (next) await integrate(run, next).catch((err) => integrateFailed(run, next, err));
     for (const wo of ledger.listWorkOrders(run.id)) if (wo.state === "merged" && wo.worktree) await cleanUp(run, wo);
-    if (ledger.getRun(run.id)?.state === "building" && ledger.listWorkOrders(run.id).every((w) => DONE_WO.has(w.state))) await finish(run);
+    // Done once everything is merged or skipped, and every merged work order's worktree is gone (a failed clean-up retries first).
+    const all = ledger.listWorkOrders(run.id);
+    if (ledger.getRun(run.id)?.state === "building" && all.every((w) => DONE_WO.has(w.state)) && !all.some((w) => w.state === "merged" && w.worktree)) await finish(run);
   }
 
   /**

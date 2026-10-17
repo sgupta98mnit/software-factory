@@ -20,8 +20,10 @@ const BASE_ARGS = [
   "-c", "user.email=factory@localhost",
 ];
 
-// Everything but installed packages: agents run npm install in worktrees that may have no .gitignore.
-const ADD_ALL = ["add", "-A", "--", ".", ":(exclude,glob)**/node_modules/**"];
+// Everything but installed packages (agents run npm install in worktrees that may have no .gitignore)
+// and dotenv files that hold real values. Templates like .env.example are committed.
+const NEVER_COMMIT = ["node_modules/**", ".env", ".env.local", ".env.*.local", ".env.development", ".env.production", ".env.staging", ".env.test"];
+const ADD_ALL = ["add", "-A", "--", ".", ...NEVER_COMMIT.map((p) => `:(exclude,glob)**/${p}`)];
 
 /** Runs git in `cwd`. Throws on a non-zero exit unless `allowFail`. */
 export function git(cwd: string, args: string[], opts: { allowFail?: boolean } = {}): Promise<GitResult> {

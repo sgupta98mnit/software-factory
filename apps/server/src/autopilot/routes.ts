@@ -16,8 +16,13 @@ const FINISHED_WO = new Set<string>(["merged", "skipped", "cancelled"]);
 const money = (usd: number) => Math.round(usd * 1000) / 1000;
 const attemptView = ({ seenRunning: _s, lastSentAt: _l, ...a }: Attempt) => ({ ...a, costUsd: money(a.costUsd) });
 
-/** median(dispatch -> merged) of merged work orders x the waves of work left; null until one has merged. */
-function etaMs(workOrders: WorkOrder[], attempts: Attempt[], parallel: number): number | null {
+/**
+ * median(dispatch -> merged) of merged work orders times the rounds of work
+ * left: each wave with unfinished work orders takes ceil(their number /
+ * parallel) rounds. null until one has merged, and for a run that isn't building.
+ */
+function etaMs(state: string, workOrders: WorkOrder[], attempts: Attempt[], parallel: number): number | null {
+  if (state !== "building") return null;
   const durations = workOrders
     .filter((w) => w.state === "merged")
     .map((w) => {
@@ -29,8 +34,10 @@ function etaMs(workOrders: WorkOrder[], attempts: Attempt[], parallel: number): 
   if (!durations.length) return null;
   const mid = durations.length / 2;
   const median = durations.length % 2 ? (durations[Math.floor(mid)] ?? 0) : ((durations[mid - 1] ?? 0) + (durations[mid] ?? 0)) / 2;
-  const remaining = workOrders.filter((w) => !FINISHED_WO.has(w.state)).length;
-  return median * Math.ceil(remaining / parallel);
+  const perWave = new Map<number, number>();
+  for (const w of workOrders) if (!FINISHED_WO.has(w.state)) perWave.set(w.wave, (perWave.get(w.wave) ?? 0) + 1);
+  const rounds = [...perWave.values()].reduce((sum, n) => sum + Math.ceil(n / parallel), 0);
+  return median * rounds;
 }
 
 export function createAutopilotRoutes(o: Orchestrator) {
@@ -133,7 +140,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       attempts: attempts.map(attemptView),
       checks: ledger.listChecks({ runId: run.id }),
       inbox: ledger.listInbox({ state: "all", runId: run.id }).map(inboxView),
-      etaMs: etaMs(workOrders, attempts, pinnedPolicy(run).parallel),
+      etaMs: etaMs(run.state, workOrders, attempts, pinnedPolicy(run).parallel),
     });
   });
 
