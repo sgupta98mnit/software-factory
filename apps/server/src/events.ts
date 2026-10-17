@@ -7,7 +7,8 @@ import { streamSSE } from "hono/streaming";
 export type FactoryEvent =
   | { type: "workorders.changed" }
   | { type: "specs.changed" }
-  | { type: "audit.appended"; seq: number };
+  | { type: "audit.appended"; seq: number }
+  | { type: "autopilot.changed"; runId?: string };
 
 type Listener = (event: FactoryEvent) => void;
 const listeners = new Set<Listener>();

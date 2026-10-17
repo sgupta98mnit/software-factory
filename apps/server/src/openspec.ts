@@ -11,12 +11,12 @@ const CHANGES_DIR = path.join(WORKSPACE, "openspec", "changes");
 const SPECS_DIR = path.join(WORKSPACE, "openspec", "specs");
 const SAFE_ID = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)*$/i;
 
-function run(args: string[]): Promise<unknown> {
+export function run(args: string[], cwd = WORKSPACE): Promise<unknown> {
   return new Promise((resolve, reject) => {
     execFile(
       process.execPath,
       [tools.openspec.script, ...args, "--json"],
-      { cwd: WORKSPACE, env: childEnv(), maxBuffer: 20 * 1024 * 1024, windowsHide: true },
+      { cwd, env: childEnv(), maxBuffer: 20 * 1024 * 1024, windowsHide: true },
       (error, stdout, stderr) => {
         // `validate` exits 1 when something fails but still prints JSON, so try stdout first.
         try {
@@ -85,6 +85,24 @@ export async function specDetail(id: string) {
 
 export function validateAll() {
   return run(["validate", "--all"]);
+}
+
+export interface ValidationIssue {
+  level: string; // ERROR, WARNING, INFO
+  path: string;
+  message: string;
+}
+
+/** `openspec validate <change> --strict` in `cwd` (an Autopilot worktree). Strict mode fails on warnings too. */
+export async function validateChange(change: string, cwd: string): Promise<{ valid: boolean; issues: ValidationIssue[] }> {
+  assertId(change);
+  const out = (await run(["validate", change, "--type", "change", "--strict", "--no-interactive"], cwd)) as {
+    items?: { valid?: boolean; issues?: ValidationIssue[] }[];
+    status?: { message?: string }[]; // an unknown change: no item, just a status message
+  };
+  const item = out.items?.[0];
+  if (item) return { valid: item.valid === true, issues: item.issues ?? [] };
+  return { valid: false, issues: (out.status ?? []).map((s) => ({ level: "ERROR", path: "", message: s.message ?? "" })) };
 }
 
 export const openspecDir = path.join(WORKSPACE, "openspec");

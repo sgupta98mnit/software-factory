@@ -6,9 +6,23 @@ import path from "node:path";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { audit, listAudit, verifyAudit } from "./audit.js";
+import { openLedger } from "./autopilot/ledger.js";
+import { OpenHandsClient } from "./autopilot/openhands.js";
+import { createOrchestrator } from "./autopilot/orchestrator.js";
+import { createAutopilotRoutes } from "./autopilot/routes.js";
 import { getWorkOrder, linkConversation, listWorkOrders, setStatus, watchBacklog } from "./backlog.js";
 import { changeBrief, workOrderBrief } from "./briefs.js";
-import { AGENT_WORKSPACE, HOST, LOCAL_USER, PORT, WORKSPACE } from "./config.js";
+import {
+  AGENT_SERVER_URL,
+  AGENT_WORKSPACE,
+  AUTOPILOT_DB,
+  DATA_DIR,
+  HOST,
+  LOCAL_USER,
+  PORT,
+  WORKSPACE,
+  agentServerKey,
+} from "./config.js";
 import { broadcast, eventStream } from "./events.js";
 import { assertChange, changeDetail, openspecDir, overview, specDetail, validateAll } from "./openspec.js";
 import { createWorkOrders, planWorkOrders } from "./planner.js";
@@ -86,6 +100,16 @@ app.post("/workorders/:id/conversations", async (c) => {
 app.get("/audit", (c) => c.json(listAudit()));
 app.get("/audit/verify", (c) => c.json(verifyAudit()));
 
+// ---- autopilot: goal -> spec -> plan -> build, with agents on the OpenHands agent server ----
+const ledger = openLedger(AUTOPILOT_DB);
+const autopilot = createOrchestrator({
+  ledger,
+  client: new OpenHandsClient({ baseUrl: AGENT_SERVER_URL, apiKey: agentServerKey }),
+  workspace: WORKSPACE,
+  dataDir: DATA_DIR,
+});
+app.route("/autopilot", createAutopilotRoutes(autopilot));
+
 watchBacklog();
 try {
   let t: NodeJS.Timeout | undefined;
@@ -100,7 +124,14 @@ try {
 serve({ fetch: app.fetch, port: PORT, hostname: HOST }, () => {
   console.log(`Factory API on http://${HOST}:${PORT}/sf-api`);
   console.log(`Workspace: ${WORKSPACE}${existsSync(WORKSPACE) ? "" : "  (missing!)"}`);
+  autopilot.start(3000);
 });
 void audit("system", "server.started", "server", { workspace: path.basename(WORKSPACE) });
 
-for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => process.exit(0));
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    autopilot.stop();
+    ledger.close();
+    process.exit(0);
+  });
+}

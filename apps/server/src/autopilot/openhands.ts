@@ -97,7 +97,7 @@ function detailOf(body: unknown): string | undefined {
 const userMessage = (text: string) => ({ role: "user", content: [{ type: "text", text }], run: true });
 
 export class OpenHandsClient {
-  private readonly baseUrl: string;
+  readonly baseUrl: string;
   private readonly apiKey: () => string | undefined;
   private readonly fetch: typeof fetch;
   private readonly timeoutMs: number;
