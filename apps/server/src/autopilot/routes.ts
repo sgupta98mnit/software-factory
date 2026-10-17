@@ -12,6 +12,7 @@ import { pinnedPolicy } from "./policy.js";
 import { buildEvidence } from "./evidence.js";
 import { audit, listAudit } from "../audit.js";
 import { buildInsights } from "./learning.js";
+import { computeMetrics } from "./metrics.js";
 import { INTAKE_SOURCES, signatureOk, type IntakeSource } from "./intake.js";
 
 // Work-order states that count as in progress.
@@ -270,6 +271,10 @@ export function createAutopilotRoutes(o: Orchestrator) {
 
   // What the factory has learned: per policy hash, how its merge rules fared; and the AGENTS.md lessons.
   app.get("/insights", (c) => c.json(buildInsights(ledger, listAudit(Number.MAX_SAFE_INTEGER))));
+  app.get("/metrics", (c) => {
+    const days = Number(c.req.query("days") ?? 30);
+    return c.json(computeMetrics(ledger, listAudit(Number.MAX_SAFE_INTEGER), { days: Number.isFinite(days) ? days : 30 }));
+  });
   app.get("/lessons", (c) => c.json(ledger.listLessons()));
 
   app.get("/inbox", (c) => {

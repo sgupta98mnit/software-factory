@@ -593,7 +593,35 @@ Templates (recommended, cautious, federal, hands-off) each parse under
   intake `run`) decision with its reason; the Pipeline's work-order panel
   shows `mergeWhy`.
 
-## 24. Changes since the first build
+## 24. Metrics
+
+- `GET /metrics?days=N` (1 to 365, default 30; metrics.ts) is computed on
+  each request from the ledger and the audit log, for the runs started in the
+  window. Nothing is stored or estimated.
+- **Lead time:** creation to `releasedAt`, and creation to the first
+  `run_completed` (ready to release). Each has a median and 90th percentile
+  (nearest rank) and a sample count.
+- **Autonomy:** merged work orders split by `mergedBy` (`policy@…` or a
+  person), with the rate as the policy's share. `personDecisions` counts
+  Inbox items decided by a `user:` actor, leaving out `superseded`.
+  `runsWithoutPeople` counts finished runs whose only person decision was the
+  release.
+- **Cost:** the total of every attempt's cost; per finished run (done or
+  released); and per merged work order.
+- **Failures:** counted once per work order or run each happened to:
+  - build-stage gate failures by name; the secret and dependency scans;
+    hidden tests (one entry); no gates at all;
+  - review verdicts that didn't pass;
+  - watchdog stops, and agent errors other than lost conversations;
+  - `work_order_failed`, `spec_failed` and `budget_reached` items;
+  - merge conflicts, merges reverted after tests, and failed releases.
+  The top ten come back, including problems the factory repaired on its own.
+- `policies` is `buildInsights` (§20), limited to policies used in the
+  window. The Metrics page (sidebar, `/autopilot/metrics`) shows four stat
+  cards, the failure reasons as bars, and one card per policy hash, marking
+  the base branch's current one. You can choose 7, 30 or 90 days.
+
+## 25. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

@@ -161,6 +161,16 @@ The spec can change while a run builds. **Change the spec** on the Pipeline send
 
 The factory learns from its runs without another agent. When builders make the same mistake `learning.threshold` times across runs (a gate that fails on the first try, secrets the scan catches, unpinned dependencies), it proposes a line for the workspace's `AGENTS.md`, which every agent reads, as an Inbox decision. Accepting commits that one line to the base branch in your name. Declining, or accepting, means it's never proposed again. `GET /sf-api/autopilot/insights` reports, per policy hash, how many work orders the policy merged by itself, and for each reason it held one for a person, how often people merged it, sent it back or skipped it. A reason people always merge is a rule stricter than it needs to be.
 
+### Metrics
+
+The **Metrics** page (sidebar) shows how the factory is doing for runs started in the last 7, 30 or 90 days:
+- **Lead time:** from the goal to its release, as a median and 90th percentile.
+- **Autonomy rate:** the share of merged work orders the policy merged without a person.
+- **Cost per change:** agent spend per finished run, and per merged work order.
+- **What goes wrong most:** gates that failed, scans that caught something, reviews that asked for changes, agents the watchdog stopped, merge conflicts, budgets reached, releases that didn't go through. Each is counted once per work order or run.
+
+It also has one card per version of the policy (`policy@<hash>`), comparing how each set of rules did. Every number comes from the ledger and the audit log (`GET /sf-api/autopilot/metrics?days=30`).
+
 ### More than one project
 
 `SF_WORKSPACE` is the factory's default workspace. Add others on Home (**Add a workspace**: a name and the project's folder on this machine). Each gets its own ledger, worktrees and hidden tests under `data/workspaces/<id>/`, and follows the policy on its own base branch. All of them share the agent server, the gate slots (`SF_GATE_CONCURRENCY` is factory-wide) and the one audit log. Home's picker chooses which one you're looking at. The Inbox lists every workspace's decisions, each labelled with its workspace, and its links open the run in the right one. The list is kept in `data/workspaces.json`; a workspace can be removed (`DELETE /sf-api/workspaces/<id>`) once its runs are finished, and its data stays on disk.

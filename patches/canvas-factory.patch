@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..8be7446
+index 0000000..7b50a57
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,805 @@
+@@ -0,0 +1,862 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -664,6 +664,62 @@ index 0000000..8be7446
 +  explanation: string[];
 +}
 +
++/** Median and 90th percentile of a duration, in ms (null with no samples). */
++export interface Spread {
++  medianMs: number | null;
++  p90Ms: number | null;
++  samples: number;
++}
++
++/** GET /insights, one entry per policy hash: how its rules did. */
++export interface PolicyInsight {
++  hash: string;
++  runs: number;
++  released: number;
++  firstRun: string;
++  lastRun: string;
++  merges: { policy: number; person: number };
++  reasons: {
++    reason: string;
++    asked: number;
++    merged: number;
++    sentBack: number;
++    skipped: number;
++  }[];
++  releaseFailures: number;
++  flakyGates: number;
++  notes: string[];
++}
++
++/** GET /metrics: runs started in the window. */
++export interface Metrics {
++  window: { days: number; from: string; to: string };
++  runs: {
++    started: number;
++    released: number;
++    done: number;
++    failed: number;
++    cancelled: number;
++    active: number;
++  };
++  leadTime: { toRelease: Spread; toReady: Spread };
++  autonomy: {
++    merged: number;
++    byPolicy: number;
++    byPerson: number;
++    rate: number | null;
++    runsWithoutPeople: number;
++    personDecisions: number;
++  };
++  cost: {
++    totalUsd: number;
++    perChangeUsd: number | null;
++    perMergedWorkOrderUsd: number | null;
++  };
++  failures: { reason: string; count: number }[];
++  policies: PolicyInsight[];
++}
++
 +/** One line of Home's setup checklist (GET /setup), with its one-click fix when there is one. */
 +export interface SetupItem {
 +  id: string;
@@ -897,6 +953,7 @@ index 0000000..8be7446
 +    post<PolicyCheck>(ap("/policy/check"), { yaml }),
 +  writePolicy: (body: { yaml?: string; template?: string }) =>
 +    post<PolicyView>(ap("/policy"), body),
++  metrics: (days: number) => request<Metrics>(ap(`/metrics?days=${days}`)),
 +  workspaces: () => request<WorkspaceSummary[]>("/workspaces"),
 +  addWorkspace: (body: { name: string; path: string }) =>
 +    post<WorkspaceSummary>("/workspaces", body),
@@ -2408,10 +2465,10 @@ index 0000000..ea4084e
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..4318c81
+index 0000000..3a0fa78
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1285 @@
+@@ -0,0 +1,1414 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2432,6 +2489,7 @@ index 0000000..4318c81
 +    workOrders: "Work orders",
 +    audit: "Audit log",
 +    policy: "Policy",
++    metrics: "Metrics",
 +  },
 +  common: {
 +    loading: "Loading…",
@@ -2777,6 +2835,70 @@ index 0000000..4318c81
 +    showWhat: "What it does",
 +    committed: "Committed. New runs follow it.",
 +  },
++  metrics: {
++    title: "Metrics",
++    subtitle: (days: number) =>
++      `Runs started in the last ${days} days. Counted from the ledger and the audit log; nothing is estimated.`,
++    window: "Period",
++    days: (n: number) => `${n} days`,
++    empty: (days: number) =>
++      `No runs started in the last ${days} days. Start one from Autopilot, or choose a longer period.`,
++    leadTime: "Lead time",
++    leadTimeHelp: "From the goal to its release into the base branch.",
++    median: (d: string) => `${d} median`,
++    p90: (d: string) => `90% within ${d}`,
++    toReady: (d: string) => `Ready to release: ${d} median`,
++    noRelease: "Nothing released yet",
++    samples: (n: number) => (n === 1 ? "1 run" : `${n} runs`),
++    autonomy: "Autonomy rate",
++    autonomyHelp: "Work orders the policy merged without a person.",
++    merged: (byPolicy: number, merged: number) =>
++      `${byPolicy} of ${merged} merged work orders`,
++    noMerges: "No work order merged yet",
++    withoutPeople: (n: number) =>
++      n === 0
++        ? "Every finished run needed a person before its release"
++        : n === 1
++          ? "1 finished run needed a person only to release it"
++          : `${n} finished runs needed a person only to release them`,
++    decisions: (n: number) =>
++      n === 1 ? "1 decision by a person" : `${n} decisions by people`,
++    cost: "Cost per change",
++    costHelp: "Agent spend per finished run (done or released).",
++    perWorkOrder: (usd: string) => `${usd} per merged work order`,
++    total: (usd: string) => `${usd} spent in all`,
++    noCost: "No finished run yet",
++    runs: "Runs",
++    runsHelp: "Started in the period, by where they are now.",
++    runStates: {
++      released: "released",
++      done: "ready to release",
++      active: "under way",
++      failed: "failed",
++      cancelled: "cancelled",
++    } as Record<string, string>,
++    failures: "What goes wrong most",
++    failuresHelp:
++      "Counted once per work order or run it happened to, including problems the factory repaired on its own.",
++    noFailures: "Nothing went wrong in this period.",
++    times: (n: number) => (n === 1 ? "1 time" : `${n} times`),
++    policies: "By policy",
++    policiesHelp:
++      "Each policy@hash is one version of .factory/policy.yml. Runs keep the version they started with, so this compares the rules.",
++    policyRuns: (runs: number, released: number) =>
++      `${runs === 1 ? "1 run" : `${runs} runs`}, ${released} released`,
++    policyMerges: (policy: number, person: number) =>
++      `Merges: ${policy} by the policy, ${person} by people`,
++    releaseFailures: (n: number) =>
++      n === 1
++        ? "1 release didn't go through"
++        : `${n} releases didn't go through`,
++    asked: "Asked a person because",
++    reasonCounts: (asked: number, merged: number, sentBack: number) =>
++      `${asked} asked · ${merged} merged as they were · ${sentBack} sent back`,
++    current: "current",
++    openPolicy: "Open the policy",
++  },
 +  setup: {
 +    ready: (n: number, of: number) => `${n} of ${of} ready`,
 +    done: "Done",
@@ -3065,6 +3187,7 @@ index 0000000..4318c81
 +    workOrders: "Órdenes de trabajo",
 +    audit: "Registro de auditoría",
 +    policy: "Política",
++    metrics: "Métricas",
 +  },
 +  common: {
 +    loading: "Cargando…",
@@ -3408,6 +3531,69 @@ index 0000000..4318c81
 +    showWhat: "Qué hace",
 +    committed: "Confirmada. Las nuevas ejecuciones la siguen.",
 +  },
++  metrics: {
++    title: "Métricas",
++    subtitle: (days) =>
++      `Ejecuciones iniciadas en los últimos ${days} días. Contadas del registro y la auditoría; nada es una estimación.`,
++    window: "Periodo",
++    days: (n) => `${n} días`,
++    empty: (days) =>
++      `No se inició ninguna ejecución en los últimos ${days} días. Inicie una desde el piloto automático o elija un periodo más largo.`,
++    leadTime: "Tiempo de entrega",
++    leadTimeHelp: "Del objetivo a su publicación en la rama base.",
++    median: (d) => `${d} de mediana`,
++    p90: (d) => `el 90 % en menos de ${d}`,
++    toReady: (d) => `Lista para publicar: ${d} de mediana`,
++    noRelease: "Nada publicado todavía",
++    samples: (n) => (n === 1 ? "1 ejecución" : `${n} ejecuciones`),
++    autonomy: "Tasa de autonomía",
++    autonomyHelp: "Órdenes de trabajo que la política integró sin una persona.",
++    merged: (byPolicy, merged) => `${byPolicy} de ${merged} órdenes integradas`,
++    noMerges: "Ninguna orden integrada todavía",
++    withoutPeople: (n) =>
++      n === 0
++        ? "Toda ejecución terminada necesitó a una persona antes de publicarse"
++        : n === 1
++          ? "1 ejecución terminada necesitó a una persona solo para publicarla"
++          : `${n} ejecuciones terminadas necesitaron a una persona solo para publicarlas`,
++    decisions: (n) =>
++      n === 1 ? "1 decisión de una persona" : `${n} decisiones de personas`,
++    cost: "Costo por cambio",
++    costHelp: "Gasto en agentes por ejecución terminada (lista o publicada).",
++    perWorkOrder: (usd) => `${usd} por orden integrada`,
++    total: (usd) => `${usd} en total`,
++    noCost: "Ninguna ejecución terminada todavía",
++    runs: "Ejecuciones",
++    runsHelp: "Iniciadas en el periodo, según dónde están ahora.",
++    runStates: {
++      released: "publicadas",
++      done: "listas para publicar",
++      active: "en curso",
++      failed: "fallidas",
++      cancelled: "canceladas",
++    },
++    failures: "Lo que más falla",
++    failuresHelp:
++      "Contado una vez por orden o ejecución afectada, incluidos los problemas que la fábrica reparó por sí sola.",
++    noFailures: "Nada falló en este periodo.",
++    times: (n) => (n === 1 ? "1 vez" : `${n} veces`),
++    policies: "Por política",
++    policiesHelp:
++      "Cada policy@hash es una versión de .factory/policy.yml. Las ejecuciones conservan la versión con la que empezaron, así que esto compara las reglas.",
++    policyRuns: (runs, released) =>
++      `${runs === 1 ? "1 ejecución" : `${runs} ejecuciones`}, ${released} ${released === 1 ? "publicada" : "publicadas"}`,
++    policyMerges: (policy, person) =>
++      `Integraciones: ${policy} por la política, ${person} por personas`,
++    releaseFailures: (n) =>
++      n === 1
++        ? "1 publicación no se completó"
++        : `${n} publicaciones no se completaron`,
++    asked: "Se consultó a una persona porque",
++    reasonCounts: (asked, merged, sentBack) =>
++      `${asked} consultas · ${merged} integradas tal cual · ${sentBack} devueltas`,
++    current: "actual",
++    openPolicy: "Abrir la política",
++  },
 +  setup: {
 +    ready: (n, of) => `${n} de ${of} listos`,
 +    done: "Hecho",
@@ -3699,11 +3885,12 @@ index 0000000..4318c81
 +}
 diff --git a/src/factory/factory-nav-links.tsx b/src/factory/factory-nav-links.tsx
 new file mode 100644
-index 0000000..e64d6de
+index 0000000..e5d6858
 --- /dev/null
 +++ b/src/factory/factory-nav-links.tsx
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,93 @@
 +import {
++  ChartColumn,
 +  FileText,
 +  Inbox,
 +  Rocket,
@@ -3765,6 +3952,13 @@ index 0000000..e64d6de
 +        icon={<Scale width={ICON_SIZE} height={ICON_SIZE} />}
 +      />
 +      <SidebarNavLink
++        to="/autopilot/metrics"
++        label={copy.nav.metrics}
++        testId="sidebar-factory-metrics-link"
++        collapsed={collapsed}
++        icon={<ChartColumn width={ICON_SIZE} height={ICON_SIZE} />}
++      />
++      <SidebarNavLink
 +        to="/requirements"
 +        label={copy.nav.requirements}
 +        testId="sidebar-factory-requirements-link"
@@ -3790,10 +3984,10 @@ index 0000000..e64d6de
 +}
 diff --git a/src/factory/factory-routes.ts b/src/factory/factory-routes.ts
 new file mode 100644
-index 0000000..c87818c
+index 0000000..33fa000
 --- /dev/null
 +++ b/src/factory/factory-routes.ts
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,24 @@
 +import { route } from "@react-router/dev/routes";
 +
 +/**
@@ -3804,6 +3998,7 @@ index 0000000..c87818c
 +export const factoryRoutes = [
 +  route("autopilot", "factory/routes/autopilot.tsx"),
 +  route("autopilot/policy", "factory/routes/autopilot-policy.tsx"),
++  route("autopilot/metrics", "factory/routes/autopilot-metrics.tsx"),
 +  route(
 +    "autopilot/runs/:runId/evidence",
 +    "factory/routes/autopilot-evidence.tsx",
@@ -3819,10 +4014,10 @@ index 0000000..c87818c
 +];
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..b2d86ee
+index 0000000..784e6c0
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,435 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -3860,6 +4055,7 @@ index 0000000..b2d86ee
 +  workspaces: ["factory", "workspaces"] as const,
 +  setup: ["factory", "autopilot", "setup"] as const,
 +  policy: ["factory", "autopilot", "policy"] as const,
++  metrics: (days: number) => ["factory", "autopilot", "metrics", days] as const,
 +};
 +
 +// Don't hammer a server that isn't running (the offline card has a retry
@@ -4097,6 +4293,14 @@ index 0000000..b2d86ee
 +  useQuery({
 +    queryKey: FACTORY_QUERY_KEYS.policy,
 +    queryFn: FactoryApi.policy,
++    retry,
++    meta: { disableToast: true },
++  });
++
++export const useMetrics = (days: number) =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.metrics(days),
++    queryFn: () => FactoryApi.metrics(days),
 +    retry,
 +    meta: { disableToast: true },
 +  });
@@ -5152,6 +5356,364 @@ index 0000000..84894b6
 +      ) : (
 +        <p className="text-sm text-muted">{copy.evidence.noDecisions}</p>
 +      )}
++    </section>
++  );
++}
+diff --git a/src/factory/routes/autopilot-metrics.tsx b/src/factory/routes/autopilot-metrics.tsx
+new file mode 100644
+index 0000000..daf80d8
+--- /dev/null
++++ b/src/factory/routes/autopilot-metrics.tsx
+@@ -0,0 +1,352 @@
++import React from "react";
++import { Link } from "react-router";
++import { useTranslation } from "react-i18next";
++import { cn } from "#/utils/utils";
++import type { Metrics, PolicyInsight, Spread } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useMetrics, usePolicy } from "../hooks";
++import { FactoryLoading, FactoryPage } from "../components/factory-page";
++import { formatDuration, formatMoney } from "../components/autopilot-badges";
++
++const WINDOWS = [7, 30, 90] as const;
++
++/**
++ * How the factory is doing in a period: lead time, how much the policy merged
++ * by itself, what a change costs, what goes wrong most, and how each version
++ * of the policy did.
++ */
++export default function FactoryAutopilotMetricsRoute() {
++  const copy = useFactoryCopy();
++  const [days, setDays] = React.useState<number>(30);
++  const metrics = useMetrics(days);
++  const data = metrics.data;
++
++  return (
++    <FactoryPage
++      testId="factory-metrics"
++      title={copy.metrics.title}
++      subtitle={copy.metrics.subtitle(days)}
++      error={metrics.error}
++      onRetry={() => void metrics.refetch()}
++      actions={<WindowPicker days={days} onChange={setDays} />}
++    >
++      <div className="mx-auto flex max-w-5xl flex-col gap-8 px-6 py-6">
++        {metrics.isLoading ? <FactoryLoading /> : null}
++        {data && !data.runs.started ? (
++          <p data-testid="factory-metrics-empty" className="text-sm text-muted">
++            {copy.metrics.empty(data.window.days)}
++          </p>
++        ) : null}
++        {data?.runs.started ? <Body data={data} /> : null}
++      </div>
++    </FactoryPage>
++  );
++}
++
++function WindowPicker({
++  days,
++  onChange,
++}: {
++  days: number;
++  onChange: (days: number) => void;
++}) {
++  const copy = useFactoryCopy();
++  return (
++    <fieldset className="flex items-center gap-1 rounded-lg border border-border-subtle p-0.5">
++      <legend className="sr-only">{copy.metrics.window}</legend>
++      {WINDOWS.map((n) => (
++        <button
++          key={n}
++          type="button"
++          data-testid={`factory-metrics-window-${n}`}
++          aria-pressed={days === n}
++          onClick={() => onChange(n)}
++          className={cn(
++            "rounded-md px-2.5 py-1 text-xs font-medium focus:outline-none focus-visible:ring-2 focus-visible:ring-focus",
++            days === n
++              ? "bg-surface-raised text-foreground"
++              : "text-muted hover:text-foreground",
++          )}
++        >
++          {copy.metrics.days(n)}
++        </button>
++      ))}
++    </fieldset>
++  );
++}
++
++function Body({ data }: { data: Metrics }) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const money = (usd: number) => formatMoney(usd, i18n.language);
++  const percent = (rate: number) =>
++    new Intl.NumberFormat(i18n.language, {
++      style: "percent",
++      maximumFractionDigits: 0,
++    }).format(rate);
++  const { leadTime, autonomy, cost, runs } = data;
++
++  return (
++    <>
++      <section
++        aria-label={copy.metrics.title}
++        className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"
++      >
++        <Stat
++          testId="factory-metrics-lead-time"
++          title={copy.metrics.leadTime}
++          help={copy.metrics.leadTimeHelp}
++          value={
++            leadTime.toRelease.medianMs !== null
++              ? formatDuration(leadTime.toRelease.medianMs)
++              : null
++          }
++          empty={copy.metrics.noRelease}
++          lines={[
++            spreadLine(leadTime.toRelease, copy),
++            leadTime.toReady.medianMs !== null
++              ? copy.metrics.toReady(formatDuration(leadTime.toReady.medianMs))
++              : null,
++          ]}
++        />
++        <Stat
++          testId="factory-metrics-autonomy"
++          title={copy.metrics.autonomy}
++          help={copy.metrics.autonomyHelp}
++          value={autonomy.rate !== null ? percent(autonomy.rate) : null}
++          empty={copy.metrics.noMerges}
++          lines={[
++            autonomy.merged
++              ? copy.metrics.merged(autonomy.byPolicy, autonomy.merged)
++              : null,
++            runs.done + runs.released
++              ? copy.metrics.withoutPeople(autonomy.runsWithoutPeople)
++              : null,
++            copy.metrics.decisions(autonomy.personDecisions),
++          ]}
++        />
++        <Stat
++          testId="factory-metrics-cost"
++          title={copy.metrics.cost}
++          help={copy.metrics.costHelp}
++          value={cost.perChangeUsd !== null ? money(cost.perChangeUsd) : null}
++          empty={copy.metrics.noCost}
++          lines={[
++            cost.perMergedWorkOrderUsd !== null
++              ? copy.metrics.perWorkOrder(money(cost.perMergedWorkOrderUsd))
++              : null,
++            copy.metrics.total(money(cost.totalUsd)),
++          ]}
++        />
++        <Stat
++          testId="factory-metrics-runs"
++          title={copy.metrics.runs}
++          help={copy.metrics.runsHelp}
++          value={String(runs.started)}
++          lines={(
++            ["released", "done", "active", "failed", "cancelled"] as const
++          )
++            .filter((k) => runs[k])
++            .map((k) => `${runs[k]} ${copy.metrics.runStates[k] ?? k}`)}
++        />
++      </section>
++      <Failures failures={data.failures} />
++      {data.policies.length ? <Policies policies={data.policies} /> : null}
++    </>
++  );
++}
++
++function spreadLine(s: Spread, copy: ReturnType<typeof useFactoryCopy>) {
++  if (s.p90Ms === null) return null;
++  return `${copy.metrics.p90(formatDuration(s.p90Ms))} · ${copy.metrics.samples(s.samples)}`;
++}
++
++function Stat({
++  testId,
++  title,
++  help,
++  value,
++  empty,
++  lines,
++}: {
++  testId: string;
++  title: string;
++  help: string;
++  value: string | null;
++  empty?: string;
++  lines: (string | null)[];
++}) {
++  return (
++    <div
++      data-testid={testId}
++      className="flex flex-col gap-1 rounded-xl border border-border-subtle bg-surface px-4 py-3"
++    >
++      <h2 className="text-sm font-semibold text-foreground">{title}</h2>
++      <p className="text-xs text-muted">{help}</p>
++      {value !== null ? (
++        <p className="mt-1 text-2xl font-semibold tabular-nums text-foreground">
++          {value}
++        </p>
++      ) : (
++        <p className="mt-1 text-sm text-muted">{empty}</p>
++      )}
++      {lines
++        .filter((l): l is string => !!l)
++        .map((line) => (
++          <p key={line} className="text-xs tabular-nums text-muted">
++            {line}
++          </p>
++        ))}
++    </div>
++  );
++}
++
++function Heading({
++  id,
++  title,
++  help,
++}: {
++  id: string;
++  title: string;
++  help: string;
++}) {
++  return (
++    <div>
++      <h2 id={id} className="text-sm font-semibold text-foreground">
++        {title}
++      </h2>
++      <p className="text-xs text-muted">{help}</p>
++    </div>
++  );
++}
++
++function Failures({ failures }: { failures: Metrics["failures"] }) {
++  const copy = useFactoryCopy();
++  const most = Math.max(1, ...failures.map((f) => f.count));
++  return (
++    <section
++      aria-labelledby="factory-metrics-failures"
++      className="flex flex-col gap-3"
++    >
++      <Heading
++        id="factory-metrics-failures"
++        title={copy.metrics.failures}
++        help={copy.metrics.failuresHelp}
++      />
++      {failures.length ? (
++        <ol
++          data-testid="factory-metrics-failures"
++          className="flex flex-col gap-2"
++        >
++          {failures.map((f) => (
++            <li key={f.reason} className="flex flex-col gap-1">
++              <span className="flex items-baseline justify-between gap-3 text-sm">
++                <span className="text-foreground">{f.reason}</span>
++                <span className="shrink-0 text-xs tabular-nums text-muted">
++                  {copy.metrics.times(f.count)}
++                </span>
++              </span>
++              <span
++                aria-hidden
++                className="h-1.5 w-(--bar) rounded-full bg-warning"
++                style={
++                  {
++                    "--bar": `${Math.max(4, (f.count / most) * 100)}%`,
++                  } as React.CSSProperties
++                }
++              />
++            </li>
++          ))}
++        </ol>
++      ) : (
++        <p className="text-sm text-muted">{copy.metrics.noFailures}</p>
++      )}
++    </section>
++  );
++}
++
++function Policies({ policies }: { policies: PolicyInsight[] }) {
++  const copy = useFactoryCopy();
++  const current = usePolicy().data?.hash ?? null;
++  return (
++    <section
++      aria-labelledby="factory-metrics-policies"
++      className="flex flex-col gap-3"
++    >
++      <div className="flex items-start justify-between gap-3">
++        <Heading
++          id="factory-metrics-policies"
++          title={copy.metrics.policies}
++          help={copy.metrics.policiesHelp}
++        />
++        <Link
++          to="/autopilot/policy"
++          className="shrink-0 text-sm text-link hover:underline"
++        >
++          {copy.metrics.openPolicy}
++        </Link>
++      </div>
++      <ul className="flex flex-col gap-3">
++        {policies.map((p) => (
++          <li
++            key={p.hash}
++            data-testid={`factory-metrics-policy-${p.hash}`}
++            className={cn(
++              "flex flex-col gap-2 rounded-xl border bg-surface px-4 py-3",
++              p.hash === current ? "border-primary" : "border-border-subtle",
++            )}
++          >
++            <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
++              <span className="font-mono text-sm text-foreground">{`policy@${p.hash}`}</span>
++              {p.hash === current ? (
++                <span className="rounded-full border border-primary px-2 text-xs text-primary">
++                  {copy.metrics.current}
++                </span>
++              ) : null}
++              <span className="text-xs text-muted">
++                {copy.metrics.policyRuns(p.runs, p.released)}
++              </span>
++            </p>
++            <p className="text-sm text-muted">
++              {copy.metrics.policyMerges(p.merges.policy, p.merges.person)}
++              {p.releaseFailures
++                ? ` · ${copy.metrics.releaseFailures(p.releaseFailures)}`
++                : null}
++            </p>
++            {p.reasons.length ? (
++              <div className="flex flex-col gap-1">
++                <p className="text-xs font-medium text-foreground">
++                  {copy.metrics.asked}
++                </p>
++                <ul className="flex flex-col gap-1 text-xs text-muted">
++                  {p.reasons.map((r) => (
++                    <li
++                      key={r.reason}
++                      className="flex flex-wrap justify-between gap-x-3"
++                    >
++                      <span className="text-foreground">{r.reason}</span>
++                      <span className="tabular-nums">
++                        {copy.metrics.reasonCounts(
++                          r.asked,
++                          r.merged,
++                          r.sentBack,
++                        )}
++                      </span>
++                    </li>
++                  ))}
++                </ul>
++              </div>
++            ) : null}
++            {p.notes.length ? (
++              <ul className="flex list-disc flex-col gap-1 pl-5 text-sm text-foreground">
++                {p.notes.map((note) => (
++                  <li key={note}>{note}</li>
++                ))}
++              </ul>
++            ) : null}
++          </li>
++        ))}
++      </ul>
 +    </section>
 +  );
 +}
