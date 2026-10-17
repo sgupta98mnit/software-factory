@@ -21,7 +21,7 @@ export function explainPolicy(p: Policy): string[] {
   out.push(
     p.autonomy.max === "suggest"
       ? "Every merge waits for a person."
-      : `A work order merges on its own when its gates and review pass, the scans find no secrets or risky dependencies, it adds no dependency outside the allowlist${p.autoMerge.dependencyAllowlist.length ? ` (${list(p.autoMerge.dependencyAllowlist)})` : ""}, it changes fewer than ${p.autoMerge.maxChangedLines} lines, and it changes none of the ${sensitive} sensitive path pattern${sensitive === 1 ? "" : "s"}. Anything else waits for a person in the Inbox, with the reasons.`,
+      : `A work order merges on its own when its gates and review pass, the scans find no secrets or risky dependencies, it adds no dependency outside the allowlist${p.autoMerge.dependencyAllowlist.length ? ` (${list(p.autoMerge.dependencyAllowlist)})` : ""}, it changes fewer than ${p.autoMerge.maxChangedLines} lines, and it changes none of the ${sensitive} sensitive path pattern${sensitive === 1 ? "" : "s"}. Anything else waits for a person in the Inbox, with the reasons. So does any change to the spec (openspec/), the policy (.factory/), AGENTS.md or CLAUDE.md, whatever the patterns say.`,
   );
   out.push(`Reviews block on ${list(p.review.blocking)} findings.`);
   out.push(

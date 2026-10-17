@@ -143,3 +143,17 @@ test("a policy write never follows a folder that links out of the repo", async (
     await t.close();
   }
 });
+
+test("a change to the policy or the agents' instructions waits for a person even when sensitivePaths leaves them out", () => {
+  const facts = { autonomy: "autonomous" as const, gatesOk: true, hiddenTestsOk: null, reviewPassed: true, secretFindings: 0, dependencyFindings: [], linesChanged: 3, newDependencies: [] };
+  const open = parsePolicy("autoMerge: { sensitivePaths: [] }\n");
+  for (const file of [".factory/policy.yml", "AGENTS.md", "services/api/CLAUDE.md", ".Factory/Policy.yml"]) {
+    const d = evaluateMerge(open, { ...facts, files: ["src/a.js", file] });
+    assert.equal(d.auto, false, file);
+    assert.deepEqual(d.reasons, [`Changes the factory's policy or the agents' instructions: ${file}. Only a person merges those.`]);
+  }
+  assert.equal(evaluateMerge(open, { ...facts, files: ["src/a.js", "docs/agents.md.txt"] }).auto, true);
+  // With the default list, which names them already, the reason isn't given twice.
+  assert.deepEqual(evaluateMerge(DEFAULT_POLICY, { ...facts, files: ["AGENTS.md"] }).reasons, ["Changes sensitive paths: AGENTS.md (AGENTS.md)."]);
+  assert.match(explainPolicy(open).join("\n"), /none of the 0 sensitive path patterns\. Anything else waits for a person in the Inbox, with the reasons\. So does any change to the spec \(openspec\/\), the policy \(\.factory\/\), AGENTS\.md or CLAUDE\.md, whatever the patterns say\./);
+});

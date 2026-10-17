@@ -278,6 +278,13 @@ export function sensitiveMatch(file: string, patterns: string[]): string | undef
   });
 }
 
+/**
+ * What every work order is governed by: the factory's policy and the instructions every agent reads.
+ * A person merges a change to these whatever `sensitivePaths` says, so a team that rewrites the list
+ * can't leave a door open for a work order to loosen the next run's rules or brief the next agents.
+ */
+export const GOVERNING_PATHS = [".factory/**", "AGENTS.md", "CLAUDE.md"];
+
 const some = (items: string[], max = 10) => (items.length > max ? `${items.slice(0, max).join(", ")} and ${items.length - max} more` : items.join(", "));
 
 /**
@@ -302,6 +309,8 @@ export function evaluateMerge(policy: Policy, facts: MergeFacts): { auto: boolea
     return pattern ? [`${f} (${pattern})`] : [];
   });
   if (sensitive.length) reasons.push(`Changes sensitive paths: ${some(sensitive)}.`);
+  const governing = facts.files.filter((f) => !sensitiveMatch(f, autoMerge.sensitivePaths) && sensitiveMatch(f, GOVERNING_PATHS));
+  if (governing.length) reasons.push(`Changes the factory's policy or the agents' instructions: ${some(governing)}. Only a person merges those.`);
   if (facts.linesChanged >= autoMerge.maxChangedLines) {
     reasons.push(`Changes ${facts.linesChanged} lines; the policy merges fewer than ${autoMerge.maxChangedLines} on its own.`);
   }

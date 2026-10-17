@@ -70,6 +70,11 @@ replaces the plan approval). The effective level is the lowest of the request,
   integration branch starts from `refs/heads/<base>`.
 - The policy is read from `refs/heads/<base>` when the run is created and pinned
   on the run; worktrees and work-order branches are never consulted.
+- Whatever `autoMerge.sensitivePaths` says, a person merges a work order that
+  changes the spec (`openspec/`, `mergeCheck`) or what work is governed by
+  (`GOVERNING_PATHS` in policy.ts: `.factory/**`, `AGENTS.md`, `CLAUDE.md` in
+  any folder). The second reason is only added for files the list doesn't
+  already name.
 
 ## 5. HTTP API (`/sf-api/autopilot`)
 

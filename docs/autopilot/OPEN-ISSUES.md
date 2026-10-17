@@ -96,6 +96,7 @@ run against the fake agent server), and the Phase 1 UI review.
 | 57 | low | `/w/<id>/autopilot/*` read the whole request body before forwarding it, so intake's 512 KB limit (#42) no longer applied while reading for registered workspaces. The body is forwarded as a stream. |
 | 58 | low | A registered workspace's release decision linked its preview screenshots under `/sf-api/autopilot` (the default workspace's API), so they never loaded. Each orchestrator knows its own `apiPath`. |
 | 59 | low-medium | Found while merging #53 with the Policy page: a write to the base branch (the policy, AGENTS.md, a lesson) checked only the file for a link out of the repo, not its folder, so a merged `.factory` symlinked elsewhere took the policy file with it. The folder is checked too (`autopilot-policy-screen.test.ts`). |
+| 60 | medium | Found while writing docs/AUTOPILOT.md: `.factory/**`, `AGENTS.md` and `CLAUDE.md` were held for a person only through the default `sensitivePaths`, and a policy's list replaces the default. A team that wrote its own list without them let the policy merge a work order that loosened the next runs' policy or briefed every later agent. A person now merges those whatever the list says (`GOVERNING_PATHS`, `autopilot-policy-screen.test.ts`). |
 
 ## Plausible, not fixed yet (tracked for later phases)
 
