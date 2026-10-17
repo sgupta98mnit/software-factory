@@ -1,6 +1,7 @@
 // Autopilot's HTTP API, mounted at /sf-api/autopilot. The response shapes are
 // a contract with the Canvas pages (canvas/src/factory/api.ts): camelCase
 // JSON, costs summed from attempts, nothing about prompts or keys.
+import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { LOCAL_USER } from "../config.js";
@@ -182,7 +183,16 @@ export function createAutopilotRoutes(o: Orchestrator) {
       hiddenTests: hiddenView(run.id),
       etaMs: etaMs(run.state, workOrders, attempts, pinnedPolicy(run).parallel),
       projectedCostUsd: projectedCost(run.state, workOrders, ledger.runCost(run.id), (id) => ledger.workOrderCost(id)),
+      preview: run.preview,
     });
+  });
+
+  // A screenshot from the run's preview (only names the preview recorded).
+  app.get("/runs/:id/preview/:file", (c) => {
+    const run = mustRun(c.req.param("id"));
+    const file = o.previewFile(run.id, c.req.param("file"));
+    if (!file) throw new HTTPException(404, { message: "No such screenshot" });
+    return c.body(readFileSync(file), 200, { "content-type": "image/png", "cache-control": "private, max-age=3600" });
   });
 
   for (const action of ["pause", "resume", "cancel"] as const) {

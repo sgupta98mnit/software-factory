@@ -94,6 +94,7 @@ import {
   type CriticVerdict,
 } from "./spec.js";
 import { diffPlan, planWorkOrders } from "./waves.js";
+import { runPreview, type PreviewResult } from "./preview.js";
 
 export interface OrchestratorDeps {
   ledger: Ledger;
@@ -1706,7 +1707,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const all = ledger.listWorkOrders(run.id);
     // Not while the spec is changing, or a new plan waits for a person: there may be more to build.
     const current = ledger.getRun(run.id);
-    if (current?.state === "building" && !current.revision && all.every((w) => DONE_WO.has(w.state)) && !all.some((w) => w.state === "merged" && w.worktree)) await finish(run);
+    if (current?.state === "building" && !current.revision && all.every((w) => DONE_WO.has(w.state)) && !all.some((w) => w.state === "merged" && w.worktree)) await previewThenFinish(current);
   }
 
   /**
@@ -1885,6 +1886,61 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * deliverable: its worktree goes, the branch stays. With nothing merged
    * (every work order skipped) there's nothing to deliver, and the run failed.
    */
+  // ---- the preview: the app itself, before release ----
+
+  const previewDir = (run: Run) => path.join(deps.dataDir, "previews", run.id);
+  const previewResults = new Map<string, PreviewResult>(); // a preview job's key -> what it found
+
+  /**
+   * With policy.preview on, the app runs from the integration branch (as a
+   * job, outside the lock, in a gate slot) before the run finishes; the
+   * result is kept on the run and shown with the release decision. Once per
+   * integration sha: a run that comes back to building re-runs it.
+   */
+  async function previewThenFinish(run: Run) {
+    const policy = pinnedPolicy(run);
+    const merged = ledger.listWorkOrders(run.id).some((w) => w.state === "merged");
+    if (!policy.preview.enabled || !merged || !run.integrationDir || run.preview?.sha === run.integrationSha) return finish(run);
+    const key = `${run.id}#preview`;
+    const outcome = takeJob(key);
+    if (outcome === "running") return;
+    const found = previewResults.get(key);
+    previewResults.delete(key);
+    if (!outcome || outcome.aborted || !found) {
+      const dir = run.integrationDir;
+      const out = previewDir(run);
+      rmSync(out, { recursive: true, force: true }); // screenshots of an older sha go
+      record(SYSTEM, "autopilot.preview_started", run.id, { sha: run.integrationSha, paths: policy.preview.paths });
+      startJob(run.id, key, async (signal) => {
+        const r = await runPreview(dir, policy.preview, out, { signal });
+        previewResults.set(key, r);
+        return { ok: r.ok, results: [], aborted: signal.aborted };
+      });
+      return;
+    }
+    await discardChanges(run.integrationDir); // whatever the app wrote (logs, caches); installed packages stay
+    const lines = found.error ? [found.error] : found.pages.map((p) => `${p.ok ? "ok" : "FAILED"} ${p.path}: ${p.status ?? p.error ?? "no answer"}${p.screenshot ? ` (${p.screenshot})` : ""}`);
+    ledger.transaction(() => {
+      ledger.addCheck({ runId: run.id, stage: "preview", name: "preview", ok: found.ok, exitCode: found.ok ? 0 : 1, output: [...lines, ...(found.noScreenshots ? [found.noScreenshots] : []), "", found.output.slice(-2000)].join("\n") });
+      ledger.updateRun(run.id, { preview: { ...found, sha: run.integrationSha as string } });
+      record(SYSTEM, "autopilot.preview_run", run.id, {
+        ok: found.ok,
+        sha: run.integrationSha,
+        pages: found.pages.map((p) => ({ path: p.path, status: p.status, ok: p.ok, screenshot: !!p.screenshot })),
+        ...(found.error ? { error: clip(found.error) } : {}),
+      });
+    });
+    await finish(ledger.getRun(run.id) ?? run);
+  }
+
+  /** A screenshot of the run's preview, by the name the preview gave it; null for anything else. */
+  function previewFile(runId: string, file: string): string | null {
+    const run = ledger.getRun(runId);
+    if (!run?.preview?.pages.some((p) => p.screenshot === file) || !/^\d+-[a-zA-Z0-9-]+\.png$/.test(file)) return null;
+    const full = path.join(previewDir(run), file);
+    return existsSync(full) ? full : null;
+  }
+
   async function finish(run: Run) {
     if (!(await guardIntegration(ledger.getRun(run.id) ?? run))) return;
     const wos = ledger.listWorkOrders(run.id);
@@ -1931,14 +1987,31 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       ...(hidden.length ? [`- ${hidden.length} hidden acceptance test(s), one per scenario.`] : []),
       `- Cost: ${usd(ledger.runCost(run.id))} of ${usd(runBudget(run))}.`,
       ...(stat ? ["", `### ${stat.files.length} file(s), ${stat.linesChanged} line(s) changed from \`${run.baseBranch}\``] : []),
+      ...previewLines(run),
       "",
       "Releasing is recorded in the audit log with your name.",
     ].join("\n");
   }
 
+  /** The preview's part of the release decision: each page, and its screenshot (served by the API). */
+  function previewLines(run: Run): string[] {
+    const p = run.preview;
+    if (!p) return [];
+    if (p.error) return ["", "### Preview", `The app didn't come up from \`${run.integrationBranch}\`: ${mdText(p.error)}`];
+    return [
+      "",
+      `### Preview: ${p.ok ? "every page answered" : "some pages failed"}`,
+      ...p.pages.map((page) => `- \`${page.path}\`: ${page.ok ? `answered ${page.status}` : `**failed** (${page.status ?? mdText(page.error ?? "no answer")})`}`),
+      ...p.pages.filter((page) => page.screenshot).map((page) => `\n![${page.path}](/sf-api/autopilot/runs/${run.id}/preview/${page.screenshot})`),
+      ...(p.noScreenshots ? [`- ${mdText(p.noScreenshots)}`] : []),
+    ];
+  }
+
   /** At the end of a run: a person's release decision, or (policy release.auto, autonomous runs only) the policy's. */
   async function offerRelease(run: Run, why?: string) {
     const policy = pinnedPolicy(run);
+    // A preview that failed is for a person to look at, whatever release.auto says.
+    if (!why && run.preview && !run.preview.ok) why = "The preview failed, so the policy doesn't release it on its own.";
     if (!why && policy.release.auto && run.autonomy === "autonomous") return requestRelease(run, policyActor(run));
     openItem(run, "release", `Release ${run.change} into ${run.baseBranch}`, await releaseBody(run, why), [{ ...RELEASE[0]!, label: `Release into ${run.baseBranch}` }, RELEASE[1]!]);
     changed(run.id);
@@ -2549,6 +2622,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     createRun,
     intake,
     reviseSpec,
+    previewFile,
     decide,
     pause,
     resume,

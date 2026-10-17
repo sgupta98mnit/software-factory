@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..a16b2f9
+index 0000000..5c25ee2
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,682 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -404,7 +404,7 @@ index 0000000..a16b2f9
 +  id: number;
 +  runId: string;
 +  workOrderId: string | null;
-+  stage: "spec" | "build" | "integrate";
++  stage: "spec" | "build" | "integrate" | "release" | "preview";
 +  name: string;
 +  ok: boolean;
 +  exitCode: number | null;
@@ -478,7 +478,28 @@ index 0000000..a16b2f9
 +  etaMs: number | null;
 +  /** Spent so far plus the merged average for each work order left; null until one has merged. */
 +  projectedCostUsd: number | null;
++  /** The app run from the integration branch before release (policy preview), or null. */
++  preview: Preview | null;
 +}
++
++export interface Preview {
++  ok: boolean;
++  at: string;
++  sha: string;
++  pages: {
++    path: string;
++    status: number | null;
++    ok: boolean;
++    screenshot: string | null;
++    error: string | null;
++  }[];
++  error: string | null;
++  noScreenshots: string | null;
++  output: string;
++}
++
++export const previewImageUrl = (runId: string, file: string) =>
++  `${FACTORY_API_BASE}/autopilot/runs/${encodeURIComponent(runId)}/preview/${encodeURIComponent(file)}`;
 +
 +export interface AgentProfileSummary {
 +  id: string;
@@ -1991,10 +2012,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..4d3e332
+index 0000000..fd160a9
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1162 @@
+@@ -0,0 +1,1178 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2270,7 +2291,15 @@ index 0000000..4d3e332
 +      spec: "Spec",
 +      build: "Work order",
 +      integrate: "Integration branch",
++      release: "Release",
++      preview: "Preview",
 +    } as Record<string, string>,
++    preview: "Preview",
++    previewHelp: (sha: string) =>
++      `The app as it runs from the integration branch (${sha}), started by the factory before release.`,
++    previewFailedToStart: (why: string) => `The app didn't come up: ${why}`,
++    previewPage: (status: string) => `Answered ${status}`,
++    previewPageFailed: (why: string) => `Failed: ${why}`,
 +    turns: (n: number) => (n === 1 ? "1 message" : `${n} messages`),
 +    labels: {
 +      pipeline: "Pipeline stages",
@@ -2840,7 +2869,15 @@ index 0000000..4d3e332
 +      spec: "Especificación",
 +      build: "Orden de trabajo",
 +      integrate: "Rama de integración",
++      release: "Publicación",
++      preview: "Vista previa",
 +    },
++    preview: "Vista previa",
++    previewHelp: (sha) =>
++      `La aplicación tal como se ejecuta desde la rama de integración (${sha}), iniciada por la fábrica antes de publicar.`,
++    previewFailedToStart: (why) => `La aplicación no arrancó: ${why}`,
++    previewPage: (status) => `Respondió ${status}`,
++    previewPageFailed: (why) => `Falló: ${why}`,
 +    turns: (n) => (n === 1 ? "1 mensaje" : `${n} mensajes`),
 +    labels: {
 +      pipeline: "Etapas del flujo",
@@ -4466,10 +4503,10 @@ index 0000000..0926f61
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..c7ffec6
+index 0000000..c0df715
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,985 @@
+@@ -0,0 +1,1064 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -4493,7 +4530,7 @@ index 0000000..c7ffec6
 +import { BrandButton } from "#/components/features/settings/brand-button";
 +import { cn } from "#/utils/utils";
 +import type { Attempt, AutopilotWorkOrder, Check, RunDetail } from "../api";
-+import { isNotFound } from "../api";
++import { isNotFound, previewImageUrl } from "../api";
 +import { useFactoryCopy } from "../copy";
 +import {
 +  useAutopilotStatus,
@@ -4927,6 +4964,7 @@ index 0000000..c7ffec6
 +      </section>
 +
 +      <SpecSection run={run} />
++      {run.preview ? <PreviewSection run={run} /> : null}
 +      {run.hiddenTests.length ? <HiddenTests run={run} /> : null}
 +
 +      <div className="flex flex-wrap gap-x-6 gap-y-2">
@@ -5203,6 +5241,84 @@ index 0000000..c7ffec6
 +                : copy.pipeline.hiddenNotRun}
 +            </span>
 +            <span className="font-mono text-xs text-muted">{t.file}</span>
++          </li>
++        ))}
++      </ul>
++    </section>
++  );
++}
++
++/** The app as the preview found it: each page's answer and its screenshot. */
++function PreviewSection({ run }: { run: RunDetail }) {
++  const copy = useFactoryCopy();
++  const preview = run.preview;
++  if (!preview) return null;
++  return (
++    <section
++      aria-labelledby="factory-preview"
++      className="flex flex-col gap-3"
++      data-testid="factory-run-preview"
++    >
++      <div>
++        <h2
++          id="factory-preview"
++          className="text-sm font-semibold text-foreground"
++        >
++          {copy.pipeline.preview}
++        </h2>
++        <p className="text-xs text-muted">
++          {copy.pipeline.previewHelp(preview.sha.slice(0, 10))}
++        </p>
++      </div>
++      {preview.error ? (
++        <p className="text-sm text-feedback-error">
++          {copy.pipeline.previewFailedToStart(preview.error)}
++        </p>
++      ) : null}
++      {preview.noScreenshots ? (
++        <p className="text-xs text-muted">{preview.noScreenshots}</p>
++      ) : null}
++      <ul className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
++        {preview.pages.map((page) => (
++          <li
++            key={page.path}
++            className="flex flex-col gap-1.5 rounded-xl border border-border-subtle bg-surface p-2"
++          >
++            <span className="flex items-center gap-2 text-sm">
++              {page.ok ? (
++                <CircleCheck
++                  className="size-4 shrink-0 text-success"
++                  aria-label={copy.pipeline.labels.passed}
++                />
++              ) : (
++                <CircleX
++                  className="size-4 shrink-0 text-feedback-error"
++                  aria-label={copy.pipeline.labels.failed}
++                />
++              )}
++              <span className="font-mono text-foreground">{page.path}</span>
++              <span className="text-xs text-muted">
++                {page.ok
++                  ? copy.pipeline.previewPage(String(page.status))
++                  : copy.pipeline.previewPageFailed(
++                      String(page.status ?? page.error ?? ""),
++                    )}
++              </span>
++            </span>
++            {page.screenshot ? (
++              <a
++                href={previewImageUrl(run.id, page.screenshot)}
++                target="_blank"
++                rel="noreferrer"
++              >
++                <img
++                  src={previewImageUrl(run.id, page.screenshot)}
++                  alt={page.path}
++                  loading="lazy"
++                  className="w-full rounded-lg border border-border-subtle"
++                />
++              </a>
++            ) : null}
 +          </li>
 +        ))}
 +      </ul>

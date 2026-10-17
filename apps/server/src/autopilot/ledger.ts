@@ -11,6 +11,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import type { RunOrigin } from "./intake.js";
+import type { PreviewResult } from "./preview.js";
 
 export type Autonomy = "suggest" | "supervised" | "autonomous";
 export type RunState =
@@ -95,6 +96,7 @@ export interface Run {
   origin: RunOrigin | null; // where an intake request came from; null for runs started on Home
   planTree: string | null; // git tree of the change folder the work orders were planned from
   revision: SpecRevision | null; // a person's spec change while building, or a re-plan waiting for approval
+  preview: (PreviewResult & { sha: string }) | null; // the last preview, of the integration sha it ran on
   state: RunState;
   resumeState: RunState | null; // where to go back to after "paused"
   pausedReason: string | null;
@@ -172,7 +174,7 @@ export interface Check {
   id: number;
   runId: string;
   workOrderId: string | null;
-  stage: "spec" | "build" | "integrate" | "release";
+  stage: "spec" | "build" | "integrate" | "release" | "preview";
   name: string;
   ok: boolean;
   exitCode: number | null;
@@ -377,11 +379,16 @@ ALTER TABLE runs ADD COLUMN plan_tree TEXT;
 ALTER TABLE runs ADD COLUMN revision TEXT;
 `;
 
+// v12: the preview before release.
+const SCHEMA_V12 = `
+ALTER TABLE runs ADD COLUMN preview TEXT;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
-const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "requires", "origin", "revision"]);
+const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "requires", "origin", "revision", "preview"]);
 const FLAG_COLUMNS = new Set(["seen_running", "ok"]);
 const toColumn = (field: string) => field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toField = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -442,6 +449,7 @@ export function openLedger(file: string) {
   if (version < 9) transaction(() => db.exec(`${SCHEMA_V9}\nPRAGMA user_version = 9;`));
   if (version < 10) transaction(() => db.exec(`${SCHEMA_V10}\nPRAGMA user_version = 10;`));
   if (version < 11) transaction(() => db.exec(`${SCHEMA_V11}\nPRAGMA user_version = 11;`));
+  if (version < 12) transaction(() => db.exec(`${SCHEMA_V12}\nPRAGMA user_version = 12;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

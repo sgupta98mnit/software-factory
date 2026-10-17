@@ -414,7 +414,37 @@ kind, reference and a title clipped to 80 characters, never the body.
   finish. `mergeCheck` sends any work order that changes files under
   `openspec/` to a person, with the reason that merging it re-plans the run.
 
-## 19. Changes since the first build
+## 19. Preview
+
+`previewThenFinish` replaces the direct `finish()` at the end of building
+when `preview.enabled`, the run merged something, and the last preview
+wasn't of this `integrationSha`. It's a job (gate slot, outside the lock,
+stopped by pause and cancel), audited as `autopilot.preview_started`.
+`runPreview` (preview.ts) does the following:
+
+- starts `preview.start` in the integration worktree through `startService`
+  (gates.ts: scrubbed environment, its own process group, killed at shutdown)
+  with `PORT` (a free loopback port) and `HOST=127.0.0.1`;
+- waits until anything answers on it, up to `readyTimeoutSec`. An exit
+  before that, or a timeout, is `error`;
+- fetches each of `preview.paths` (paths only, at most 20; status < 400
+  passes);
+- screenshots each at 1280×800 with playwright-core 1.63.0 (no browser
+  download) driving `SF_PREVIEW_BROWSER`, Playwright's expected Chromium, or
+  the newest under `PLAYWRIGHT_BROWSERS_PATH`. With none, `noScreenshots`
+  says why;
+- stops the app.
+
+Afterwards the integration worktree is cleaned (installed packages stay).
+The result goes on `run.preview` with its sha (ledger v12), as a check with
+stage `preview`, and in `autopilot.preview_run` (paths, statuses and whether
+there's a screenshot). Screenshots live in `data/previews/<run>/` and are
+served by `GET /runs/:id/preview/:file`, which only accepts names the preview
+recorded. The release decision lists the pages and embeds the screenshots. A
+failed preview gives the release item a reason and keeps `release.auto` from
+releasing; a person can still release.
+
+## 20. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

@@ -119,7 +119,7 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
     assert.deepEqual(list.json.map((r: Json) => r.id), [capped.id, run.id]);
 
     const detail = (await call("GET", `/runs/${run.id}`)).json;
-    assert.deepEqual(Object.keys(detail).sort(), [...Object.keys(run), "workOrders", "attempts", "checks", "inbox", "hiddenTests", "etaMs", "projectedCostUsd"].sort());
+    assert.deepEqual(Object.keys(detail).sort(), [...Object.keys(run), "workOrders", "attempts", "checks", "inbox", "hiddenTests", "etaMs", "projectedCostUsd", "preview"].sort());
     assert.deepEqual([detail.workOrders, detail.attempts, detail.checks, detail.inbox, detail.hiddenTests, detail.etaMs, detail.projectedCostUsd], [[], [], [], [], [], null, null]);
     assert.equal((await call("GET", "/runs/ap-00000000")).status, 404);
   }));

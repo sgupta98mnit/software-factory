@@ -52,6 +52,8 @@ export interface Policy {
    * githubLabel: the label an issue needs. autonomy: the most a run from intake gets.
    */
   intake: { github: IntakeMode; webhook: IntakeMode; bug: IntakeMode; githubLabel: string; autonomy: Autonomy };
+  /** Before release: run the app from the integration branch (`start`, with PORT set), check `paths` answer, screenshot them. */
+  preview: { enabled: boolean; start: string; paths: string[]; readyTimeoutSec: number };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -84,6 +86,7 @@ export const DEFAULT_POLICY: Policy = {
   selfHealing: { quietMinutes: 20, rerunFailedGates: true, conflictRounds: 3 },
   queue: { maxActiveRuns: 2 },
   intake: { github: "inbox", webhook: "off", bug: "inbox", githubLabel: "autopilot", autonomy: "supervised" },
+  preview: { enabled: false, start: "npm start", paths: ["/"], readyTimeoutSec: 60 },
 };
 
 // ---- reading and checking policy.yml ----
@@ -151,6 +154,11 @@ const RULES: Record<string, Rule> = {
   ...Object.fromEntries(INTAKE_SOURCES.map((source) => [`intake.${source}`, oneOf(INTAKE_MODES)])),
   "intake.githubLabel": text,
   "intake.autonomy": oneOf(AUTONOMY),
+  "preview.enabled": flag,
+  "preview.start": text,
+  // A path on the app ("/status"), never another host.
+  "preview.paths": (v, key) => listOf((p, k) => (typeof p === "string" && /^\/(?!\/)/.test(p) && p.length <= 200 ? null : `${k} must be a path starting with one /`))(v, key) ?? (Array.isArray(v) && v.length > 20 ? `${key} lists at most 20 paths` : null),
+  "preview.readyTimeoutSec": whole(1, 600),
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */

@@ -104,6 +104,34 @@ function killTree(child: ChildProcess) {
   }
 }
 
+/**
+ * A long-running command (the app, for a preview) started like a gate: the
+ * scrubbed environment plus `env`, its own process group, and on the list
+ * shutdown kills. `stop()` kills it and everything it started.
+ */
+export function startService(dir: string, command: string, env: Record<string, string>) {
+  let output = "";
+  let exited: number | null | undefined;
+  const child = spawn(command, { cwd: dir, shell: true, env: { ...gateEnv(), ...env }, windowsHide: true, detached: process.platform !== "win32" });
+  running.add(child);
+  const add = (text: string) => (output = (output + text).slice(-OUTPUT_LIMIT));
+  child.stdout?.setEncoding("utf8").on("data", add);
+  child.stderr?.setEncoding("utf8").on("data", add);
+  child.on("error", (err) => add(`\n${err.message}`));
+  child.on("exit", (code) => (exited = code));
+  return {
+    output: () => output,
+    /** The exit code once it has exited on its own (undefined while it runs). */
+    exited: () => exited,
+    stop() {
+      killTree(child);
+      running.delete(child);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    },
+  };
+}
+
 function runGate(dir: string, gate: Gate, signal?: AbortSignal): Promise<GateResult> {
   const started = Date.now();
   const timeoutSec = gate.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
