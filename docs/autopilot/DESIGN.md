@@ -125,8 +125,11 @@ or its work orders move.
   seen running or 20 s passed (`classify`).
 - The reviewer and critic only read: whatever they change is thrown away and recorded.
 - A merge whose gates fail is reset (not reverted) so the fixed branch can merge again.
-- An exception in one work order's step puts only that work order in
-  `needs_attention`; three such work orders pause the run.
+- An exception in one work order's step, or a conversation of its that the
+  agent server can't start or report on, stays with that work order: the step
+  goes to `needs_attention`, the attempt fails and is repaired. Three such work
+  orders pause the run. Only the factory's setup (a refused session key, a
+  profile the policy names that doesn't exist) stops a run as a whole, once.
 - The API binds to 127.0.0.1 and rejects other Host headers.
 
 ## 8. Changes since the first build

@@ -26,6 +26,9 @@ export interface FakeProfile {
   acp_server?: string;
 }
 
+/** Answers a request with [status, body] instead of the fake's own logic; undefined lets it through. For fault tests. */
+export type FakeFault = (method: string, path: string) => [number, unknown] | undefined;
+
 /** `cost` is what this turn adds; `status` is how the turn ends (default finished). */
 export type FakeReply = { response?: string; cost?: number; status?: "finished" | "error" | "stuck" | "idle" };
 export type FakeHandler = (conv: FakeConversation, text: string) => FakeReply | void | Promise<FakeReply | void>;
@@ -41,6 +44,7 @@ export async function startFakeOpenHands(
   const conversations = new Map<string, FakeConversation>();
   const turns = new Set<Promise<void>>();
   let handler = opts.onMessage ?? done;
+  let fault: FakeFault | undefined;
 
   const info = (c: FakeConversation) => ({
     id: c.id,
@@ -77,6 +81,8 @@ export async function startFakeOpenHands(
     if (opts.apiKey && req.headers["x-session-api-key"] !== opts.apiKey) return [401, { detail: "Unauthorized" }];
     const path = url.pathname;
     const method = req.method ?? "GET";
+    const injected = fault?.(method, path);
+    if (injected) return injected;
 
     if (method === "GET" && path === "/api/agent-profiles") {
       const summaries = profiles.map((p) => ({ id: p.id, name: p.name, agent_kind: p.agent_kind, revision: 0, llm_profile_ref: null, mcp_server_refs: null }));
@@ -165,6 +171,10 @@ export async function startFakeOpenHands(
     conversations,
     setHandler(fn: FakeHandler) {
       handler = fn;
+    },
+    /** Inject (or with undefined, clear) a fault: see FakeFault. */
+    setFault(fn: FakeFault | undefined) {
+      fault = fn;
     },
     settled,
     async close() {

@@ -136,6 +136,12 @@ const now = () => new Date().toISOString();
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 /** The agent server is down or slow: leave everything as it is and try again on a later tick. */
 const unreachable = (err: unknown) => err instanceof OpenHandsError && err.status === 0;
+/** The agent server refused the factory's session key: nothing works until a person fixes it. */
+const refused = (err: unknown) => err instanceof OpenHandsError && (err.status === 401 || err.status === 403);
+/** Something wrong with the factory's setup (a profile the policy names is missing), not with one work order. */
+class SetupError extends Error {}
+/** Errors that stop the whole run once, with one inbox item, instead of failing work orders one by one. */
+const runWide = (err: unknown) => refused(err) || err instanceof SetupError;
 /** One line, at most `max` chars: for audit data, which never holds full goals, notes or prompts. */
 const clip = (text: string, max = 120) => {
   const line = text.replace(/\s+/g, " ").trim();
@@ -220,7 +226,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     console.error(`[autopilot] ${runId}:`, err);
     const run = ledger.getRun(runId);
     if (!run || TERMINAL.has(run.state) || run.state === "paused") return;
-    const message = errorText(err);
+    const message = refused(err)
+      ? `The agent server refused Autopilot's session key (${errorText(err)}). Set SF_AGENT_SERVER_KEY, or restart Canvas so it writes a fresh key, then Retry.`
+      : errorText(err);
     ledger.transaction(() => {
       openItem(run, "error", `Autopilot stopped on ${run.change}`, `While in **${run.state}**:\n\n${message}\n\nRetry picks up from there.`, RETRY);
       moveRun(run, "paused", {
@@ -252,27 +260,35 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return a;
   }
 
+  /** A profile by id or name (none = Canvas's active one). One that doesn't exist is the setup's problem, not a work order's. */
+  async function profile(ref: string | null, opts: { avoidServerOf?: string | null } = {}) {
+    try {
+      return await client.resolveProfile(ref, opts);
+    } catch (err) {
+      throw err instanceof OpenHandsError ? err : new SetupError(errorText(err));
+    }
+  }
+
   /**
    * The profile the policy names for a critic or reviewer; with none named,
    * another vendor than the agent whose work it checks, when the agent server has one.
    */
   async function checkerProfile(named: string | null, profileRef: string | null | undefined) {
-    if (named) return client.resolveProfile(named);
+    if (named) return profile(named);
     const other = profileRef ? await client.resolveProfile(profileRef).catch(() => null) : null;
-    return client.resolveProfile(null, { avoidServerOf: other?.server });
+    return profile(null, { avoidServerOf: other?.server });
   }
 
   /** Records a new attempt before asking the agent server for it (write-ahead), then starts it. */
   async function startAgent(run: Run, role: "spec" | "critic") {
     const { agents } = pinnedPolicy(run);
-    const profile =
-      role === "spec" ? await client.resolveProfile(agents.spec) : await checkerProfile(agents.critic, latest(run.id, "spec")?.agentProfile);
+    const who = role === "spec" ? await profile(agents.spec) : await checkerProfile(agents.critic, latest(run.id, "spec")?.agentProfile);
     const attempt = ledger.transaction(() => {
-      const a = ledger.addAttempt({ runId: run.id, role, conversationId: randomUUID(), agentProfile: profile.id });
+      const a = ledger.addAttempt({ runId: run.id, role, conversationId: randomUUID(), agentProfile: who.id });
       if (role === "spec") ledger.updateRun(run.id, { specConversation: a.conversationId });
       return a;
     });
-    record(SYSTEM, "autopilot.agent_started", run.id, { role, attempt: attempt.id, conversationId: attempt.conversationId, profile: profile.name });
+    record(SYSTEM, "autopilot.agent_started", run.id, { role, attempt: attempt.id, conversationId: attempt.conversationId, profile: who.name });
     await startConversation(attempt);
   }
 
@@ -305,6 +321,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       ledger.updateAttempt(a.id, { state: "running", seenRunning: snap.status === "running", costUsd: snap.costUsd, lastSentAt: now() });
     } catch (err) {
       if (unreachable(err)) return; // stays "starting": a later tick starts it again with the same id
+      if (refused(err)) throw err; // the key, not this conversation: the run stops once
       ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: errorText(err) } });
       record(SYSTEM, "autopilot.agent_finished", run.id, { role: a.role, attempt: a.id, state: "error", error: clip(errorText(err)) });
     }
@@ -567,6 +584,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
           await verify(run, wo);
         }
       } catch (err) {
+        if (runWide(err)) throw err;
         if (!unreachable(err)) workOrderError(run, wo, err);
       }
       if (ledger.getRun(run.id)?.state !== "building") return; // too many failures paused it
@@ -585,6 +603,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         room--;
       } catch (err) {
         if (unreachable(err)) return;
+        if (runWide(err)) throw err;
         workOrderError(run, wo, err); // resumes in pending: a retry dispatches it again
         if (ledger.getRun(run.id)?.state !== "building") return;
       }
@@ -598,7 +617,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * conversation with the same id. `findings` go into the brief.
    */
   async function dispatch(run: Run, wo: WorkOrder, findings = wo.findings) {
-    const profile = await client.resolveProfile(pinnedPolicy(run).agents.builder);
+    const builder = await profile(pinnedPolicy(run).agents.builder);
     const dir = path.join(worktrees, run.id, `wo-${wo.seq}`);
     // Not autopilot/<change>/wo-N: git can't have that next to the branch autopilot/<change>.
     const branch = `${run.integrationBranch}--wo-${wo.seq}`;
@@ -606,11 +625,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     await addWorktree(workspace, dir, branch, baseSha);
     const round = builders(wo).length + 1;
     const attempt = ledger.transaction(() => {
-      const a = ledger.addAttempt({ runId: run.id, workOrderId: wo.id, role: "builder", conversationId: randomUUID(), agentProfile: profile.id });
+      const a = ledger.addAttempt({ runId: run.id, workOrderId: wo.id, role: "builder", conversationId: randomUUID(), agentProfile: builder.id });
       moveWorkOrder(wo, "building", {
         patch: { branch, worktree: dir, baseSha, findings, resumeState: null },
         action: "autopilot.work_order_dispatched",
-        data: { attempt: a.id, conversationId: a.conversationId, profile: profile.name, round, branch, baseSha },
+        data: { attempt: a.id, conversationId: a.conversationId, profile: builder.name, round, branch, baseSha },
       });
       return a;
     });
@@ -674,13 +693,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** Write-ahead like dispatch: the attempt and the move to reviewing, then the agent server. */
   async function startReviewer(run: Run, wo: WorkOrder) {
-    const profile = await checkerProfile(pinnedPolicy(run).agents.reviewer, builders(wo).at(-1)?.agentProfile);
+    const reviewer = await checkerProfile(pinnedPolicy(run).agents.reviewer, builders(wo).at(-1)?.agentProfile);
     const attempt = ledger.transaction(() => {
-      const a = ledger.addAttempt({ runId: run.id, workOrderId: wo.id, role: "reviewer", conversationId: randomUUID(), agentProfile: profile.id });
+      const a = ledger.addAttempt({ runId: run.id, workOrderId: wo.id, role: "reviewer", conversationId: randomUUID(), agentProfile: reviewer.id });
       if (wo.state !== "reviewing") moveWorkOrder(wo, "reviewing", { data: { attempt: a.id } });
       return a;
     });
-    record(SYSTEM, "autopilot.agent_started", run.id, { role: "reviewer", workOrder: `WO-${wo.seq}`, attempt: attempt.id, conversationId: attempt.conversationId, profile: profile.name });
+    record(SYSTEM, "autopilot.agent_started", run.id, { role: "reviewer", workOrder: `WO-${wo.seq}`, attempt: attempt.id, conversationId: attempt.conversationId, profile: reviewer.name });
     await startConversation(attempt);
   }
 
@@ -990,10 +1009,31 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   // ---- the scheduler ----
 
+  /**
+   * One work order's conversation the factory can't start or poll (the agent
+   * server answers 500 for it, say): the attempt fails with the reason and its
+   * work order's own step repairs it or asks a person. The conversation is
+   * paused first, so a fresh builder doesn't share a worktree with it.
+   */
+  async function attemptFailed(a: Attempt, err: unknown) {
+    console.error(`[autopilot] ${a.runId} attempt ${a.id}:`, err);
+    await client.pause(a.conversationId).catch(() => undefined);
+    const doing = a.state === "starting" ? "start" : "follow";
+    ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: `Autopilot couldn't ${doing} this conversation on the agent server: ${errorText(err)}` } });
+    record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state: "error", error: clip(errorText(err)) });
+    changed(a.runId);
+  }
+
   /** Starts or polls the run's agents, then takes its next step. */
   async function advance(runId: string) {
     for (const a of ledger.listAttempts({ runId }).filter((x) => ACTIVE.has(x.state))) {
-      await (a.state === "starting" ? startConversation(a) : poll(a));
+      try {
+        await (a.state === "starting" ? startConversation(a) : poll(a));
+      } catch (err) {
+        // The agent server down or refusing the key, or the spec stage's own agents: the run waits or stops as a whole.
+        if (unreachable(err) || runWide(err) || !a.workOrderId) throw err;
+        await attemptFailed(a, err);
+      }
     }
     const run = ledger.getRun(runId);
     if (run?.state === "spec") await specStep(run);
@@ -1021,6 +1061,19 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return AUTONOMY[Math.min(AUTONOMY.indexOf(requested), ...caps.map((c) => AUTONOMY.indexOf(c)))] ?? requested;
   }
 
+  /**
+   * Profiles the policy names that the agent server doesn't have, as
+   * "agents.builder: \"x\"". Empty when the agent server can't be reached:
+   * it may come up later, and every agent start checks again.
+   */
+  async function missingProfiles(policy: Policy): Promise<string[]> {
+    const named = Object.entries(policy.agents).filter((e): e is [string, string] => !!e[1]);
+    if (!named.length) return [];
+    const list = await client.listProfiles().catch(() => null);
+    if (!list) return [];
+    return named.filter(([, ref]) => !list.profiles.some((p) => p.id === ref || p.name === ref)).map(([role, ref]) => `agents.${role}: "${ref}"`);
+  }
+
   // One run is created at a time: two at once (a double-click) would both init the repo or pick the same change name.
   let creating: Promise<unknown> = Promise.resolve();
   function createRun(input: { goal: string; autonomy?: Autonomy; budgetUsd?: number | null; actor: string }): Promise<Run> {
@@ -1045,6 +1098,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const baseBranch = (await currentBranch(workspace)) ?? "main";
     // The rules this run keeps to the end, from the base branch: an invalid policy.yml stops it here.
     const { policy, hash, source } = await loadPolicy(workspace, baseBranch);
+    const missing = await missingProfiles(policy);
+    if (missing.length) throw new Error(`${source}: the agent server has no profile for ${missing.join(", ")}`);
     const requested = input.autonomy ?? policy.autonomy.default;
     const autonomy = clampAutonomy(requested, policy.autonomy.max);
     const taken = await takenChangeNames(workspace, baseBranch);
@@ -1253,12 +1308,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // The policy a run started now would pin; an invalid policy.yml shows here before anyone starts one.
     // `autonomy`: what Home preselects, and the most anyone can pick (the policy's max under SF_AUTONOMY_CAP).
     const autonomyOf = (p: Policy) => ({ default: clampAutonomy(p.autonomy.default, p.autonomy.max), max: clampAutonomy("autonomous", p.autonomy.max) });
+    // A policy naming profiles the agent server lacks starts no run either, so it shows as the policy's error.
+    const checked = async (p: { policy: Policy; hash: string; source: string }) => {
+      const missing = agent.reachable ? await missingProfiles(p.policy) : [];
+      const error = missing.length ? `${p.source}: the agent server has no profile for ${missing.join(", ")}` : null;
+      return { source: p.source, hash: p.hash, error, autonomy: autonomyOf(p.policy) as ReturnType<typeof autonomyOf> | null };
+    };
     const policy = branch
-      ? await loadPolicy(workspace, branch).then(
-          (p) => ({ source: p.source, hash: p.hash, error: null as string | null, autonomy: autonomyOf(p.policy) as ReturnType<typeof autonomyOf> | null }),
-          (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err), autonomy: null }),
-        )
-      : { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null, autonomy: autonomyOf(DEFAULT_POLICY) };
+      ? await loadPolicy(workspace, branch).then(checked, (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err), autonomy: null }))
+      : await checked({ policy: DEFAULT_POLICY, hash: policyHash(DEFAULT_POLICY), source: "defaults" });
     return {
       agentServer: { url: client.baseUrl, ...agent },
       workspace: { path: workspace, isRepo, branch },
