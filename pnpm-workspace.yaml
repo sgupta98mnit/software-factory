@@ -1,0 +1,7 @@
+packages:
+  - "apps/*"
+
+# pnpm 10 blocks dependency install scripts unless they're listed here.
+# esbuild (used by tsx) needs its install script to fetch its native binary.
+onlyBuiltDependencies:
+  - esbuild

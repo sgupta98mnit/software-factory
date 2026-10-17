@@ -1,0 +1,18 @@
+{
+  "name": "software-factory",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.6",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "setup:canvas": "node scripts/setup-canvas.mjs",
+    "dev": "node scripts/dev.mjs",
+    "dev:api": "node scripts/setup-workspace.mjs && pnpm --filter @sf/server dev",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "export:canvas-patch": "node scripts/export-canvas-patch.mjs",
+    "setup-workspace": "node scripts/setup-workspace.mjs"
+  }
+}

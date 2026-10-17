@@ -1,0 +1,2812 @@
+diff --git a/src/components/features/sidebar/sidebar-rail-body.tsx b/src/components/features/sidebar/sidebar-rail-body.tsx
+index 821b542..1ec6a3c 100644
+--- a/src/components/features/sidebar/sidebar-rail-body.tsx
++++ b/src/components/features/sidebar/sidebar-rail-body.tsx
+@@ -44,6 +44,7 @@ import {
+ import { useCanvasExtensionsRuntime } from "#/components/features/canvas-extensions/canvas-extensions-runtime";
+ import { CanvasExtensionIcon } from "#/components/features/canvas-extensions/canvas-extension-icon";
+ import type { Backend } from "#/api/backend-registry/types";
++import { FactoryNavLinks } from "#/factory/factory-nav-links";
+ 
+ const ICON_SIZE = 18;
+ const SIDEBAR_LOGO_WIDTH = 34;
+@@ -264,6 +265,7 @@ export function SidebarRailBody({
+             )}
+           />
+         )}
++        <FactoryNavLinks collapsed={collapsed} />
+         {canvasExtensionPages.map((page) => (
+           <SidebarNavLink
+             key={`${page.extension.name}:${page.contribution.id}`}
+diff --git a/src/factory/README.md b/src/factory/README.md
+new file mode 100644
+index 0000000..3d7ac28
+--- /dev/null
++++ b/src/factory/README.md
+@@ -0,0 +1,44 @@
++# Software Factory pages
++
++This folder adds three pages to Agent Canvas for spec-driven, governed delivery:
++
++| Page | Route | Reads |
++| --- | --- | --- |
++| Requirements | `/requirements/:changeId?` | OpenSpec changes: proposal, specs with scenarios, design, tasks |
++| Work orders | `/work-orders/:workOrderId?` | Backlog.md tasks, as a board with a detail panel |
++| Audit log | `/audit-log` | The factory's hash-chained audit log |
++
++The data comes from the Software Factory API (`apps/server` in the software-factory
++repo), not from the OpenHands agent server. Vite proxies `/sf-api` to it
++(`SF_API_URL`, default `http://127.0.0.1:4317`). Agents run as ordinary Canvas
++conversations: "Start with an agent" calls `useCreateConversation` with the
++workspace as the working folder and a brief written by the API.
++
++## Files
++
++```
++api.ts                 Typed client for /sf-api
++hooks.ts               React Query hooks, and live updates over Server-Sent Events
++copy.ts                The pages' words (English and Spanish)
++factory-nav-links.tsx  Sidebar entries
++routes/                The three pages
++components/            Page frame, markdown, badges, and the plan/approve/start-agent dialogs
++```
++
++## Outside this folder
++
++Only three upstream files are touched, so pulling new OpenHands releases stays easy:
++
++- `src/routes.ts`: the three routes
++- `src/components/features/sidebar/sidebar-rail-body.tsx`: `<FactoryNavLinks />`
++- `vite.config.ts`: the `/sf-api` proxy
++
++## Rules the pages follow
++
++- Moving a work order to the last status is an approval. Only the Approve dialog
++  does it, and it records who approved and their note.
++- If a work order reaches the last status any other way (an agent ran the
++  Backlog.md CLI, someone edited the file), the API flags it as not approved and
++  the board shows it.
++- Strings live in `copy.ts`, not `src/i18n/translation.json`, to keep the
++  factory self-contained. Other Canvas languages fall back to English.
+diff --git a/src/factory/api.ts b/src/factory/api.ts
+new file mode 100644
+index 0000000..7ab8bbf
+--- /dev/null
++++ b/src/factory/api.ts
+@@ -0,0 +1,218 @@
++/**
++ * Client for the Software Factory API (apps/server in the software-factory
++ * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
++ * to it (see `vite.config.ts`), so these are same-origin requests.
++ */
++
++export const FACTORY_API_BASE = "/sf-api";
++
++export interface FactoryHealth {
++  /** `agentPath` is the same folder as the agent server sees it (differs only in a Docker sandbox). */
++  workspace: { name: string; path: string; agentPath: string; exists: boolean };
++  user: string;
++  versions: { openspec: string; backlog: string };
++}
++
++export interface ChangeSummary {
++  name: string;
++  completedTasks: number;
++  totalTasks: number;
++  lastModified: string;
++  status: string;
++}
++
++export interface SpecsOverview {
++  changes: { changes: ChangeSummary[] };
++  specs: { specs: { id: string; requirementCount: number }[] };
++}
++
++export interface Requirement {
++  name?: string;
++  text: string;
++  scenarios: { name?: string; rawText: string }[];
++}
++
++export interface ChangeDetail {
++  id: string;
++  show: {
++    id: string;
++    title: string;
++    deltaCount: number;
++    deltas: {
++      spec: string;
++      operation: string;
++      description: string;
++      requirement?: Requirement;
++    }[];
++  };
++  status: {
++    isComplete?: boolean;
++    artifacts: { id: string; status: string }[];
++  };
++  files: {
++    proposal: string | null;
++    design: string | null;
++    tasks: string | null;
++    specs: { path: string; markdown: string }[];
++  };
++}
++
++export interface ValidationResult {
++  items: {
++    id: string;
++    type: string;
++    valid: boolean;
++    issues: { level: string; path: string; message: string }[];
++  }[];
++  summary: { totals: { items: number; passed: number; failed: number } };
++}
++
++export interface PlannedWorkOrder {
++  title: string;
++  description: string;
++  acceptanceCriteria: string[];
++  controls: string[];
++  labels: string[];
++  dependsOn: number | null;
++}
++
++export interface WorkOrderPlan {
++  change: string;
++  source: string;
++  workOrders: PlannedWorkOrder[];
++  existing: { id: string; title: string; status: string }[];
++}
++
++export interface WorkOrderConversation {
++  id: string;
++  agent: string;
++  by: string;
++  at: string;
++}
++
++export interface WorkOrder {
++  id: string;
++  title: string;
++  status: string;
++  assignee: string[];
++  labels: string[];
++  dependencies: string[];
++  priority?: string;
++  createdDate?: string;
++  updatedDate?: string;
++  description: string;
++  acceptanceCriteria: { index: number; text: string; done: boolean }[];
++  plan?: string;
++  notes?: string;
++  finalSummary?: string;
++  file: string;
++  approval?: { by: string; at: string };
++  doneWithoutApproval: boolean;
++  conversations: WorkOrderConversation[];
++}
++
++export interface WorkOrderList {
++  initialized: boolean;
++  statuses: string[];
++  finalStatus: string;
++  workOrders: WorkOrder[];
++}
++
++export interface AuditEvent {
++  seq: number;
++  at: string;
++  actor: string;
++  action: string;
++  subject: string;
++  data: Record<string, unknown>;
++  prevHash: string;
++  hash: string;
++}
++
++export interface AuditVerification {
++  ok: boolean;
++  checked: number;
++  brokenAt?: number;
++  reason?: string;
++}
++
++/** Thrown when the factory API can't be reached at all (server not running). */
++export class FactoryOfflineError extends Error {
++  constructor() {
++    super("The Software Factory API isn't running.");
++    this.name = "FactoryOfflineError";
++  }
++}
++
++async function request<T>(path: string, init?: RequestInit): Promise<T> {
++  let response: Response;
++  try {
++    response = await fetch(`${FACTORY_API_BASE}${path}`, {
++      ...init,
++      headers: init?.body
++        ? { "Content-Type": "application/json", ...init.headers }
++        : init?.headers,
++    });
++  } catch {
++    throw new FactoryOfflineError();
++  }
++  // The dev proxy answers 502/504 (or Vite's HTML fallback) when nothing is listening.
++  const isJson = (response.headers.get("content-type") ?? "").includes(
++    "application/json",
++  );
++  if (!isJson && (response.status >= 500 || response.status === 404)) {
++    throw new FactoryOfflineError();
++  }
++  const data = isJson ? await response.json() : null;
++  if (!response.ok) {
++    throw new Error(
++      (data as { error?: string } | null)?.error ??
++        `${response.status} ${response.statusText}`,
++    );
++  }
++  return data as T;
++}
++
++const post = <T>(path: string, body: unknown = {}) =>
++  request<T>(path, { method: "POST", body: JSON.stringify(body) });
++
++export const FactoryApi = {
++  health: () => request<FactoryHealth>("/health"),
++  specs: () => request<SpecsOverview>("/specs"),
++  change: (id: string) =>
++    request<ChangeDetail>(`/specs/changes/${encodeURIComponent(id)}`),
++  validate: () => post<ValidationResult>("/specs/validate"),
++  changeBrief: (id: string, purpose: "review" | "plan") =>
++    request<{ text: string }>(
++      `/specs/changes/${encodeURIComponent(id)}/brief/${purpose}`,
++    ),
++  workOrderPlan: (id: string) =>
++    request<WorkOrderPlan>(
++      `/specs/changes/${encodeURIComponent(id)}/work-order-plan`,
++    ),
++  createWorkOrders: (id: string) =>
++    post<{ change: string; created: { id: string; title: string }[] }>(
++      `/specs/changes/${encodeURIComponent(id)}/work-orders`,
++    ),
++  workOrders: () => request<WorkOrderList>("/workorders"),
++  workOrderBrief: (id: string) =>
++    request<{ workOrder: string; text: string }>(
++      `/workorders/${encodeURIComponent(id)}/brief`,
++    ),
++  setStatus: (
++    id: string,
++    body: { status: string; approve?: boolean; note?: string },
++  ) => post<{ ok: true }>(`/workorders/${encodeURIComponent(id)}/status`, body),
++  linkConversation: (id: string, conversationId: string, agent: string) =>
++    post<{ ok: true }>(`/workorders/${encodeURIComponent(id)}/conversations`, {
++      conversationId,
++      agent,
++    }),
++  linkChangeConversation: (id: string, conversationId: string, agent: string) =>
++    post<{ ok: true }>(
++      `/specs/changes/${encodeURIComponent(id)}/conversations`,
++      { conversationId, agent },
++    ),
++  audit: () => request<AuditEvent[]>("/audit"),
++  verifyAudit: () => request<AuditVerification>("/audit/verify"),
++};
+diff --git a/src/factory/components/approve-modal.tsx b/src/factory/components/approve-modal.tsx
+new file mode 100644
+index 0000000..2305eef
+--- /dev/null
++++ b/src/factory/components/approve-modal.tsx
+@@ -0,0 +1,125 @@
++import React from "react";
++import { TriangleAlert } from "lucide-react";
++import { ModalBackdrop } from "#/components/shared/modals/modal-backdrop";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { displaySuccessToast } from "#/utils/custom-toast-handlers";
++import { cn } from "#/utils/utils";
++import type { WorkOrder } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useSetWorkOrderStatus } from "../hooks";
++import { factoryFieldClassName } from "./start-agent-modal";
++import { FactoryError } from "./factory-page";
++
++interface ApproveModalProps {
++  workOrder: WorkOrder;
++  finalStatus: string;
++  /** Work orders this one depends on that aren't approved yet. */
++  openDependencies?: string[];
++  onClose: () => void;
++}
++
++/** A person's approval: moves the work order to the final status and records who and why. */
++export function ApproveModal({
++  workOrder,
++  finalStatus,
++  openDependencies = [],
++  onClose,
++}: ApproveModalProps) {
++  const copy = useFactoryCopy();
++  const setStatus = useSetWorkOrderStatus();
++  const [note, setNote] = React.useState("");
++  const unmet = workOrder.acceptanceCriteria.filter((ac) => !ac.done).length;
++  const busy = setStatus.isPending;
++
++  const approve = () =>
++    setStatus.mutate(
++      {
++        id: workOrder.id,
++        status: finalStatus,
++        approve: true,
++        note: note.trim() || undefined,
++      },
++      {
++        onSuccess: () => {
++          displaySuccessToast(copy.approve.approved(workOrder.id));
++          onClose();
++        },
++      },
++    );
++
++  return (
++    <ModalBackdrop
++      onClose={busy ? undefined : onClose}
++      closeOnEscape={!busy}
++      aria-label={copy.approve.title(workOrder.id)}
++    >
++      <div
++        data-testid="factory-approve-modal"
++        className="flex w-full max-w-lg flex-col gap-4 rounded-xl border border-border bg-base-secondary p-5"
++      >
++        <h2 className="text-base font-semibold text-foreground">
++          {copy.approve.title(workOrder.id)}
++        </h2>
++        <p className="text-sm text-muted">{copy.approve.body(finalStatus)}</p>
++        {unmet > 0 ? <Warning text={copy.approve.unmet(unmet)} /> : null}
++        {openDependencies.length ? (
++          <Warning
++            text={copy.approve.openDependencies(
++              openDependencies.join(", "),
++              finalStatus,
++            )}
++          />
++        ) : null}
++        <div className="flex flex-col gap-1.5">
++          <label
++            htmlFor="factory-approve-note"
++            className="text-sm font-medium text-foreground"
++          >
++            {copy.approve.noteLabel}
++          </label>
++          <textarea
++            id="factory-approve-note"
++            className={cn(factoryFieldClassName, "min-h-20")}
++            placeholder={copy.approve.notePlaceholder}
++            value={note}
++            onChange={(e) => setNote(e.target.value)}
++            disabled={busy}
++          />
++        </div>
++        <FactoryError error={setStatus.error} />
++        <div className="flex justify-end gap-2">
++          <BrandButton
++            type="button"
++            variant="secondary"
++            onClick={onClose}
++            isDisabled={busy}
++          >
++            {copy.common.cancel}
++          </BrandButton>
++          <BrandButton
++            testId="factory-approve-confirm"
++            type="button"
++            variant="primary"
++            onClick={approve}
++            isDisabled={busy}
++            aria-busy={busy}
++          >
++            {busy ? copy.approve.approving : copy.approve.confirm}
++          </BrandButton>
++        </div>
++      </div>
++    </ModalBackdrop>
++  );
++}
++
++function Warning({ text }: { text: string }) {
++  return (
++    <p className="flex items-start gap-2 rounded-lg border border-border-subtle bg-surface px-3 py-2 text-sm text-foreground">
++      <TriangleAlert
++        className="mt-0.5 size-4 shrink-0 text-warning"
++        aria-hidden
++      />
++      {text}
++    </p>
++  );
++}
+diff --git a/src/factory/components/factory-badges.tsx b/src/factory/components/factory-badges.tsx
+new file mode 100644
+index 0000000..76e6509
+--- /dev/null
++++ b/src/factory/components/factory-badges.tsx
+@@ -0,0 +1,66 @@
++import { Shield } from "lucide-react";
++import { cn } from "#/utils/utils";
++
++/** Status with a colored dot: first status muted, last status green, anything between in the accent color. */
++export function StatusPill({
++  status,
++  statuses,
++}: {
++  status: string;
++  statuses: string[];
++}) {
++  const index = statuses.indexOf(status);
++  const isFinal = index === statuses.length - 1;
++  const isFirst = index <= 0;
++  return (
++    <span className="inline-flex items-center gap-1.5 text-xs text-muted">
++      <span
++        aria-hidden
++        className={cn(
++          "size-2 rounded-full",
++          isFinal && "bg-success",
++          isFirst && !isFinal && "bg-muted",
++          !isFirst && !isFinal && "bg-primary",
++        )}
++      />
++      <span className="text-foreground">{status}</span>
++    </span>
++  );
++}
++
++/**
++ * Backlog.md labels. `control:SI-10` shows as a control chip, `change:x` as
++ * the change name; anything else as-is.
++ */
++export function LabelChip({ label }: { label: string }) {
++  if (label.startsWith("control:")) {
++    return (
++      <span className="inline-flex items-center gap-1 rounded-md border border-border-subtle px-1.5 py-0.5 font-mono text-xs text-foreground">
++        <Shield className="size-3 text-muted" aria-hidden />
++        {label.slice("control:".length)}
++      </span>
++    );
++  }
++  const text = label.startsWith("change:")
++    ? label.slice("change:".length)
++    : label;
++  return (
++    <span className="inline-flex max-w-full items-center truncate rounded-md bg-surface-raised px-1.5 py-0.5 font-mono text-xs text-muted">
++      {text}
++    </span>
++  );
++}
++
++/** "user:sumit" -> "sumit", "filesystem" -> "filesystem" */
++export function actorName(actor: string) {
++  return actor.replace(/^user:/, "");
++}
++
++export function formatWhen(iso: string, language: string) {
++  const date = new Date(iso);
++  if (Number.isNaN(date.getTime())) return iso;
++  return new Intl.DateTimeFormat(language, {
++    dateStyle: "medium",
++    timeStyle: "short",
++  }).format(date);
++}
+diff --git a/src/factory/components/factory-markdown.tsx b/src/factory/components/factory-markdown.tsx
+new file mode 100644
+index 0000000..8fbbd26
+--- /dev/null
++++ b/src/factory/components/factory-markdown.tsx
+@@ -0,0 +1,42 @@
++import { MarkdownRenderer } from "#/components/features/markdown/markdown-renderer";
++import { useColorTheme } from "#/hooks/use-color-theme";
++import { COLOR_THEMES } from "#/themes/color-themes";
++import { cn } from "#/utils/utils";
++
++// Same prose treatment as the Files tab's markdown preview, so OpenSpec and
++// Backlog.md documents read like the rest of Canvas.
++const PROSE_THEME =
++  "[--tw-prose-body:var(--oh-foreground)] [--tw-prose-bold:var(--oh-foreground)] [--tw-prose-headings:var(--oh-foreground)] [--tw-prose-lead:var(--oh-text-secondary)] [--tw-prose-counters:var(--oh-text-secondary)] [--tw-prose-quotes:var(--oh-foreground)] [--tw-prose-quote-borders:var(--oh-border-subtle)] [--tw-prose-bullets:var(--oh-muted)] [--tw-prose-hr:var(--oh-border-subtle)] [--tw-prose-captions:var(--oh-muted)] [--tw-prose-kbd:var(--oh-foreground)]";
++
++interface FactoryMarkdownProps {
++  text: string;
++  className?: string;
++  /** Render h1-h6 (documents). Off for short snippets like scenarios. */
++  headings?: boolean;
++}
++
++export function FactoryMarkdown({
++  text,
++  className,
++  headings = false,
++}: FactoryMarkdownProps) {
++  const colorTheme = useColorTheme();
++  const isLight = COLOR_THEMES[colorTheme].appearance === "light";
++  return (
++    <div
++      className={cn(
++        "prose prose-sm max-w-none",
++        PROSE_THEME,
++        !isLight && "prose-invert",
++        className,
++      )}
++    >
++      <MarkdownRenderer
++        content={text}
++        includeStandard
++        includeHeadings={headings}
++        allowHtml={false}
++      />
++    </div>
++  );
++}
+diff --git a/src/factory/components/factory-page.tsx b/src/factory/components/factory-page.tsx
+new file mode 100644
+index 0000000..52cfa9a
+--- /dev/null
++++ b/src/factory/components/factory-page.tsx
+@@ -0,0 +1,105 @@
++import React from "react";
++import { PlugZap } from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { cn } from "#/utils/utils";
++import { FactoryOfflineError } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useFactoryLiveUpdates } from "../hooks";
++
++interface FactoryPageProps {
++  testId: string;
++  title: string;
++  subtitle?: React.ReactNode;
++  actions?: React.ReactNode;
++  /** A query error from the page's data; the offline card replaces the page when the API is down. */
++  error?: unknown;
++  onRetry?: () => void;
++  /** Body fills the remaining height (for side-by-side panes) instead of scrolling as one column. */
++  fill?: boolean;
++  children: React.ReactNode;
++}
++
++/** Common frame for the factory pages: header, live updates, and the "API isn't running" state. */
++export function FactoryPage({
++  testId,
++  title,
++  subtitle,
++  actions,
++  error,
++  onRetry,
++  fill = false,
++  children,
++}: FactoryPageProps) {
++  useFactoryLiveUpdates();
++  const offline = error instanceof FactoryOfflineError;
++
++  return (
++    <div data-testid={testId} className="flex h-full min-h-0 flex-col">
++      <header className="flex shrink-0 flex-wrap items-start gap-3 border-b border-border-subtle px-6 py-5">
++        <div className="min-w-0 flex-1">
++          <h1 className="text-lg font-semibold text-foreground">{title}</h1>
++          {subtitle ? (
++            <p className="mt-1 text-sm text-muted">{subtitle}</p>
++          ) : null}
++        </div>
++        {actions && !offline ? (
++          <div className="flex shrink-0 flex-wrap items-center gap-2">
++            {actions}
++          </div>
++        ) : null}
++      </header>
++      <div
++        className={cn(
++          "min-h-0 flex-1",
++          fill ? "flex" : "overflow-y-auto custom-scrollbar-always",
++        )}
++      >
++        {offline ? <FactoryOffline onRetry={onRetry} /> : children}
++      </div>
++    </div>
++  );
++}
++
++export function FactoryOffline({ onRetry }: { onRetry?: () => void }) {
++  const copy = useFactoryCopy();
++  return (
++    <div
++      data-testid="factory-offline"
++      className="mx-auto flex max-w-xl flex-col items-start gap-3 px-6 py-16"
++    >
++      <PlugZap className="size-8 text-muted" aria-hidden />
++      <h2 className="text-base font-semibold text-foreground">
++        {copy.offline.title}
++      </h2>
++      <p className="text-sm text-muted">{copy.offline.body}</p>
++      <code className="rounded-md border border-border-subtle bg-surface px-3 py-2 font-mono text-sm text-foreground">
++        {copy.offline.command}
++      </code>
++      <p className="text-sm text-muted">{copy.offline.hint}</p>
++      {onRetry ? (
++        <BrandButton type="button" variant="secondary" onClick={onRetry}>
++          {copy.common.retry}
++        </BrandButton>
++      ) : null}
++    </div>
++  );
++}
++
++/** A plain error line for anything that isn't "the API is down". */
++export function FactoryError({ error }: { error: unknown }) {
++  if (!error || error instanceof FactoryOfflineError) return null;
++  return (
++    <p role="alert" className="text-sm text-feedback-error">
++      {error instanceof Error ? error.message : String(error)}
++    </p>
++  );
++}
++
++export function FactoryLoading() {
++  const copy = useFactoryCopy();
++  return (
++    <p className="px-6 py-6 text-sm text-muted" aria-live="polite">
++      {copy.common.loading}
++    </p>
++  );
++}
+diff --git a/src/factory/components/start-agent-modal.tsx b/src/factory/components/start-agent-modal.tsx
+new file mode 100644
+index 0000000..1b70afb
+--- /dev/null
++++ b/src/factory/components/start-agent-modal.tsx
+@@ -0,0 +1,204 @@
++import React from "react";
++import { useNavigate } from "react-router";
++import { ModalBackdrop } from "#/components/shared/modals/modal-backdrop";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { useAgentProfiles } from "#/hooks/query/use-agent-profiles";
++import { useCreateConversation } from "#/hooks/mutation/use-create-conversation";
++import { cn } from "#/utils/utils";
++import { useFactoryCopy } from "../copy";
++import { useFactoryHealth } from "../hooks";
++
++export const factoryFieldClassName =
++  "w-full rounded-lg border border-border bg-base-secondary px-3 py-2 text-sm text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-focus";
++
++interface StartAgentModalProps {
++  /** What the agent works on, for the title: "WO-1" or a change name. */
++  subject: string;
++  /** Loads the first message (the brief) from the factory API. */
++  loadBrief: () => Promise<string>;
++  /** Called with the new conversation before we navigate to it, to link it in the audit log. */
++  onStarted?: (conversationId: string, agentName: string) => Promise<void>;
++  onClose: () => void;
++}
++
++/**
++ * Starts a normal Canvas conversation in the factory workspace, with the
++ * agent profile you pick (Claude Code, Codex, OpenHands...) and a brief
++ * written from the work order. Then it opens that conversation.
++ */
++export function StartAgentModal({
++  subject,
++  loadBrief,
++  onStarted,
++  onClose,
++}: StartAgentModalProps) {
++  const copy = useFactoryCopy();
++  const navigate = useNavigate();
++  const { data: health } = useFactoryHealth();
++  const { data: profileList } = useAgentProfiles();
++  const createConversation = useCreateConversation({ disableToast: true });
++
++  const [message, setMessage] = React.useState("");
++  const [loadingBrief, setLoadingBrief] = React.useState(true);
++  const [error, setError] = React.useState<string | null>(null);
++  const [profileId, setProfileId] = React.useState("");
++
++  React.useEffect(() => {
++    let cancelled = false;
++    loadBrief()
++      .then((text) => !cancelled && setMessage(text))
++      .catch((e: Error) => !cancelled && setError(e.message))
++      .finally(() => !cancelled && setLoadingBrief(false));
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  const profiles = (profileList?.profiles ?? []).filter((p) => p.id);
++  const activeId = profileList?.active_agent_profile_id ?? null;
++  const active = profiles.find((p) => p.id === activeId);
++  const workspace = health?.workspace;
++  const busy = createConversation.isPending;
++  const canStart =
++    Boolean(workspace?.exists) && message.trim().length > 0 && !busy;
++
++  const start = async () => {
++    if (!workspace) return;
++    setError(null);
++    const chosen = profiles.find((p) => p.id === profileId) ?? active;
++    try {
++      const result = await createConversation.mutateAsync({
++        query: message,
++        workingDir: workspace.agentPath || workspace.path,
++        agentProfileId: profileId || undefined,
++        entryPoint: "software-factory",
++      });
++      await onStarted?.(result.conversation_id, chosen?.name ?? "");
++      onClose();
++      navigate(`/conversations/${result.conversation_id}`);
++    } catch (e) {
++      setError(e instanceof Error ? e.message : String(e));
++    }
++  };
++
++  const profileLabel = (name: string, kind: string) =>
++    `${name} (${copy.agent.kinds[kind] ?? kind})`;
++
++  return (
++    <ModalBackdrop
++      onClose={busy ? undefined : onClose}
++      closeOnEscape={!busy}
++      aria-label={copy.agent.title(subject)}
++    >
++      <div
++        data-testid="factory-start-agent-modal"
++        className="flex max-h-screen w-full max-w-2xl flex-col gap-4 overflow-y-auto rounded-xl border border-border bg-base-secondary p-5"
++      >
++        <h2 className="text-base font-semibold text-foreground">
++          {copy.agent.title(subject)}
++        </h2>
++
++        <div className="flex flex-col gap-1.5">
++          {profiles.length ? (
++            <label
++              htmlFor="factory-agent-profile"
++              className="text-sm font-medium text-foreground"
++            >
++              {copy.agent.agentLabel}
++            </label>
++          ) : (
++            <span className="text-sm font-medium text-foreground">
++              {copy.agent.agentLabel}
++            </span>
++          )}
++          {profiles.length ? (
++            <select
++              id="factory-agent-profile"
++              data-testid="factory-agent-profile"
++              className={cn(factoryFieldClassName, "h-9 py-0")}
++              value={profileId}
++              onChange={(e) => setProfileId(e.target.value)}
++              disabled={busy}
++            >
++              <option value="">
++                {active
++                  ? `${copy.agent.activeProfile}: ${profileLabel(active.name, active.agent_kind)}`
++                  : copy.agent.activeProfile}
++              </option>
++              {profiles
++                .filter((p) => p.id !== activeId)
++                .map((p) => (
++                  <option key={p.id} value={p.id ?? ""}>
++                    {profileLabel(p.name, p.agent_kind)}
++                  </option>
++                ))}
++            </select>
++          ) : (
++            <p className="text-sm text-muted">{copy.agent.noProfiles}</p>
++          )}
++        </div>
++
++        <div className="flex flex-col gap-1.5">
++          <span className="text-sm font-medium text-foreground">
++            {copy.agent.folderLabel}
++          </span>
++          <code className="break-all rounded-lg border border-border-subtle bg-surface px-3 py-2 font-mono text-xs text-muted">
++            {workspace
++              ? workspace.agentPath || workspace.path
++              : copy.common.loading}
++          </code>
++          {workspace && !workspace.exists ? (
++            <p role="alert" className="text-sm text-feedback-error">
++              {copy.agent.workspaceMissing(workspace.path)}
++            </p>
++          ) : null}
++        </div>
++
++        <div className="flex flex-col gap-1.5">
++          <label
++            htmlFor="factory-agent-message"
++            className="text-sm font-medium text-foreground"
++          >
++            {copy.agent.messageLabel}
++          </label>
++          <p className="text-xs text-muted">{copy.agent.messageHelp}</p>
++          <textarea
++            id="factory-agent-message"
++            data-testid="factory-agent-message"
++            className={cn(factoryFieldClassName, "min-h-64 font-mono text-xs")}
++            value={loadingBrief ? copy.common.loading : message}
++            onChange={(e) => setMessage(e.target.value)}
++            disabled={loadingBrief || busy}
++          />
++        </div>
++
++        {error ? (
++          <p role="alert" className="text-sm text-feedback-error">
++            {error}
++          </p>
++        ) : null}
++
++        <div className="flex justify-end gap-2">
++          <BrandButton
++            type="button"
++            variant="secondary"
++            onClick={onClose}
++            isDisabled={busy}
++          >
++            {copy.common.cancel}
++          </BrandButton>
++          <BrandButton
++            testId="factory-start-agent-confirm"
++            type="button"
++            variant="primary"
++            onClick={() => void start()}
++            isDisabled={!canStart}
++            aria-busy={busy}
++          >
++            {busy ? copy.agent.starting : copy.agent.start}
++          </BrandButton>
++        </div>
++      </div>
++    </ModalBackdrop>
++  );
++}
+diff --git a/src/factory/components/work-order-plan-modal.tsx b/src/factory/components/work-order-plan-modal.tsx
+new file mode 100644
+index 0000000..3b39060
+--- /dev/null
++++ b/src/factory/components/work-order-plan-modal.tsx
+@@ -0,0 +1,128 @@
++import { useNavigate } from "react-router";
++import { ModalBackdrop } from "#/components/shared/modals/modal-backdrop";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { displaySuccessToast } from "#/utils/custom-toast-handlers";
++import { useFactoryCopy } from "../copy";
++import { useCreateWorkOrders, useWorkOrderPlan } from "../hooks";
++import { FactoryMarkdown } from "./factory-markdown";
++import { FactoryError } from "./factory-page";
++
++interface WorkOrderPlanModalProps {
++  change: string;
++  onClose: () => void;
++}
++
++/**
++ * Shows the work orders the factory would create from a change's tasks.md,
++ * and creates them when you confirm. Your confirmation is the audit record.
++ */
++export function WorkOrderPlanModal({
++  change,
++  onClose,
++}: WorkOrderPlanModalProps) {
++  const copy = useFactoryCopy();
++  const navigate = useNavigate();
++  const plan = useWorkOrderPlan(change, true);
++  const create = useCreateWorkOrders();
++  const busy = create.isPending;
++  const workOrders = plan.data?.workOrders ?? [];
++  const existing = plan.data?.existing ?? [];
++
++  const confirm = () =>
++    create.mutate(change, {
++      onSuccess: (result) => {
++        displaySuccessToast(copy.plan.created(result.created.map((c) => c.id)));
++        onClose();
++        navigate(`/work-orders?change=${encodeURIComponent(change)}`);
++      },
++    });
++
++  return (
++    <ModalBackdrop
++      onClose={busy ? undefined : onClose}
++      closeOnEscape={!busy}
++      aria-label={copy.plan.title(change)}
++    >
++      <div
++        data-testid="factory-plan-modal"
++        className="flex max-h-screen w-full max-w-2xl flex-col gap-4 overflow-y-auto rounded-xl border border-border bg-base-secondary p-5"
++      >
++        <div>
++          <h2 className="text-base font-semibold text-foreground">
++            {copy.plan.title(change)}
++          </h2>
++          <p className="mt-1 text-sm text-muted">{copy.plan.subtitle}</p>
++        </div>
++
++        {plan.isLoading ? (
++          <p className="text-sm text-muted">{copy.common.loading}</p>
++        ) : null}
++        <FactoryError error={plan.error} />
++        {existing.length ? (
++          <p role="status" className="text-sm text-foreground">
++            {copy.plan.existing(existing.map((w) => w.id))}
++          </p>
++        ) : null}
++
++        <ol className="flex flex-col gap-2">
++          {workOrders.map((wo, i) => (
++            <li
++              key={wo.title}
++              className="rounded-lg border border-border-subtle bg-surface px-4 py-3"
++            >
++              <div className="flex flex-wrap items-baseline gap-x-2">
++                <span className="font-mono text-xs text-muted">{`#${i + 1}`}</span>
++                <span className="text-sm font-medium text-foreground">
++                  {wo.title}
++                </span>
++                {wo.dependsOn !== null ? (
++                  <span className="text-xs text-muted">
++                    {copy.plan.after(wo.dependsOn + 1)}
++                  </span>
++                ) : null}
++              </div>
++              <p className="mt-1 text-xs text-muted">
++                {copy.plan.criteria(wo.acceptanceCriteria.length)}
++              </p>
++              <FactoryMarkdown
++                className="mt-1"
++                text={wo.acceptanceCriteria.map((ac) => `- ${ac}`).join("\n")}
++              />
++              {wo.controls.length ? (
++                <p className="mt-2 text-xs text-muted">
++                  {`${copy.plan.controls}: `}
++                  <span className="font-mono text-foreground">
++                    {wo.controls.join(", ")}
++                  </span>
++                </p>
++              ) : null}
++            </li>
++          ))}
++        </ol>
++
++        <FactoryError error={create.error} />
++
++        <div className="flex justify-end gap-2">
++          <BrandButton
++            type="button"
++            variant="secondary"
++            onClick={onClose}
++            isDisabled={busy}
++          >
++            {copy.common.cancel}
++          </BrandButton>
++          <BrandButton
++            testId="factory-plan-confirm"
++            type="button"
++            variant="primary"
++            onClick={confirm}
++            isDisabled={busy || !workOrders.length || existing.length > 0}
++            aria-busy={busy}
++          >
++            {busy ? copy.plan.creating : copy.plan.create(workOrders.length)}
++          </BrandButton>
++        </div>
++      </div>
++    </ModalBackdrop>
++  );
++}
+diff --git a/src/factory/copy.ts b/src/factory/copy.ts
+new file mode 100644
+index 0000000..22a85cd
+--- /dev/null
++++ b/src/factory/copy.ts
+@@ -0,0 +1,384 @@
++import { useTranslation } from "react-i18next";
++
++/**
++ * Words used by the Software Factory pages.
++ *
++ * They live here instead of `src/i18n/translation.json` so the factory stays a
++ * self-contained folder and upstream merges don't conflict on that 2 MB file.
++ * English and Spanish are provided; other Canvas languages fall back to
++ * English. To contribute upstream later, move these into translation.json.
++ */
++const en = {
++  nav: {
++    requirements: "Requirements",
++    workOrders: "Work orders",
++    audit: "Audit log",
++  },
++  common: {
++    loading: "Loading…",
++    retry: "Try again",
++    cancel: "Cancel",
++    close: "Close",
++    none: "None",
++    workspace: "Workspace",
++  },
++  offline: {
++    title: "The Software Factory API isn't running",
++    body: "These pages read OpenSpec and Backlog.md through a small local server. Start it from the software-factory folder:",
++    command: "pnpm dev",
++    hint: "pnpm dev starts it together with Canvas. If Canvas is already running, use pnpm dev:api instead.",
++  },
++  requirements: {
++    title: "Requirements",
++    subtitle: (workspace: string) => `OpenSpec changes in ${workspace}`,
++    changes: "Changes in progress",
++    specs: "Current specs",
++    noChanges:
++      "No changes yet. Ask an agent to propose one with OpenSpec (/opsx:propose).",
++    noSpecs: "None yet. Specs appear here when a change is archived.",
++    tasks: (done: number, total: number) => `${done}/${total} tasks`,
++    requirementCount: (n: number) =>
++      n === 1 ? "1 requirement" : `${n} requirements`,
++    pick: "Pick a change to see its requirements.",
++    validate: "Validate",
++    validating: "Validating…",
++    valid: "Valid. OpenSpec found no problems.",
++    invalid: (n: number) =>
++      n === 1 ? "OpenSpec found 1 problem:" : `OpenSpec found ${n} problems:`,
++    review: "Ask an agent to review",
++    createWorkOrders: "Create work orders",
++    viewWorkOrders: (n: number) =>
++      n === 1 ? "View 1 work order" : `View ${n} work orders`,
++    tabs: {
++      requirements: "Requirements",
++      proposal: "Proposal",
++      design: "Design",
++      tasks: "Tasks",
++    },
++    noRequirements: "This change has no spec requirements yet.",
++    missingFile: "This file doesn't exist yet.",
++    operation: {
++      ADDED: "added",
++      MODIFIED: "modified",
++      REMOVED: "removed",
++      RENAMED: "renamed",
++    } as Record<string, string>,
++    artifactDone: "done",
++    artifactPending: "not written yet",
++  },
++  plan: {
++    title: (change: string) => `Create work orders from ${change}`,
++    subtitle:
++      "One work order per task group in tasks.md. Checklist items become acceptance criteria, and each work order waits for the one before it.",
++    criteria: (n: number) =>
++      n === 1 ? "1 acceptance criterion" : `${n} acceptance criteria`,
++    after: (n: number) => `After #${n}`,
++    controls: "Controls",
++    create: (n: number) =>
++      n === 1 ? "Create 1 work order" : `Create ${n} work orders`,
++    creating: "Creating…",
++    created: (ids: string[]) => `Created ${ids.join(", ")}`,
++    existing: (ids: string[]) =>
++      `This change already has work orders (${ids.join(", ")}).`,
++  },
++  workOrders: {
++    title: "Work orders",
++    subtitle: (workspace: string) =>
++      `Backlog.md tasks in ${workspace}. Agents do the work; a person approves it.`,
++    allChanges: "All changes",
++    filterLabel: "Filter by change",
++    empty:
++      "No work orders yet. Open a change under Requirements and create them.",
++    notInitialized:
++      "This workspace doesn't have Backlog.md set up. Run backlog init there first.",
++    criteriaProgress: (done: number, total: number) => `${done}/${total}`,
++    criteriaLabel: "Acceptance criteria met",
++    waitingOn: (ids: string) => `Waits for ${ids}`,
++    conversations: (n: number) =>
++      n === 1 ? "1 conversation" : `${n} conversations`,
++    approvedBy: (who: string) => `Approved by ${who}`,
++    notApproved: "Not approved",
++    notApprovedHelp:
++      "This reached the final status without a person approving it here. An agent or a manual edit changed it. Review the work, then approve it or move it back.",
++    startAgent: "Start with an agent",
++    approve: "Approve",
++    moveTo: (status: string) => `Move to ${status}`,
++    reopen: (status: string) => `Move back to ${status}`,
++    description: "Description",
++    criteria: "Acceptance criteria",
++    finalSummary: "Final summary",
++    notes: "Implementation notes",
++    plan: "Implementation plan",
++    dependencies: "Depends on",
++    agentConversations: "Agent conversations",
++    noConversations: "No agent has worked on this yet.",
++    file: "File",
++    history: "History in the audit log",
++    openConversation: "Open",
++    closeDetail: "Close details",
++    labels: "Labels",
++  },
++  approve: {
++    title: (id: string) => `Approve ${id}`,
++    body: (status: string) =>
++      `Approving moves it to ${status} and records your name in the audit log. Check the acceptance criteria and the agent's summary first.`,
++    unmet: (n: number) =>
++      n === 1
++        ? "1 acceptance criterion isn't checked off."
++        : `${n} acceptance criteria aren't checked off.`,
++    openDependencies: (ids: string, status: string) =>
++      `It depends on ${ids}, which isn't ${status} yet.`,
++    noteLabel: "Note (optional)",
++    notePlaceholder: "What you checked, or anything a reviewer should know",
++    confirm: "Approve",
++    approving: "Approving…",
++    approved: (id: string) => `${id} approved`,
++  },
++  agent: {
++    title: (subject: string) => `Start an agent on ${subject}`,
++    agentLabel: "Agent",
++    activeProfile: "Your active agent",
++    noProfiles:
++      "No agent profiles yet. The conversation uses your default agent from Settings.",
++    folderLabel: "Working folder",
++    messageLabel: "First message",
++    messageHelp:
++      "Written from the work order. Edit it before you start if you like.",
++    start: "Start conversation",
++    starting: "Starting…",
++    workspaceMissing: (path: string) =>
++      `The workspace folder doesn't exist: ${path}`,
++    kinds: {
++      openhands: "OpenHands",
++      acp: "ACP agent",
++    } as Record<string, string>,
++  },
++  audit: {
++    title: "Audit log",
++    subtitle:
++      "Every approval, status change and work order edit. Each entry includes the hash of the one before it, so changing or deleting any line breaks the chain.",
++    verify: "Verify chain",
++    verifying: "Checking…",
++    intact: (n: number) => `Chain intact. ${n} entries checked.`,
++    broken: (seq: number, reason: string) =>
++      `Chain broken at #${seq}: ${reason}`,
++    filterLabel: "Filter",
++    filterPlaceholder: "Work order, person or action",
++    empty: "Nothing recorded yet.",
++    columns: {
++      seq: "#",
++      time: "Time",
++      actor: "Who",
++      action: "What",
++      subject: "About",
++      details: "Details",
++      hash: "Hash",
++    },
++    actions: {
++      "server.started": "Factory API started",
++      "specs.validated": "Validated specs",
++      "work_orders.created_from_change": "Created work orders from a change",
++      "work_order.file_created": "Work order file created",
++      "work_order.file_changed": "Work order file changed",
++      "work_order.status_changed": "Changed status",
++      "work_order.approved": "Approved",
++      "work_order.done_without_approval": "Finished without approval",
++      "work_order.conversation_started": "Started an agent conversation",
++      "change.conversation_started": "Started an agent conversation",
++    } as Record<string, string>,
++  },
++};
++
++export type FactoryCopy = typeof en;
++
++const es: FactoryCopy = {
++  nav: {
++    requirements: "Requisitos",
++    workOrders: "Órdenes de trabajo",
++    audit: "Registro de auditoría",
++  },
++  common: {
++    loading: "Cargando…",
++    retry: "Reintentar",
++    cancel: "Cancelar",
++    close: "Cerrar",
++    none: "Ninguno",
++    workspace: "Espacio de trabajo",
++  },
++  offline: {
++    title: "La API de Software Factory no está en ejecución",
++    body: "Estas páginas leen OpenSpec y Backlog.md a través de un pequeño servidor local. Inícielo desde la carpeta software-factory:",
++    command: "pnpm dev",
++    hint: "pnpm dev lo inicia junto con Canvas. Si Canvas ya está en ejecución, use pnpm dev:api.",
++  },
++  requirements: {
++    title: "Requisitos",
++    subtitle: (workspace) => `Cambios de OpenSpec en ${workspace}`,
++    changes: "Cambios en curso",
++    specs: "Especificaciones actuales",
++    noChanges:
++      "Aún no hay cambios. Pida a un agente que proponga uno con OpenSpec (/opsx:propose).",
++    noSpecs:
++      "Aún no hay ninguna. Las especificaciones aparecen aquí cuando se archiva un cambio.",
++    tasks: (done, total) => `${done}/${total} tareas`,
++    requirementCount: (n) => (n === 1 ? "1 requisito" : `${n} requisitos`),
++    pick: "Elija un cambio para ver sus requisitos.",
++    validate: "Validar",
++    validating: "Validando…",
++    valid: "Válido. OpenSpec no encontró problemas.",
++    invalid: (n) =>
++      n === 1
++        ? "OpenSpec encontró 1 problema:"
++        : `OpenSpec encontró ${n} problemas:`,
++    review: "Pedir revisión a un agente",
++    createWorkOrders: "Crear órdenes de trabajo",
++    viewWorkOrders: (n) =>
++      n === 1 ? "Ver 1 orden de trabajo" : `Ver ${n} órdenes de trabajo`,
++    tabs: {
++      requirements: "Requisitos",
++      proposal: "Propuesta",
++      design: "Diseño",
++      tasks: "Tareas",
++    },
++    noRequirements: "Este cambio aún no tiene requisitos de especificación.",
++    missingFile: "Este archivo aún no existe.",
++    operation: {
++      ADDED: "añadido",
++      MODIFIED: "modificado",
++      REMOVED: "eliminado",
++      RENAMED: "renombrado",
++    },
++    artifactDone: "listo",
++    artifactPending: "aún no escrito",
++  },
++  plan: {
++    title: (change) => `Crear órdenes de trabajo a partir de ${change}`,
++    subtitle:
++      "Una orden de trabajo por cada grupo de tareas de tasks.md. Los elementos de la lista pasan a ser criterios de aceptación, y cada orden espera a la anterior.",
++    criteria: (n) =>
++      n === 1 ? "1 criterio de aceptación" : `${n} criterios de aceptación`,
++    after: (n) => `Después de #${n}`,
++    controls: "Controles",
++    create: (n) =>
++      n === 1 ? "Crear 1 orden de trabajo" : `Crear ${n} órdenes de trabajo`,
++    creating: "Creando…",
++    created: (ids) => `Se crearon ${ids.join(", ")}`,
++    existing: (ids) =>
++      `Este cambio ya tiene órdenes de trabajo (${ids.join(", ")}).`,
++  },
++  workOrders: {
++    title: "Órdenes de trabajo",
++    subtitle: (workspace) =>
++      `Tareas de Backlog.md en ${workspace}. Los agentes hacen el trabajo; una persona lo aprueba.`,
++    allChanges: "Todos los cambios",
++    filterLabel: "Filtrar por cambio",
++    empty:
++      "Aún no hay órdenes de trabajo. Abra un cambio en Requisitos y créelas.",
++    notInitialized:
++      "Este espacio de trabajo no tiene Backlog.md configurado. Ejecute backlog init allí primero.",
++    criteriaProgress: (done, total) => `${done}/${total}`,
++    criteriaLabel: "Criterios de aceptación cumplidos",
++    waitingOn: (ids) => `Espera a ${ids}`,
++    conversations: (n) => (n === 1 ? "1 conversación" : `${n} conversaciones`),
++    approvedBy: (who) => `Aprobado por ${who}`,
++    notApproved: "Sin aprobar",
++    notApprovedHelp:
++      "Llegó al estado final sin que una persona lo aprobara aquí. Lo cambió un agente o una edición manual. Revise el trabajo y luego apruébelo o devuélvalo.",
++    startAgent: "Empezar con un agente",
++    approve: "Aprobar",
++    moveTo: (status) => `Mover a ${status}`,
++    reopen: (status) => `Devolver a ${status}`,
++    description: "Descripción",
++    criteria: "Criterios de aceptación",
++    finalSummary: "Resumen final",
++    notes: "Notas de implementación",
++    plan: "Plan de implementación",
++    dependencies: "Depende de",
++    agentConversations: "Conversaciones con agentes",
++    noConversations: "Ningún agente ha trabajado en esto todavía.",
++    file: "Archivo",
++    history: "Historial en el registro de auditoría",
++    openConversation: "Abrir",
++    closeDetail: "Cerrar detalles",
++    labels: "Etiquetas",
++  },
++  approve: {
++    title: (id) => `Aprobar ${id}`,
++    body: (status) =>
++      `Al aprobar, pasa a ${status} y su nombre queda en el registro de auditoría. Revise antes los criterios de aceptación y el resumen del agente.`,
++    unmet: (n) =>
++      n === 1
++        ? "Falta marcar 1 criterio de aceptación."
++        : `Faltan por marcar ${n} criterios de aceptación.`,
++    openDependencies: (ids, status) =>
++      `Depende de ${ids}, que aún no está en ${status}.`,
++    noteLabel: "Nota (opcional)",
++    notePlaceholder: "Qué revisó, o lo que deba saber quien revise",
++    confirm: "Aprobar",
++    approving: "Aprobando…",
++    approved: (id) => `${id} aprobado`,
++  },
++  agent: {
++    title: (subject) => `Empezar un agente en ${subject}`,
++    agentLabel: "Agente",
++    activeProfile: "Su agente activo",
++    noProfiles:
++      "Aún no hay perfiles de agente. La conversación usa su agente predeterminado de Configuración.",
++    folderLabel: "Carpeta de trabajo",
++    messageLabel: "Primer mensaje",
++    messageHelp:
++      "Redactado a partir de la orden de trabajo. Puede editarlo antes de empezar.",
++    start: "Iniciar conversación",
++    starting: "Iniciando…",
++    workspaceMissing: (path) =>
++      `La carpeta del espacio de trabajo no existe: ${path}`,
++    kinds: {
++      openhands: "OpenHands",
++      acp: "Agente ACP",
++    },
++  },
++  audit: {
++    title: "Registro de auditoría",
++    subtitle:
++      "Cada aprobación, cambio de estado y edición de una orden de trabajo. Cada entrada incluye el hash de la anterior, así que cambiar o borrar cualquier línea rompe la cadena.",
++    verify: "Verificar cadena",
++    verifying: "Comprobando…",
++    intact: (n) => `Cadena intacta. Se comprobaron ${n} entradas.`,
++    broken: (seq, reason) => `Cadena rota en #${seq}: ${reason}`,
++    filterLabel: "Filtrar",
++    filterPlaceholder: "Orden de trabajo, persona o acción",
++    empty: "Aún no hay nada registrado.",
++    columns: {
++      seq: "#",
++      time: "Hora",
++      actor: "Quién",
++      action: "Qué",
++      subject: "Sobre",
++      details: "Detalles",
++      hash: "Hash",
++    },
++    actions: {
++      "server.started": "Se inició la API de Factory",
++      "specs.validated": "Validó las especificaciones",
++      "work_orders.created_from_change":
++        "Creó órdenes de trabajo a partir de un cambio",
++      "work_order.file_created": "Se creó el archivo de la orden",
++      "work_order.file_changed": "Cambió el archivo de la orden",
++      "work_order.status_changed": "Cambió el estado",
++      "work_order.approved": "Aprobó",
++      "work_order.done_without_approval": "Se terminó sin aprobación",
++      "work_order.conversation_started":
++        "Inició una conversación con un agente",
++      "change.conversation_started": "Inició una conversación con un agente",
++    },
++  },
++};
++
++const COPY: Record<string, FactoryCopy> = { en, es };
++
++/** The factory's words in the current Canvas language (English if we don't have it). */
++export function useFactoryCopy(): FactoryCopy {
++  const { i18n } = useTranslation("openhands");
++  const lang = (i18n.resolvedLanguage ?? i18n.language ?? "en").split("-")[0];
++  return COPY[lang] ?? en;
++}
+diff --git a/src/factory/factory-nav-links.tsx b/src/factory/factory-nav-links.tsx
+new file mode 100644
+index 0000000..66e69e4
+--- /dev/null
++++ b/src/factory/factory-nav-links.tsx
+@@ -0,0 +1,35 @@
++import { FileText, ShieldCheck, SquareKanban } from "lucide-react";
++import { SidebarNavLink } from "#/components/features/sidebar/sidebar-nav-link";
++import { useFactoryCopy } from "./copy";
++
++const ICON_SIZE = 18;
++
++/** The Software Factory's entries in the Canvas sidebar. */
++export function FactoryNavLinks({ collapsed }: { collapsed: boolean }) {
++  const copy = useFactoryCopy();
++  return (
++    <>
++      <SidebarNavLink
++        to="/requirements"
++        label={copy.nav.requirements}
++        testId="sidebar-factory-requirements-link"
++        collapsed={collapsed}
++        icon={<FileText width={ICON_SIZE} height={ICON_SIZE} />}
++      />
++      <SidebarNavLink
++        to="/work-orders"
++        label={copy.nav.workOrders}
++        testId="sidebar-factory-work-orders-link"
++        collapsed={collapsed}
++        icon={<SquareKanban width={ICON_SIZE} height={ICON_SIZE} />}
++      />
++      <SidebarNavLink
++        to="/audit-log"
++        label={copy.nav.audit}
++        testId="sidebar-factory-audit-link"
++        collapsed={collapsed}
++        icon={<ShieldCheck width={ICON_SIZE} height={ICON_SIZE} />}
++      />
++    </>
++  );
++}
+diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
+new file mode 100644
+index 0000000..b1dbf7f
+--- /dev/null
++++ b/src/factory/hooks.ts
+@@ -0,0 +1,144 @@
++import React from "react";
++import {
++  useMutation,
++  useQuery,
++  useQueryClient,
++  type QueryClient,
++} from "@tanstack/react-query";
++import { FACTORY_API_BASE, FactoryApi, FactoryOfflineError } from "./api";
++
++export const FACTORY_QUERY_KEYS = {
++  all: ["factory"] as const,
++  health: ["factory", "health"] as const,
++  specs: ["factory", "specs"] as const,
++  change: (id: string) => ["factory", "specs", "change", id] as const,
++  plan: (id: string) => ["factory", "specs", "plan", id] as const,
++  workOrders: ["factory", "work-orders"] as const,
++  audit: ["factory", "audit"] as const,
++};
++
++// Don't hammer a server that isn't running; the offline card has a retry button.
++const retry = (count: number, error: unknown) =>
++  !(error instanceof FactoryOfflineError) && count < 2;
++
++export const useFactoryHealth = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.health,
++    queryFn: FactoryApi.health,
++    retry,
++    staleTime: 60_000,
++    meta: { disableToast: true },
++  });
++
++export const useSpecsOverview = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.specs,
++    queryFn: FactoryApi.specs,
++    retry,
++    meta: { disableToast: true },
++  });
++
++export const useChangeDetail = (id: string | undefined) =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.change(id ?? ""),
++    queryFn: () => FactoryApi.change(id ?? ""),
++    enabled: Boolean(id),
++    retry,
++    meta: { disableToast: true },
++  });
++
++export const useWorkOrderPlan = (id: string, enabled: boolean) =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.plan(id),
++    queryFn: () => FactoryApi.workOrderPlan(id),
++    enabled,
++    retry,
++    meta: { disableToast: true },
++  });
++
++export const useWorkOrders = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.workOrders,
++    queryFn: FactoryApi.workOrders,
++    retry,
++    meta: { disableToast: true },
++  });
++
++export const useAuditLog = () =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.audit,
++    queryFn: FactoryApi.audit,
++    retry,
++    meta: { disableToast: true },
++  });
++
++function invalidateFactory(queryClient: QueryClient) {
++  return queryClient.invalidateQueries({ queryKey: FACTORY_QUERY_KEYS.all });
++}
++
++export function useValidateSpecs() {
++  return useMutation({
++    mutationFn: FactoryApi.validate,
++    meta: { disableToast: true },
++  });
++}
++
++export function useCreateWorkOrders() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (change: string) => FactoryApi.createWorkOrders(change),
++    onSettled: () => invalidateFactory(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++export function useSetWorkOrderStatus() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (variables: {
++      id: string;
++      status: string;
++      approve?: boolean;
++      note?: string;
++    }) => {
++      const { id, ...body } = variables;
++      return FactoryApi.setStatus(id, body);
++    },
++    onSettled: () => invalidateFactory(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++/**
++ * Keep factory data fresh while a factory page is open. The API sends an
++ * event whenever an agent (or anyone) edits a work order or spec file, or the
++ * audit log grows, and we refetch what changed.
++ */
++export function useFactoryLiveUpdates() {
++  const queryClient = useQueryClient();
++  React.useEffect(() => {
++    if (typeof EventSource === "undefined") return undefined;
++    const source = new EventSource(`${FACTORY_API_BASE}/events`);
++    const refetch = (key: readonly string[]) => () =>
++      queryClient.invalidateQueries({ queryKey: key });
++    source.addEventListener(
++      "workorders.changed",
++      refetch(FACTORY_QUERY_KEYS.workOrders),
++    );
++    source.addEventListener("specs.changed", refetch(FACTORY_QUERY_KEYS.specs));
++    source.addEventListener("audit.appended", () => {
++      queryClient.invalidateQueries({ queryKey: FACTORY_QUERY_KEYS.audit });
++      queryClient.invalidateQueries({
++        queryKey: FACTORY_QUERY_KEYS.workOrders,
++      });
++    });
++    // After a reconnect (say the API restarted), pick up anything that changed
++    // while it was down. The first hello is just the initial connection.
++    let connectedBefore = false;
++    source.addEventListener("hello", () => {
++      if (connectedBefore) invalidateFactory(queryClient);
++      connectedBefore = true;
++    });
++    return () => source.close();
++  }, [queryClient]);
++}
+diff --git a/src/factory/routes/audit-log.tsx b/src/factory/routes/audit-log.tsx
+new file mode 100644
+index 0000000..690db11
+--- /dev/null
++++ b/src/factory/routes/audit-log.tsx
+@@ -0,0 +1,227 @@
++import React from "react";
++import { useTranslation } from "react-i18next";
++import { Link, useSearchParams } from "react-router";
++import { ShieldAlert, ShieldCheck } from "lucide-react";
++import { useMutation } from "@tanstack/react-query";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { cn } from "#/utils/utils";
++import { FactoryApi, type AuditEvent } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useAuditLog } from "../hooks";
++import {
++  FactoryError,
++  FactoryLoading,
++  FactoryPage,
++} from "../components/factory-page";
++import { actorName, formatWhen } from "../components/factory-badges";
++import { factoryFieldClassName } from "../components/start-agent-modal";
++
++const WORK_ORDER_ID = /^[a-z]+-\d+$/i;
++
++/** The few data fields worth showing inline for each kind of entry. */
++function summarize(event: AuditEvent): string {
++  const d = event.data;
++  const parts: string[] = [];
++  if (d.from !== undefined || d.to !== undefined) {
++    parts.push(`${String(d.from ?? "∅")} → ${String(d.to ?? "∅")}`);
++  } else if (typeof d.status === "string") {
++    parts.push(d.status);
++  }
++  if (Array.isArray(d.workOrders)) parts.push(d.workOrders.join(", "));
++  if (typeof d.agent === "string" && d.agent) parts.push(d.agent);
++  if (typeof d.note === "string") parts.push(`“${d.note}”`);
++  if (typeof d.file === "string") parts.push(d.file);
++  if (typeof d.workspace === "string") parts.push(d.workspace);
++  return parts.join(" · ");
++}
++
++function actionClassName(action: string) {
++  if (action === "work_order.approved") return "font-medium text-success";
++  if (action === "work_order.done_without_approval") {
++    return "font-medium text-warning";
++  }
++  return "text-foreground";
++}
++
++export default function FactoryAuditLogRoute() {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const [searchParams, setSearchParams] = useSearchParams();
++  const filter = searchParams.get("q") ?? "";
++  const audit = useAuditLog();
++  const verify = useMutation({
++    mutationFn: FactoryApi.verifyAudit,
++    meta: { disableToast: true },
++  });
++
++  const events = React.useMemo(() => {
++    const all = audit.data ?? [];
++    const q = filter.trim().toLowerCase();
++    if (!q) return all;
++    return all.filter((e) =>
++      [e.subject, e.actor, e.action, copy.audit.actions[e.action] ?? ""]
++        .join(" ")
++        .toLowerCase()
++        .includes(q),
++    );
++  }, [audit.data, filter, copy]);
++
++  const setFilter = (value: string) => {
++    const next = new URLSearchParams(searchParams);
++    if (value) next.set("q", value);
++    else next.delete("q");
++    setSearchParams(next, { replace: true });
++  };
++
++  return (
++    <FactoryPage
++      testId="factory-audit-log"
++      title={copy.audit.title}
++      subtitle={copy.audit.subtitle}
++      error={audit.error}
++      onRetry={() => void audit.refetch()}
++      actions={
++        <BrandButton
++          testId="factory-verify-chain"
++          type="button"
++          variant="secondary"
++          onClick={() => verify.mutate()}
++          isDisabled={verify.isPending}
++          startContent={<ShieldCheck className="size-4" aria-hidden />}
++        >
++          {verify.isPending ? copy.audit.verifying : copy.audit.verify}
++        </BrandButton>
++      }
++    >
++      <div className="flex flex-col gap-4 px-6 py-5">
++        {verify.data ? (
++          <p
++            role="status"
++            data-testid="factory-verify-result"
++            className={cn(
++              "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm",
++              verify.data.ok
++                ? "border-border-subtle text-foreground"
++                : "border-feedback-error text-feedback-error",
++            )}
++          >
++            {verify.data.ok ? (
++              <ShieldCheck className="size-4 text-success" aria-hidden />
++            ) : (
++              <ShieldAlert className="size-4" aria-hidden />
++            )}
++            {verify.data.ok
++              ? copy.audit.intact(verify.data.checked)
++              : copy.audit.broken(
++                  verify.data.brokenAt ?? 0,
++                  verify.data.reason ?? "",
++                )}
++          </p>
++        ) : null}
++        <FactoryError error={verify.error} />
++
++        <label className="flex max-w-md flex-col gap-1.5 text-sm text-muted">
++          {copy.audit.filterLabel}
++          <input
++            type="search"
++            data-testid="factory-audit-filter"
++            className={factoryFieldClassName}
++            placeholder={copy.audit.filterPlaceholder}
++            value={filter}
++            onChange={(e) => setFilter(e.target.value)}
++          />
++        </label>
++
++        {audit.isLoading ? <FactoryLoading /> : null}
++        {audit.data && events.length === 0 ? (
++          <p className="text-sm text-muted">{copy.audit.empty}</p>
++        ) : null}
++
++        {events.length > 0 ? (
++          <div className="overflow-x-auto rounded-xl border border-border-subtle">
++            <table className="w-full text-left text-sm">
++              <thead className="bg-surface text-xs text-muted">
++                <tr>
++                  <th scope="col" className="px-3 py-2 font-medium">
++                    {copy.audit.columns.seq}
++                  </th>
++                  <th scope="col" className="px-3 py-2 font-medium">
++                    {copy.audit.columns.time}
++                  </th>
++                  <th scope="col" className="px-3 py-2 font-medium">
++                    {copy.audit.columns.actor}
++                  </th>
++                  <th scope="col" className="px-3 py-2 font-medium">
++                    {copy.audit.columns.action}
++                  </th>
++                  <th scope="col" className="px-3 py-2 font-medium">
++                    {copy.audit.columns.subject}
++                  </th>
++                  <th scope="col" className="px-3 py-2 font-medium">
++                    {copy.audit.columns.details}
++                  </th>
++                  <th scope="col" className="px-3 py-2 font-medium">
++                    {copy.audit.columns.hash}
++                  </th>
++                </tr>
++              </thead>
++              <tbody className="divide-y divide-border-subtle">
++                {events.map((e) => (
++                  <tr key={e.seq} className="align-top">
++                    <td className="px-3 py-2 font-mono text-xs tabular-nums text-muted">
++                      {e.seq}
++                    </td>
++                    <td className="whitespace-nowrap px-3 py-2 text-muted">
++                      <time dateTime={e.at}>
++                        {formatWhen(e.at, i18n.language)}
++                      </time>
++                    </td>
++                    <td className="whitespace-nowrap px-3 py-2 text-foreground">
++                      {actorName(e.actor)}
++                    </td>
++                    <td className={cn("px-3 py-2", actionClassName(e.action))}>
++                      {copy.audit.actions[e.action] ?? e.action}
++                      {e.action === "work_order.conversation_started" ||
++                      e.action === "change.conversation_started" ? (
++                        <>
++                          {" "}
++                          <Link
++                            to={`/conversations/${String(e.data.conversationId)}`}
++                            className="text-link hover:underline"
++                          >
++                            {copy.workOrders.openConversation}
++                          </Link>
++                        </>
++                      ) : null}
++                    </td>
++                    <td className="whitespace-nowrap px-3 py-2 font-mono text-xs">
++                      {WORK_ORDER_ID.test(e.subject) ? (
++                        <Link
++                          to={`/work-orders/${e.subject}`}
++                          className="text-link hover:underline"
++                        >
++                          {e.subject}
++                        </Link>
++                      ) : (
++                        <span className="text-muted">{e.subject}</span>
++                      )}
++                    </td>
++                    <td className="max-w-sm break-words px-3 py-2 text-xs text-muted">
++                      {summarize(e)}
++                    </td>
++                    <td
++                      className="px-3 py-2 font-mono text-xs text-muted"
++                      title={e.hash}
++                    >
++                      {e.hash.slice(0, 10)}
++                    </td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        ) : null}
++      </div>
++    </FactoryPage>
++  );
++}
+diff --git a/src/factory/routes/requirements.tsx b/src/factory/routes/requirements.tsx
+new file mode 100644
+index 0000000..20fa232
+--- /dev/null
++++ b/src/factory/routes/requirements.tsx
+@@ -0,0 +1,433 @@
++import React from "react";
++import { Link, NavLink, useNavigate, useParams } from "react-router";
++import { Bot, CircleCheck, CircleDashed, ListChecks } from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { cn } from "#/utils/utils";
++import {
++  FactoryApi,
++  type ChangeDetail,
++  type Requirement,
++  type ValidationResult,
++} from "../api";
++import { useFactoryCopy } from "../copy";
++import {
++  useChangeDetail,
++  useFactoryHealth,
++  useSpecsOverview,
++  useValidateSpecs,
++  useWorkOrders,
++} from "../hooks";
++import {
++  FactoryError,
++  FactoryLoading,
++  FactoryPage,
++} from "../components/factory-page";
++import { FactoryMarkdown } from "../components/factory-markdown";
++import { StartAgentModal } from "../components/start-agent-modal";
++import { WorkOrderPlanModal } from "../components/work-order-plan-modal";
++
++type Tab = "requirements" | "proposal" | "design" | "tasks";
++const TABS: Tab[] = ["requirements", "proposal", "design", "tasks"];
++
++export default function FactoryRequirementsRoute() {
++  const copy = useFactoryCopy();
++  const { changeId } = useParams();
++  const navigate = useNavigate();
++  const overview = useSpecsOverview();
++  const health = useFactoryHealth();
++  const changes = overview.data?.changes.changes ?? [];
++  const specs = overview.data?.specs.specs ?? [];
++
++  // Open the first change when none is picked.
++  React.useEffect(() => {
++    if (!changeId && changes[0]) {
++      navigate(`/requirements/${changes[0].name}`, { replace: true });
++    }
++  }, [changeId, changes, navigate]);
++
++  return (
++    <FactoryPage
++      testId="factory-requirements"
++      title={copy.requirements.title}
++      subtitle={
++        health.data
++          ? copy.requirements.subtitle(health.data.workspace.name)
++          : undefined
++      }
++      error={overview.error}
++      onRetry={() => void overview.refetch()}
++      fill
++    >
++      <aside className="w-72 shrink-0 overflow-y-auto border-r border-border-subtle px-3 py-4 custom-scrollbar">
++        <h2 className="px-2 text-xs font-medium text-muted">
++          {copy.requirements.changes}
++        </h2>
++        <ul className="mt-1 flex flex-col gap-0.5">
++          {changes.map((c) => (
++            <li key={c.name}>
++              <NavLink
++                to={`/requirements/${c.name}`}
++                className={({ isActive }) =>
++                  cn(
++                    "block rounded-lg px-2 py-2 hover:bg-surface-raised",
++                    isActive && "bg-interactive-selected",
++                  )
++                }
++              >
++                <span className="block truncate font-mono text-sm text-foreground">
++                  {c.name}
++                </span>
++                <span className="mt-1.5 flex items-center gap-2">
++                  <span
++                    className="h-1 flex-1 overflow-hidden rounded-full bg-surface-raised"
++                    aria-hidden
++                  >
++                    <span
++                      className="block h-full w-(--factory-progress) bg-success"
++                      style={
++                        {
++                          "--factory-progress": `${c.totalTasks ? (100 * c.completedTasks) / c.totalTasks : 0}%`,
++                        } as React.CSSProperties
++                      }
++                    />
++                  </span>
++                  <span className="text-xs tabular-nums text-muted">
++                    {copy.requirements.tasks(c.completedTasks, c.totalTasks)}
++                  </span>
++                </span>
++              </NavLink>
++            </li>
++          ))}
++          {overview.data && changes.length === 0 ? (
++            <li className="px-2 py-2 text-sm text-muted">
++              {copy.requirements.noChanges}
++            </li>
++          ) : null}
++        </ul>
++
++        <h2 className="mt-6 px-2 text-xs font-medium text-muted">
++          {copy.requirements.specs}
++        </h2>
++        <ul className="mt-1">
++          {specs.map((s) => (
++            <li key={s.id} className="px-2 py-1 text-sm">
++              <span className="font-mono text-foreground">{s.id}</span>{" "}
++              <span className="text-muted">
++                {copy.requirements.requirementCount(s.requirementCount)}
++              </span>
++            </li>
++          ))}
++          {overview.data && specs.length === 0 ? (
++            <li className="px-2 py-1 text-sm text-muted">
++              {copy.requirements.noSpecs}
++            </li>
++          ) : null}
++        </ul>
++      </aside>
++
++      <section className="min-w-0 flex-1 overflow-y-auto custom-scrollbar-always">
++        {overview.isLoading ? <FactoryLoading /> : null}
++        {changeId ? <ChangeView key={changeId} id={changeId} /> : null}
++        {!changeId && overview.data && changes.length > 0 ? (
++          <p className="px-6 py-6 text-sm text-muted">
++            {copy.requirements.pick}
++          </p>
++        ) : null}
++      </section>
++    </FactoryPage>
++  );
++}
++
++function ChangeView({ id }: { id: string }) {
++  const copy = useFactoryCopy();
++  const detail = useChangeDetail(id);
++  const workOrders = useWorkOrders();
++  const validate = useValidateSpecs();
++  const [tab, setTab] = React.useState<Tab>("requirements");
++  const [planOpen, setPlanOpen] = React.useState(false);
++  const [reviewOpen, setReviewOpen] = React.useState(false);
++
++  if (detail.error) {
++    return (
++      <div className="px-6 py-4">
++        <FactoryError error={detail.error} />
++      </div>
++    );
++  }
++  if (!detail.data) return <FactoryLoading />;
++
++  const { data } = detail;
++  const requirements = data.show.deltas.filter((d) => d.requirement);
++  const linked =
++    workOrders.data?.workOrders.filter((w) =>
++      w.labels.includes(`change:${id}`),
++    ) ?? [];
++  const markdown: Record<Exclude<Tab, "requirements">, string | null> = {
++    proposal: data.files.proposal,
++    design: data.files.design,
++    tasks: data.files.tasks,
++  };
++
++  return (
++    <div className="max-w-4xl px-6 py-5">
++      <div className="flex flex-wrap items-start gap-3">
++        <div className="min-w-0 flex-1">
++          <h2 className="font-mono text-base font-semibold text-foreground">
++            {data.id}
++          </h2>
++          <ArtifactChecks status={data.status} />
++        </div>
++        <BrandButton
++          testId="factory-validate"
++          type="button"
++          variant="secondary"
++          onClick={() => validate.mutate()}
++          isDisabled={validate.isPending}
++        >
++          {validate.isPending
++            ? copy.requirements.validating
++            : copy.requirements.validate}
++        </BrandButton>
++        <BrandButton
++          testId="factory-review-change"
++          type="button"
++          variant="secondary"
++          onClick={() => setReviewOpen(true)}
++          startContent={<Bot className="size-4" aria-hidden />}
++        >
++          {copy.requirements.review}
++        </BrandButton>
++        {linked.length ? (
++          <Link
++            to={`/work-orders?change=${encodeURIComponent(id)}`}
++            data-testid="factory-view-work-orders"
++            className="inline-flex h-9 items-center gap-2 rounded-lg border border-border bg-base-secondary px-3 text-sm text-contrast hover:bg-surface-raised"
++          >
++            <ListChecks className="size-4" aria-hidden />
++            {copy.requirements.viewWorkOrders(linked.length)}
++          </Link>
++        ) : (
++          <BrandButton
++            testId="factory-create-work-orders"
++            type="button"
++            variant="primary"
++            onClick={() => setPlanOpen(true)}
++            isDisabled={!data.files.tasks}
++            startContent={<ListChecks className="size-4" aria-hidden />}
++          >
++            {copy.requirements.createWorkOrders}
++          </BrandButton>
++        )}
++      </div>
++
++      <ValidationMessage
++        id={id}
++        result={validate.data}
++        error={validate.error}
++      />
++
++      <div
++        role="tablist"
++        aria-label={data.id}
++        className="mt-5 flex gap-1 border-b border-border-subtle"
++      >
++        {TABS.map((t) => (
++          <button
++            key={t}
++            type="button"
++            role="tab"
++            id={`factory-tab-${t}`}
++            aria-selected={tab === t}
++            aria-controls="factory-tab-panel"
++            onClick={() => setTab(t)}
++            className={cn(
++              "-mb-px border-b-2 px-3 py-2 text-sm",
++              tab === t
++                ? "border-primary font-medium text-foreground"
++                : "border-transparent text-muted hover:text-foreground",
++            )}
++          >
++            {copy.requirements.tabs[t]}
++            {t === "requirements" ? (
++              <span className="ml-1.5 text-muted">{requirements.length}</span>
++            ) : null}
++          </button>
++        ))}
++      </div>
++
++      <div
++        id="factory-tab-panel"
++        role="tabpanel"
++        aria-labelledby={`factory-tab-${tab}`}
++        className="py-2"
++      >
++        {tab === "requirements" &&
++          (requirements.length ? (
++            requirements.map((d, i) => (
++              <RequirementBlock
++                key={`${d.spec}-${i}`}
++                requirement={d.requirement as Requirement}
++                operation={d.operation}
++                spec={d.spec}
++              />
++            ))
++          ) : (
++            <p className="py-4 text-sm text-muted">
++              {copy.requirements.noRequirements}
++            </p>
++          ))}
++        {tab !== "requirements" &&
++          (markdown[tab] ? (
++            <FactoryMarkdown
++              text={markdown[tab] ?? ""}
++              headings
++              className="py-2"
++            />
++          ) : (
++            <p className="py-4 text-sm text-muted">
++              {copy.requirements.missingFile}
++            </p>
++          ))}
++      </div>
++
++      {planOpen ? (
++        <WorkOrderPlanModal change={id} onClose={() => setPlanOpen(false)} />
++      ) : null}
++      {reviewOpen ? (
++        <StartAgentModal
++          subject={id}
++          loadBrief={async () =>
++            (await FactoryApi.changeBrief(id, "review")).text
++          }
++          onStarted={(conversationId, agent) =>
++            FactoryApi.linkChangeConversation(id, conversationId, agent).then(
++              () => undefined,
++            )
++          }
++          onClose={() => setReviewOpen(false)}
++        />
++      ) : null}
++    </div>
++  );
++}
++
++function ArtifactChecks({ status }: { status: ChangeDetail["status"] }) {
++  const copy = useFactoryCopy();
++  return (
++    <ul className="mt-1.5 flex flex-wrap gap-3 text-xs">
++      {status.artifacts.map((a) => {
++        const done = a.status === "done";
++        return (
++          <li
++            key={a.id}
++            className={cn(
++              "inline-flex items-center gap-1",
++              done ? "text-foreground" : "text-muted",
++            )}
++          >
++            {done ? (
++              <CircleCheck className="size-3.5 text-success" aria-hidden />
++            ) : (
++              <CircleDashed className="size-3.5" aria-hidden />
++            )}
++            {a.id}
++            <span className="sr-only">
++              {done
++                ? copy.requirements.artifactDone
++                : copy.requirements.artifactPending}
++            </span>
++          </li>
++        );
++      })}
++    </ul>
++  );
++}
++
++function ValidationMessage({
++  id,
++  result,
++  error,
++}: {
++  id: string;
++  result?: ValidationResult;
++  error: Error | null;
++}) {
++  const copy = useFactoryCopy();
++  if (error) {
++    return (
++      <p role="alert" className="mt-3 text-sm text-feedback-error">
++        {error.message}
++      </p>
++    );
++  }
++  if (!result) return null;
++  const mine = result.items.find((item) => item.id === id);
++  if (!mine || mine.valid) {
++    return (
++      <p
++        role="status"
++        className="mt-3 inline-flex items-center gap-1.5 text-sm text-foreground"
++      >
++        <CircleCheck className="size-4 text-success" aria-hidden />
++        {copy.requirements.valid}
++      </p>
++    );
++  }
++  return (
++    <div role="alert" className="mt-3 text-sm text-foreground">
++      <p>{copy.requirements.invalid(mine.issues.length)}</p>
++      <ul className="mt-1 list-disc pl-5 text-muted">
++        {mine.issues.map((issue, i) => (
++          <li key={i}>
++            <span className="font-mono">{issue.path}</span>
++            {": "}
++            {issue.message}
++          </li>
++        ))}
++      </ul>
++    </div>
++  );
++}
++
++function RequirementBlock({
++  requirement,
++  operation,
++  spec,
++}: {
++  requirement: Requirement;
++  operation: string;
++  spec: string;
++}) {
++  const copy = useFactoryCopy();
++  return (
++    <article className="border-b border-border-subtle py-4 last:border-b-0">
++      <header className="flex flex-wrap items-baseline gap-x-2">
++        <h3 className="text-sm font-semibold text-foreground">
++          {requirement.name ?? requirement.text}
++        </h3>
++        <span className="text-xs text-success">
++          {copy.requirements.operation[operation] ?? operation.toLowerCase()}
++        </span>
++        <span className="font-mono text-xs text-muted">{spec}</span>
++      </header>
++      {requirement.name ? (
++        <FactoryMarkdown text={requirement.text} className="mt-1" />
++      ) : null}
++      <div className="mt-2 flex flex-col gap-2">
++        {requirement.scenarios.map((scenario, i) => (
++          <div
++            key={scenario.name ?? i}
++            className="border-l-2 border-border-subtle pl-3"
++          >
++            {scenario.name ? (
++              <div className="text-xs font-medium text-muted">
++                {scenario.name}
++              </div>
++            ) : null}
++            <FactoryMarkdown text={scenario.rawText} />
++          </div>
++        ))}
++      </div>
++    </article>
++  );
++}
+diff --git a/src/factory/routes/work-orders.tsx b/src/factory/routes/work-orders.tsx
+new file mode 100644
+index 0000000..79de68c
+--- /dev/null
++++ b/src/factory/routes/work-orders.tsx
+@@ -0,0 +1,522 @@
++import React from "react";
++import { useTranslation } from "react-i18next";
++import { Link, useNavigate, useParams, useSearchParams } from "react-router";
++import {
++  Bot,
++  CircleCheck,
++  Circle,
++  GitBranch,
++  History,
++  MessageSquare,
++  ShieldCheck,
++  TriangleAlert,
++  X,
++} from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { cn } from "#/utils/utils";
++import { FactoryApi, type WorkOrder, type WorkOrderList } from "../api";
++import { useFactoryCopy } from "../copy";
++import {
++  useFactoryHealth,
++  useSetWorkOrderStatus,
++  useWorkOrders,
++} from "../hooks";
++import {
++  FactoryError,
++  FactoryLoading,
++  FactoryPage,
++} from "../components/factory-page";
++import {
++  LabelChip,
++  StatusPill,
++  actorName,
++  formatWhen,
++} from "../components/factory-badges";
++import { FactoryMarkdown } from "../components/factory-markdown";
++import { ApproveModal } from "../components/approve-modal";
++import {
++  StartAgentModal,
++  factoryFieldClassName,
++} from "../components/start-agent-modal";
++
++const changeOf = (wo: WorkOrder) =>
++  wo.labels.find((l) => l.startsWith("change:"))?.slice("change:".length);
++
++export default function FactoryWorkOrdersRoute() {
++  const copy = useFactoryCopy();
++  const { workOrderId } = useParams();
++  const [searchParams, setSearchParams] = useSearchParams();
++  const navigate = useNavigate();
++  const health = useFactoryHealth();
++  const list = useWorkOrders();
++  const changeFilter = searchParams.get("change") ?? "";
++
++  const all = list.data?.workOrders ?? [];
++  const changes = [...new Set(all.map(changeOf).filter(Boolean))] as string[];
++  const shown = changeFilter
++    ? all.filter((w) => changeOf(w) === changeFilter)
++    : all;
++  const selected = workOrderId
++    ? all.find((w) => w.id.toLowerCase() === workOrderId.toLowerCase())
++    : undefined;
++  const query = searchParams.toString();
++  const hrefFor = (id?: string) =>
++    `/work-orders${id ? `/${id}` : ""}${query ? `?${query}` : ""}`;
++
++  return (
++    <FactoryPage
++      testId="factory-work-orders"
++      title={copy.workOrders.title}
++      subtitle={
++        health.data
++          ? copy.workOrders.subtitle(health.data.workspace.name)
++          : undefined
++      }
++      error={list.error}
++      onRetry={() => void list.refetch()}
++      fill
++      actions={
++        changes.length > 0 ? (
++          <label className="flex items-center gap-2 text-sm text-muted">
++            {copy.workOrders.filterLabel}
++            <select
++              data-testid="factory-change-filter"
++              className={cn(factoryFieldClassName, "h-9 w-auto py-0")}
++              value={changeFilter}
++              onChange={(e) => {
++                const next = new URLSearchParams(searchParams);
++                if (e.target.value) next.set("change", e.target.value);
++                else next.delete("change");
++                setSearchParams(next);
++              }}
++            >
++              <option value="">{copy.workOrders.allChanges}</option>
++              {changes.map((c) => (
++                <option key={c} value={c}>
++                  {c}
++                </option>
++              ))}
++            </select>
++          </label>
++        ) : null
++      }
++    >
++      <div className="min-w-0 flex-1 overflow-auto custom-scrollbar-always">
++        {list.isLoading ? <FactoryLoading /> : null}
++        {list.data && !list.data.initialized ? (
++          <p className="px-6 py-6 text-sm text-muted">
++            {copy.workOrders.notInitialized}
++          </p>
++        ) : null}
++        {list.data?.initialized && all.length === 0 ? (
++          <p className="px-6 py-6 text-sm text-muted">
++            {copy.workOrders.empty}{" "}
++            <Link to="/requirements" className="text-link underline">
++              {copy.nav.requirements}
++            </Link>
++          </p>
++        ) : null}
++        {list.data && all.length > 0 ? (
++          <Board
++            list={list.data}
++            workOrders={shown}
++            selectedId={selected?.id}
++            hrefFor={hrefFor}
++          />
++        ) : null}
++      </div>
++      {selected && list.data ? (
++        <WorkOrderDetail
++          key={selected.id}
++          workOrder={selected}
++          list={list.data}
++          hrefFor={hrefFor}
++          onClose={() => navigate(hrefFor())}
++        />
++      ) : null}
++    </FactoryPage>
++  );
++}
++
++function Board({
++  list,
++  workOrders,
++  selectedId,
++  hrefFor,
++}: {
++  list: WorkOrderList;
++  workOrders: WorkOrder[];
++  selectedId?: string;
++  hrefFor: (id?: string) => string;
++}) {
++  return (
++    <div className="flex min-h-full gap-4 px-6 py-5">
++      {list.statuses.map((status) => {
++        const column = workOrders.filter((w) => w.status === status);
++        return (
++          <section
++            key={status}
++            aria-label={status}
++            className="flex min-w-56 max-w-80 flex-1 basis-0 flex-col gap-2"
++          >
++            <h2 className="flex items-center gap-2 px-1 text-xs font-medium text-muted">
++              <StatusPill status={status} statuses={list.statuses} />
++              <span className="tabular-nums">{column.length}</span>
++            </h2>
++            {column.map((wo) => (
++              <WorkOrderCard
++                key={wo.id}
++                workOrder={wo}
++                list={list}
++                selected={wo.id === selectedId}
++                href={hrefFor(wo.id)}
++              />
++            ))}
++          </section>
++        );
++      })}
++    </div>
++  );
++}
++
++function WorkOrderCard({
++  workOrder: wo,
++  list,
++  selected,
++  href,
++}: {
++  workOrder: WorkOrder;
++  list: WorkOrderList;
++  selected: boolean;
++  href: string;
++}) {
++  const copy = useFactoryCopy();
++  const done = wo.acceptanceCriteria.filter((ac) => ac.done).length;
++  const total = wo.acceptanceCriteria.length;
++  const waitingOn = wo.dependencies.filter(
++    (d) =>
++      list.workOrders.find((w) => w.id.toLowerCase() === d.toLowerCase())
++        ?.status !== list.finalStatus,
++  );
++  return (
++    <Link
++      to={href}
++      data-testid={`factory-work-order-${wo.id}`}
++      aria-current={selected ? "true" : undefined}
++      className={cn(
++        "flex flex-col gap-2 rounded-xl border bg-surface px-3 py-2.5 hover:bg-surface-raised focus:outline-none focus-visible:ring-2 focus-visible:ring-focus",
++        selected ? "border-primary" : "border-border-subtle",
++      )}
++    >
++      <span className="flex items-baseline gap-2">
++        <span className="font-mono text-xs text-muted">{wo.id}</span>
++        <span className="min-w-0 flex-1 text-sm font-medium text-foreground">
++          {wo.title}
++        </span>
++      </span>
++      <span className="flex flex-wrap gap-1">
++        {wo.labels
++          .filter((l) => l.startsWith("control:"))
++          .map((l) => (
++            <LabelChip key={l} label={l} />
++          ))}
++      </span>
++      <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
++        {total > 0 ? (
++          <span
++            className="inline-flex items-center gap-1 tabular-nums"
++            title={copy.workOrders.criteriaLabel}
++          >
++            <CircleCheck className="size-3.5" aria-hidden />
++            {copy.workOrders.criteriaProgress(done, total)}
++          </span>
++        ) : null}
++        {wo.conversations.length ? (
++          <span className="inline-flex items-center gap-1">
++            <MessageSquare className="size-3.5" aria-hidden />
++            {copy.workOrders.conversations(wo.conversations.length)}
++          </span>
++        ) : null}
++        {waitingOn.length > 0 && wo.status !== list.finalStatus ? (
++          <span className="inline-flex items-center gap-1">
++            <GitBranch className="size-3.5" aria-hidden />
++            {copy.workOrders.waitingOn(waitingOn.join(", "))}
++          </span>
++        ) : null}
++        {wo.approval ? (
++          <span className="inline-flex items-center gap-1 text-success">
++            <ShieldCheck className="size-3.5" aria-hidden />
++            {copy.workOrders.approvedBy(actorName(wo.approval.by))}
++          </span>
++        ) : null}
++        {wo.doneWithoutApproval ? (
++          <span className="inline-flex items-center gap-1 text-warning">
++            <TriangleAlert className="size-3.5" aria-hidden />
++            {copy.workOrders.notApproved}
++          </span>
++        ) : null}
++      </span>
++    </Link>
++  );
++}
++
++function WorkOrderDetail({
++  workOrder: wo,
++  list,
++  hrefFor,
++  onClose,
++}: {
++  workOrder: WorkOrder;
++  list: WorkOrderList;
++  hrefFor: (id?: string) => string;
++  onClose: () => void;
++}) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const setStatus = useSetWorkOrderStatus();
++  const [agentOpen, setAgentOpen] = React.useState(false);
++  const [approveOpen, setApproveOpen] = React.useState(false);
++  const { statuses, finalStatus } = list;
++  const index = statuses.indexOf(wo.status);
++  const isFinal = wo.status === finalStatus;
++  // Moves a person can make without approving: any non-final status other than the current one.
++  const moves = statuses.filter((s) => s !== wo.status && s !== finalStatus);
++  const reviewStatus = statuses.at(-2) ?? statuses[0];
++  const canApprove = (!isFinal && index > 0) || wo.doneWithoutApproval;
++  const openDependencies = wo.dependencies.filter(
++    (d) =>
++      list.workOrders.find((w) => w.id.toLowerCase() === d.toLowerCase())
++        ?.status !== finalStatus,
++  );
++
++  return (
++    <aside
++      data-testid="factory-work-order-detail"
++      aria-label={`${wo.id} ${wo.title}`}
++      className="flex w-104 shrink-0 flex-col overflow-y-auto border-l border-border-subtle bg-base-secondary custom-scrollbar"
++    >
++      <div className="flex items-center gap-3 border-b border-border-subtle px-5 py-3">
++        <span className="font-mono text-sm text-muted">{wo.id}</span>
++        <StatusPill status={wo.status} statuses={statuses} />
++        <button
++          type="button"
++          onClick={onClose}
++          aria-label={copy.workOrders.closeDetail}
++          className="ml-auto inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-interactive-hover hover:text-contrast"
++        >
++          <X className="size-4" aria-hidden />
++        </button>
++      </div>
++
++      <div className="flex flex-col gap-5 px-5 py-4">
++        <h2 className="text-base font-semibold text-foreground">{wo.title}</h2>
++
++        {wo.approval ? (
++          <p className="flex items-center gap-2 text-sm text-foreground">
++            <ShieldCheck className="size-4 text-success" aria-hidden />
++            {`${copy.workOrders.approvedBy(actorName(wo.approval.by))} · ${formatWhen(wo.approval.at, i18n.language)}`}
++          </p>
++        ) : null}
++        {wo.doneWithoutApproval ? (
++          <div
++            role="alert"
++            className="flex flex-col gap-2 rounded-lg border border-border bg-surface px-3 py-2.5 text-sm"
++          >
++            <p className="flex items-center gap-2 font-medium text-foreground">
++              <TriangleAlert className="size-4 text-warning" aria-hidden />
++              {copy.workOrders.notApproved}
++            </p>
++            <p className="text-muted">{copy.workOrders.notApprovedHelp}</p>
++          </div>
++        ) : null}
++
++        <div className="flex flex-wrap gap-2">
++          {/* Not started: the next step is an agent. Started: the next step is your approval. */}
++          {canApprove ? (
++            <BrandButton
++              testId="factory-approve"
++              type="button"
++              variant="primary"
++              onClick={() => setApproveOpen(true)}
++              startContent={<ShieldCheck className="size-4" aria-hidden />}
++            >
++              {copy.workOrders.approve}
++            </BrandButton>
++          ) : null}
++          {!isFinal ? (
++            <BrandButton
++              testId="factory-start-agent"
++              type="button"
++              variant={canApprove ? "secondary" : "primary"}
++              onClick={() => setAgentOpen(true)}
++              startContent={<Bot className="size-4" aria-hidden />}
++            >
++              {copy.workOrders.startAgent}
++            </BrandButton>
++          ) : null}
++          {moves.map((status) => (
++            <BrandButton
++              key={status}
++              type="button"
++              variant="tertiary"
++              onClick={() => setStatus.mutate({ id: wo.id, status })}
++              isDisabled={setStatus.isPending}
++            >
++              {isFinal && status === reviewStatus
++                ? copy.workOrders.reopen(status)
++                : copy.workOrders.moveTo(status)}
++            </BrandButton>
++          ))}
++        </div>
++        <FactoryError error={setStatus.error} />
++
++        {wo.description ? (
++          <DetailSection title={copy.workOrders.description}>
++            <FactoryMarkdown text={wo.description} />
++          </DetailSection>
++        ) : null}
++
++        {wo.acceptanceCriteria.length ? (
++          <DetailSection title={copy.workOrders.criteria}>
++            <ul className="flex flex-col gap-1.5">
++              {wo.acceptanceCriteria.map((ac) => (
++                <li key={ac.index} className="flex items-start gap-2 text-sm">
++                  {ac.done ? (
++                    <CircleCheck
++                      className="mt-0.5 size-4 shrink-0 text-success"
++                      aria-label={copy.requirements.artifactDone}
++                    />
++                  ) : (
++                    <Circle
++                      className="mt-0.5 size-4 shrink-0 text-muted"
++                      aria-hidden
++                    />
++                  )}
++                  <FactoryMarkdown text={ac.text} className="min-w-0" />
++                </li>
++              ))}
++            </ul>
++          </DetailSection>
++        ) : null}
++
++        {wo.finalSummary ? (
++          <DetailSection title={copy.workOrders.finalSummary}>
++            <FactoryMarkdown text={wo.finalSummary} />
++          </DetailSection>
++        ) : null}
++        {wo.notes ? (
++          <DetailSection title={copy.workOrders.notes}>
++            <FactoryMarkdown text={wo.notes} />
++          </DetailSection>
++        ) : null}
++        {wo.plan ? (
++          <DetailSection title={copy.workOrders.plan}>
++            <FactoryMarkdown text={wo.plan} />
++          </DetailSection>
++        ) : null}
++
++        <DetailSection title={copy.workOrders.agentConversations}>
++          {wo.conversations.length ? (
++            <ul className="flex flex-col gap-1">
++              {wo.conversations.map((c) => (
++                <li key={c.id} className="text-sm">
++                  <Link
++                    to={`/conversations/${c.id}`}
++                    className="inline-flex items-center gap-1.5 text-link hover:underline"
++                  >
++                    <MessageSquare className="size-3.5" aria-hidden />
++                    {c.agent || copy.workOrders.openConversation}
++                  </Link>{" "}
++                  <span className="text-muted">
++                    {`${actorName(c.by)} · ${formatWhen(c.at, i18n.language)}`}
++                  </span>
++                </li>
++              ))}
++            </ul>
++          ) : (
++            <p className="text-sm text-muted">
++              {copy.workOrders.noConversations}
++            </p>
++          )}
++        </DetailSection>
++
++        {wo.dependencies.length ? (
++          <DetailSection title={copy.workOrders.dependencies}>
++            <ul className="flex flex-wrap gap-2">
++              {wo.dependencies.map((d) => (
++                <li key={d}>
++                  <Link
++                    to={hrefFor(d)}
++                    className="font-mono text-sm text-link hover:underline"
++                  >
++                    {d}
++                  </Link>
++                </li>
++              ))}
++            </ul>
++          </DetailSection>
++        ) : null}
++
++        {wo.labels.length ? (
++          <DetailSection title={copy.workOrders.labels}>
++            <div className="flex flex-wrap gap-1">
++              {wo.labels.map((l) => (
++                <LabelChip key={l} label={l} />
++              ))}
++            </div>
++          </DetailSection>
++        ) : null}
++
++        <DetailSection title={copy.workOrders.file}>
++          <code className="break-all font-mono text-xs text-muted">
++            {wo.file}
++          </code>
++        </DetailSection>
++
++        <Link
++          to={`/audit-log?q=${encodeURIComponent(wo.id)}`}
++          className="inline-flex items-center gap-1.5 text-sm text-link hover:underline"
++        >
++          <History className="size-4" aria-hidden />
++          {copy.workOrders.history}
++        </Link>
++      </div>
++
++      {agentOpen ? (
++        <StartAgentModal
++          subject={wo.id}
++          loadBrief={async () => (await FactoryApi.workOrderBrief(wo.id)).text}
++          onStarted={(conversationId, agent) =>
++            FactoryApi.linkConversation(wo.id, conversationId, agent).then(
++              () => undefined,
++            )
++          }
++          onClose={() => setAgentOpen(false)}
++        />
++      ) : null}
++      {approveOpen ? (
++        <ApproveModal
++          workOrder={wo}
++          finalStatus={finalStatus}
++          openDependencies={openDependencies}
++          onClose={() => setApproveOpen(false)}
++        />
++      ) : null}
++    </aside>
++  );
++}
++
++function DetailSection({
++  title,
++  children,
++}: {
++  title: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <section className="flex flex-col gap-1.5">
++      <h3 className="text-xs font-medium text-muted">{title}</h3>
++      {children}
++    </section>
++  );
++}
+diff --git a/src/routes.ts b/src/routes.ts
+index 4e50cac..151a78e 100644
+--- a/src/routes.ts
++++ b/src/routes.ts
+@@ -40,6 +40,10 @@ export default [
+     route("automations/new/:automationId", "routes/automation-setup-route.tsx"),
+     route("automations/setup", "routes/automation-setup-new.tsx"),
+     route("automations/:automationId", "routes/automation-detail.tsx"),
++    // Software Factory (src/factory): requirements, work orders, audit log.
++    route("requirements/:changeId?", "factory/routes/requirements.tsx"),
++    route("work-orders/:workOrderId?", "factory/routes/work-orders.tsx"),
++    route("audit-log", "factory/routes/audit-log.tsx"),
+     // Unknown URLs (including /settings/<x>) render inside the app shell.
+     route("*", "routes/not-found.tsx"),
+   ]),
+diff --git a/vite.config.ts b/vite.config.ts
+index 26241f5..3e53d2e 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -440,6 +440,11 @@ export default defineConfig(({ mode }) => {
+           changeOrigin: true,
+           secure: !INSECURE_SKIP_VERIFY,
+         },
++        // Software Factory API (apps/server in the software-factory repo).
++        "/sf-api": {
++          target: process.env.SF_API_URL || "http://127.0.0.1:4317",
++          changeOrigin: true,
++        },
+         "/sockets": {
+           target: WS_URL,
+           ws: true,

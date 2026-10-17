@@ -1,0 +1,7 @@
+{
+  "repo": "https://github.com/OpenHands/OpenHands.git",
+  "commit": "045290739f0af2ae4cc89d2a209c6bd930bb81ee",
+  "version": "1.27.1",
+  "branch": "factory",
+  "patch": "patches/canvas-factory.patch"
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+*.log
+.DS_Store
+# Your OpenHands Canvas clone is its own git repo (pnpm setup:canvas).
+# Its changes are kept here as patches/canvas-factory.patch.
+canvas/
+# Files retired from the standalone version; delete whenever you like.
+_to_delete/
