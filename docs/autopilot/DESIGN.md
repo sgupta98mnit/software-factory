@@ -241,7 +241,34 @@ when `release.auto` and autonomy is autonomous), `releasedSha` and
 `releasedAt`; audited as `autopilot.release_requested`, `release_failed` and
 `run_released`. `POST /runs/:id/release` is the Pipeline's Release button.
 
-## 14. Changes since the first build
+## 14. Evidence
+
+`GET /runs/:id/evidence` (evidence.ts) puts together, from the ledger, git and
+the audit log, what an assessor asks for. Nothing in it is new state:
+
+- `traceability`: every `#### Scenario:` of the change's specs, as the
+  released commit (or the integration tip) has them, with the hidden tests
+  for it (file, sha256 from the manifest, how often each ran and how it last
+  ended) and the work orders it needs, each with who let it in: `{by, kind}`
+  where `kind` is `policy` (`policy@<hash>`) or `person`.
+- `workOrders`: risk, controls, acceptance, approval, the merge sha, and
+  `mergeReasons`, the policy rules that sent it to a person (empty when the
+  policy merged it because every rule held). Also the last review verdict,
+  builder count, checks passed and failed, and cost.
+- `controls`: each NIST control the plan names, and the work orders that carry it.
+- `decisions`: every decided Inbox item in order, with the option label the
+  person saw, their note, who and when.
+- `spec` (validations, critic verdict, the plan's approver), `policy` (hash,
+  source, cap, autoMerge, review blocking, hidden tests, release.auto),
+  `release`, and `audit` (this run's event count and seq range, plus
+  `verifyAudit()` over the whole chain).
+
+`?download=1` adds `Content-Disposition: attachment;
+filename="evidence-<change>-<run>.json"` and records
+`autopilot.evidence_exported` (counts only). The Canvas page
+`/autopilot/runs/:id/evidence` shows the same JSON, linked from the Pipeline.
+
+## 15. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

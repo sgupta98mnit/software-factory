@@ -135,6 +135,7 @@ Factory UI code lives in `canvas\src\factory\`. Canvas is its own git repo on a 
 - **Telemetry is off.** `pnpm setup:canvas` sets `VITE_DO_NOT_TRACK=1` for Canvas, and OpenSpec runs with telemetry disabled. With that set, the only outside requests the browser made in testing were Google Fonts and an npm registry version check.
 - **Canvas makes the workspace a git repo.** The first conversation in a folder that isn't one runs `git init` (no commit) so Canvas can show the agent's changes as a diff.
 - **Subscriptions vs. products.** Your own Claude and Codex logins are fine while you build. Something you ship to agencies must use API keys or an approved endpoint such as Bedrock. Anthropic's terms don't let third-party products use claude.ai logins.
+- **Evidence per run.** The Pipeline's Evidence link traces each scenario of the spec to the hidden test that checks it, the work orders that built it, and who let each one in (a person, or the policy with its hash and reasons). It also lists the controls, the decisions made and whether the audit chain holds. Download JSON saves it for an assessor, and the export is recorded in the audit log.
 - The factory API listens on 127.0.0.1 only.
 
 ## Troubleshooting

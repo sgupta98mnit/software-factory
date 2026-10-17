@@ -1995,6 +1995,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   return {
     ledger,
+    workspace,
     createRun,
     decide,
     pause,

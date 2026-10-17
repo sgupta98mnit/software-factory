@@ -7,6 +7,8 @@ import { LOCAL_USER } from "../config.js";
 import type { Attempt, InboxItem, Run, WorkOrder } from "./ledger.js";
 import type { Orchestrator } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
+import { buildEvidence } from "./evidence.js";
+import { audit } from "../audit.js";
 
 // Work-order states that count as in progress.
 const ACTIVE_WO = new Set<string>(["building", "verifying", "reviewing", "ready", "awaiting_merge_approval", "merging"]);
@@ -185,6 +187,17 @@ export function createAutopilotRoutes(o: Orchestrator) {
       return c.json(summary(updated));
     });
   }
+
+  // Scenario <-> hidden test <-> work order <-> approval, for assessors. ?download=1 saves it as a file (and says so in the audit log).
+  app.get("/runs/:id/evidence", async (c) => {
+    const run = mustRun(c.req.param("id"));
+    const evidence = await buildEvidence(ledger, o.workspace, run);
+    if (c.req.query("download")) {
+      await audit(LOCAL_USER, "autopilot.evidence_exported", run.id, { change: run.change, scenarios: evidence.traceability.length, workOrders: evidence.workOrders.length });
+      c.header("Content-Disposition", `attachment; filename="evidence-${run.change}-${run.id}.json"`);
+    }
+    return c.json(evidence);
+  });
 
   app.post("/runs/:id/release", async (c) => {
     const run = mustRun(c.req.param("id"));

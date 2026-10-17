@@ -20,22 +20,23 @@ index 821b542..1ec6a3c 100644
              key={`${page.extension.name}:${page.contribution.id}`}
 diff --git a/src/factory/README.md b/src/factory/README.md
 new file mode 100644
-index 0000000..cfc572e
+index 0000000..8bd5ba0
 --- /dev/null
 +++ b/src/factory/README.md
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,66 @@
 +# Software Factory pages
 +
 +This folder adds the Software Factory's pages to Agent Canvas for spec-driven, governed delivery:
 +
-+| Page | Route | Reads |
-+| --- | --- | --- |
-+| Autopilot (Home) | `/autopilot` | Goal box, autonomy dial, budget, setup status, the list of runs |
-+| Pipeline | `/autopilot/runs/:runId/:workOrderKey?` | One run: stage lanes, waves of work orders, decisions, each work order's agents and checks |
-+| Inbox | `/inbox` | Decisions Autopilot leaves to a person, across runs; the sidebar shows how many wait |
-+| Requirements | `/requirements/:changeId?` | OpenSpec changes: proposal, specs with scenarios, design, tasks |
-+| Work orders | `/work-orders/:workOrderId?` | Backlog.md tasks, as a board with a detail panel |
-+| Audit log | `/audit-log` | The factory's hash-chained audit log |
++| Page             | Route                                   | Reads                                                                                                                                                |
++| ---------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
++| Autopilot (Home) | `/autopilot`                            | Goal box, autonomy dial, budget, setup status, the list of runs                                                                                      |
++| Pipeline         | `/autopilot/runs/:runId/:workOrderKey?` | One run: stage lanes, waves of work orders, decisions, each work order's agents and checks                                                           |
++| Evidence         | `/autopilot/runs/:runId/evidence`       | For an assessor: scenario, hidden test, work order and who approved it (a person or the policy), controls, decisions, audit chain; downloads as JSON |
++| Inbox            | `/inbox`                                | Decisions Autopilot leaves to a person, across runs; the sidebar shows how many wait                                                                 |
++| Requirements     | `/requirements/:changeId?`              | OpenSpec changes: proposal, specs with scenarios, design, tasks                                                                                      |
++| Work orders      | `/work-orders/:workOrderId?`            | Backlog.md tasks, as a board with a detail panel                                                                                                     |
++| Audit log        | `/audit-log`                            | The factory's hash-chained audit log                                                                                                                 |
 +
 +The data comes from the Software Factory API (`apps/server` in the software-factory
 +repo), not from the OpenHands agent server. Vite proxies `/sf-api` to it
@@ -91,10 +92,10 @@ index 0000000..cfc572e
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..fdb8028
+index 0000000..1891875
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,613 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -533,6 +534,113 @@ index 0000000..fdb8028
 +const post = <T>(path: string, body: unknown = {}) =>
 +  request<T>(path, { method: "POST", body: JSON.stringify(body) });
 +
++/** Who let something in: a person, or the policy (`policy@<hash>`). */
++export interface EvidenceApproval {
++  by: string;
++  kind: "policy" | "person";
++}
++
++/** GET /autopilot/runs/:id/evidence: the run's evidence for an assessor (see evidence.ts on the server). */
++export interface Evidence {
++  generatedAt: string;
++  run: {
++    id: string;
++    goal: string;
++    change: string;
++    autonomy: Autonomy;
++    state: RunState;
++    createdBy: string;
++    createdAt: string;
++    baseBranch: string;
++    integrationBranch: string;
++    integrationSha: string | null;
++    costUsd: number;
++    budgetUsd: number;
++  };
++  policy: {
++    hash: string | null;
++    actor: string;
++    source: string | null;
++    autonomyMax: Autonomy;
++    autoMerge: Record<string, unknown>;
++    reviewBlocking: string[];
++    hiddenTests: boolean;
++    releaseAuto: boolean;
++  };
++  spec: {
++    validations: { ok: boolean; at: string }[];
++    critic: string | null;
++    committed: { at: string; by: string; seq: number } | null;
++    planApproval: (EvidenceApproval & { at: string }) | null;
++  };
++  traceability: {
++    capability: string;
++    requirement: string;
++    scenario: string;
++    hiddenTests: {
++      file: string;
++      sha256: string;
++      requires: string[];
++      runs: number;
++      lastOk: boolean | null;
++      lastAt: string | null;
++    }[];
++    workOrders: {
++      key: string;
++      title: string | null;
++      state: AutopilotWorkOrderState | null;
++      approval: EvidenceApproval | null;
++    }[];
++  }[];
++  workOrders: {
++    key: string;
++    title: string;
++    risk: "low" | "medium" | "high";
++    controls: string[];
++    acceptance: string[];
++    state: AutopilotWorkOrderState;
++    approval: EvidenceApproval | null;
++    mergedAt: string | null;
++    mergeSha: string | null;
++    /** Why a person had to decide; empty when the policy merged it. */
++    mergeReasons: string[];
++    review: { verdict: string; findings: number } | null;
++    builders: number;
++    checks: { passed: number; failed: number; names: string[] };
++    costUsd: number;
++  }[];
++  controls: {
++    control: string;
++    workOrders: {
++      key: string;
++      state: AutopilotWorkOrderState;
++      approval: EvidenceApproval | null;
++    }[];
++  }[];
++  decisions: {
++    kind: InboxKind;
++    title: string;
++    workOrder: string | null;
++    decision: string | null;
++    /** The option's label as the person saw it. */
++    choice: string | null;
++    note: string | null;
++    by: string | null;
++    at: string | null;
++  }[];
++  release: ({ sha: string; at: string | null } & EvidenceApproval) | null;
++  audit: {
++    events: number;
++    firstSeq: number | null;
++    lastSeq: number | null;
++    chain: AuditVerification;
++  };
++}
++
++/** Where the browser saves a run's evidence as a JSON file (the API records the export). */
++export const evidenceDownloadUrl = (id: string) =>
++  `${FACTORY_API_BASE}/autopilot/runs/${encodeURIComponent(id)}/evidence?download=1`;
++
 +export const FactoryApi = {
 +  health: () => request<FactoryHealth>("/health"),
 +  specs: () => request<SpecsOverview>("/specs"),
@@ -593,6 +701,8 @@ index 0000000..fdb8028
 +    ),
 +  release: (id: string) =>
 +    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/release`),
++  evidence: (id: string) =>
++    request<Evidence>(`/autopilot/runs/${encodeURIComponent(id)}/evidence`),
 +  inbox: (state: "open" | "decided" | "all" = "open") =>
 +    request<InboxItem[]>(`/autopilot/inbox?state=${state}`),
 +  inboxCount: () => request<{ open: number }>("/autopilot/inbox/count"),
@@ -1649,10 +1759,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..1495e93
+index 0000000..342d6d3
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,927 @@
+@@ -0,0 +1,1069 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1952,6 +2062,76 @@ index 0000000..1495e93
 +      release: "Release",
 +    } as Record<string, string>,
 +    decidedToast: "Decision recorded",
++  },
++  evidence: {
++    title: "Evidence",
++    open: "Evidence",
++    back: "Back to the pipeline",
++    subtitle:
++      "For an assessor: each scenario of the spec, the hidden test that checks it, the work orders that built it, and who let each one in. Built from the ledger, git and the audit log.",
++    download: "Download JSON",
++    downloadHelp:
++      "Saves this evidence as a JSON file. The export is recorded in the audit log.",
++    generated: (when: string) => `Generated ${when}`,
++    labels: {
++      policy: "Policy",
++      autonomy: "Autonomy",
++      cost: "Cost",
++      chain: "Audit chain",
++      release: "Release",
++      spec: "Spec",
++    },
++    chainOk: (n: number) => `Intact · ${n} entries for this run`,
++    chainBroken: (seq: number) => `Broken at #${seq}`,
++    notReleased: "Not released",
++    released: (who: string, sha: string) => `Released by ${who} (${sha})`,
++    releasedByPolicy: (sha: string) => `Released by the policy (${sha})`,
++    validations: (ok: number, total: number) =>
++      `openspec validate passed ${ok} of ${total}`,
++    critic: (verdict: string) => `Critic: ${verdict}`,
++    planApprovedBy: (who: string) => `Plan approved by ${who}`,
++    traceability: "Traceability",
++    traceabilityHelp:
++      "A hidden test is written from the scenario before any code and kept from the builders; its header names the work orders it needs.",
++    noScenarios: "The spec has no scenarios yet.",
++    hiddenOff:
++      "Hidden tests are off in this policy, so no test checks a scenario independently of the builders. Turn on hiddenTests in .factory/policy.yml.",
++    noHiddenTest: "No hidden test",
++    notRun: "Not run",
++    ran: (n: number) => (n === 1 ? "ran once" : `ran ${n} times`),
++    columns: {
++      scenario: "Requirement and scenario",
++      hiddenTest: "Hidden test",
++      workOrders: "Built by",
++      workOrder: "Work order",
++      risk: "Risk",
++      controls: "Controls",
++      checks: "Checks",
++      review: "Review",
++      approval: "Let in by",
++      reasons: "Why",
++      when: "When",
++      kind: "Decision",
++      choice: "Choice",
++      by: "By",
++      note: "Note",
++    },
++    byPolicy: "Policy",
++    notMerged: "Not merged",
++    allRulesHeld: "Every policy rule held",
++    checks: (passed: number, failed: number) =>
++      failed ? `${passed} passed, ${failed} failed` : `${passed} passed`,
++    review: (verdict: string, findings: number) =>
++      findings ? `${verdict}, ${findings} findings` : verdict,
++    builders: (n: number) => (n === 1 ? "1 builder" : `${n} builders`),
++    workOrders: "Work orders",
++    controls: "Controls",
++    controlsHelp:
++      "The NIST 800-53 controls the plan names, and the work orders that implement them.",
++    noControls: "The plan names no controls.",
++    decisions: "Decisions",
++    decisionsHelp: "Everything decided in the Inbox, and who decided it.",
++    noDecisions: "No decisions yet.",
 +  },
 +  plan: {
 +    title: (change: string) => `Create work orders from ${change}`,
@@ -2407,6 +2587,78 @@ index 0000000..1495e93
 +    },
 +    decidedToast: "Decisión registrada",
 +  },
++  evidence: {
++    title: "Evidencia",
++    open: "Evidencia",
++    back: "Volver al flujo",
++    subtitle:
++      "Para un evaluador: cada escenario de la especificación, la prueba oculta que lo comprueba, las órdenes de trabajo que lo construyeron y quién aprobó cada una. Se genera a partir del registro, git y el registro de auditoría.",
++    download: "Descargar JSON",
++    downloadHelp:
++      "Guarda esta evidencia como archivo JSON. La exportación queda en el registro de auditoría.",
++    generated: (when) => `Generada ${when}`,
++    labels: {
++      policy: "Política",
++      autonomy: "Autonomía",
++      cost: "Coste",
++      chain: "Cadena de auditoría",
++      release: "Publicación",
++      spec: "Especificación",
++    },
++    chainOk: (n) => `Intacta · ${n} entradas de esta ejecución`,
++    chainBroken: (seq) => `Rota en #${seq}`,
++    notReleased: "Sin publicar",
++    released: (who, sha) => `Publicada por ${who} (${sha})`,
++    releasedByPolicy: (sha) => `Publicada por la política (${sha})`,
++    validations: (ok, total) => `openspec validate pasó ${ok} de ${total}`,
++    critic: (verdict) => `Crítico: ${verdict}`,
++    planApprovedBy: (who) => `Plan aprobado por ${who}`,
++    traceability: "Trazabilidad",
++    traceabilityHelp:
++      "Una prueba oculta se escribe a partir del escenario antes del código y no la ven los constructores; su cabecera indica las órdenes que necesita.",
++    noScenarios: "La especificación aún no tiene escenarios.",
++    hiddenOff:
++      "Las pruebas ocultas están desactivadas en esta política, así que ninguna prueba comprueba un escenario con independencia de los constructores. Active hiddenTests en .factory/policy.yml.",
++    noHiddenTest: "Sin prueba oculta",
++    notRun: "Sin ejecutar",
++    ran: (n) => (n === 1 ? "se ejecutó una vez" : `se ejecutó ${n} veces`),
++    columns: {
++      scenario: "Requisito y escenario",
++      hiddenTest: "Prueba oculta",
++      workOrders: "Construido por",
++      workOrder: "Orden de trabajo",
++      risk: "Riesgo",
++      controls: "Controles",
++      checks: "Comprobaciones",
++      review: "Revisión",
++      approval: "Aprobada por",
++      reasons: "Por qué",
++      when: "Cuándo",
++      kind: "Decisión",
++      choice: "Opción",
++      by: "Por",
++      note: "Nota",
++    },
++    byPolicy: "Política",
++    notMerged: "Sin integrar",
++    allRulesHeld: "Se cumplieron todas las reglas de la política",
++    checks: (passed, failed) =>
++      failed
++        ? `${passed} correctas, ${failed} fallidas`
++        : `${passed} correctas`,
++    review: (verdict, findings) =>
++      findings ? `${verdict}, ${findings} hallazgos` : verdict,
++    builders: (n) => (n === 1 ? "1 constructor" : `${n} constructores`),
++    workOrders: "Órdenes de trabajo",
++    controls: "Controles",
++    controlsHelp:
++      "Los controles NIST 800-53 que nombra el plan y las órdenes de trabajo que los implementan.",
++    noControls: "El plan no nombra controles.",
++    decisions: "Decisiones",
++    decisionsHelp:
++      "Todo lo que se decidió en la bandeja de entrada, y quién lo decidió.",
++    noDecisions: "Aún no hay decisiones.",
++  },
 +  plan: {
 +    title: (change) => `Crear órdenes de trabajo a partir de ${change}`,
 +    subtitle:
@@ -2665,10 +2917,10 @@ index 0000000..6cda042
 +}
 diff --git a/src/factory/factory-routes.ts b/src/factory/factory-routes.ts
 new file mode 100644
-index 0000000..cba4719
+index 0000000..a90f6d1
 --- /dev/null
 +++ b/src/factory/factory-routes.ts
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,22 @@
 +import { route } from "@react-router/dev/routes";
 +
 +/**
@@ -2678,6 +2930,10 @@ index 0000000..cba4719
 + */
 +export const factoryRoutes = [
 +  route("autopilot", "factory/routes/autopilot.tsx"),
++  route(
++    "autopilot/runs/:runId/evidence",
++    "factory/routes/autopilot-evidence.tsx",
++  ),
 +  route(
 +    "autopilot/runs/:runId/:workOrderKey?",
 +    "factory/routes/autopilot-run.tsx",
@@ -2689,10 +2945,10 @@ index 0000000..cba4719
 +];
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..3a6914e
+index 0000000..b7ebd75
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,307 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -2720,6 +2976,8 @@ index 0000000..3a6914e
 +  autopilotStatus: ["factory", "autopilot", "status"] as const,
 +  runs: ["factory", "autopilot", "runs"] as const,
 +  run: (id: string) => ["factory", "autopilot", "runs", id] as const,
++  evidence: (id: string) =>
++    ["factory", "autopilot", "runs", id, "evidence"] as const,
 +  inbox: (state: string) => ["factory", "autopilot", "inbox", state] as const,
 +  inboxCount: ["factory", "autopilot", "inbox-count"] as const,
 +};
@@ -2846,6 +3104,15 @@ index 0000000..3a6914e
 +    // The ETA and agent costs move between events; a slow poll keeps them honest.
 +    refetchInterval: (query) =>
 +      isNotFound(query.state.error) ? false : 15_000,
++    meta: { disableToast: true },
++  });
++
++export const useEvidence = (id: string | undefined) =>
++  useQuery({
++    queryKey: FACTORY_QUERY_KEYS.evidence(id ?? ""),
++    queryFn: () => FactoryApi.evidence(id ?? ""),
++    enabled: Boolean(id),
++    retry,
 +    meta: { disableToast: true },
 +  });
 +
@@ -3223,12 +3490,636 @@ index 0000000..380b38f
 +    </FactoryPage>
 +  );
 +}
+diff --git a/src/factory/routes/autopilot-evidence.tsx b/src/factory/routes/autopilot-evidence.tsx
+new file mode 100644
+index 0000000..34c36a7
+--- /dev/null
++++ b/src/factory/routes/autopilot-evidence.tsx
+@@ -0,0 +1,618 @@
++import React from "react";
++import { useTranslation } from "react-i18next";
++import { Link, useParams } from "react-router";
++import {
++  ArrowLeft,
++  CircleCheck,
++  CircleDashed,
++  CircleX,
++  FileDown,
++  Shield,
++  ShieldAlert,
++  ShieldCheck,
++  UserCheck,
++} from "lucide-react";
++import type { Evidence, EvidenceApproval } from "../api";
++import { evidenceDownloadUrl, isNotFound } from "../api";
++import { useFactoryCopy } from "../copy";
++import { useEvidence } from "../hooks";
++import {
++  FactoryError,
++  FactoryLoading,
++  FactoryPage,
++} from "../components/factory-page";
++import { formatWhen } from "../components/factory-badges";
++import {
++  RiskChip,
++  RunStatePill,
++  WorkOrderStatePill,
++  approverName,
++  formatMoney,
++} from "../components/autopilot-badges";
++
++const TABLE_WRAP = "overflow-x-auto rounded-xl border border-border-subtle";
++const TH = "px-3 py-2 font-medium";
++const TD = "px-3 py-2";
++
++/** What an assessor reads: scenario to hidden test to work order to who let it in. */
++export default function FactoryAutopilotEvidenceRoute() {
++  const copy = useFactoryCopy();
++  const { runId } = useParams();
++  const evidence = useEvidence(runId);
++  const data = evidence.data;
++
++  return (
++    <FactoryPage
++      testId="factory-evidence"
++      title={copy.evidence.title}
++      subtitle={
++        data ? (
++          <span className="flex flex-wrap gap-x-3">
++            <span>{data.run.goal}</span>
++            <span className="font-mono">{data.run.change}</span>
++          </span>
++        ) : undefined
++      }
++      error={evidence.error}
++      onRetry={() => void evidence.refetch()}
++      actions={
++        runId && data ? (
++          <a
++            href={evidenceDownloadUrl(runId)}
++            download
++            data-testid="factory-evidence-download"
++            title={copy.evidence.downloadHelp}
++            className="inline-flex items-center gap-1.5 rounded-lg border border-border-subtle px-3 py-2 text-sm text-foreground hover:bg-surface"
++          >
++            <FileDown className="size-4" aria-hidden />
++            {copy.evidence.download}
++          </a>
++        ) : null
++      }
++    >
++      <div className="flex flex-col gap-6 px-6 py-5">
++        <Link
++          to={`/autopilot/runs/${runId}`}
++          className="inline-flex items-center gap-1.5 self-start text-sm text-link hover:underline"
++        >
++          <ArrowLeft className="size-4" aria-hidden />
++          {copy.evidence.back}
++        </Link>
++        <p className="max-w-3xl text-sm text-muted">{copy.evidence.subtitle}</p>
++        {evidence.isLoading ? <FactoryLoading /> : null}
++        {isNotFound(evidence.error) ? (
++          <p className="text-sm text-muted">{copy.pipeline.notFound}</p>
++        ) : null}
++        {evidence.error && !data && !isNotFound(evidence.error) ? (
++          <FactoryError error={evidence.error} />
++        ) : null}
++        {data ? <EvidenceBody evidence={data} /> : null}
++      </div>
++    </FactoryPage>
++  );
++}
++
++function EvidenceBody({ evidence }: { evidence: Evidence }) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  return (
++    <>
++      <Summary evidence={evidence} />
++      <Traceability evidence={evidence} />
++      <WorkOrders evidence={evidence} />
++      <Controls evidence={evidence} />
++      <Decisions evidence={evidence} />
++      <p className="text-xs text-muted">
++        {copy.evidence.generated(
++          formatWhen(evidence.generatedAt, i18n.language),
++        )}
++      </p>
++    </>
++  );
++}
++
++/** A person by name, or the policy with its hash. */
++function Approval({ approval }: { approval: EvidenceApproval | null }) {
++  const copy = useFactoryCopy();
++  if (!approval)
++    return <span className="text-muted">{copy.evidence.notMerged}</span>;
++  if (approval.kind === "policy")
++    return (
++      <span
++        className="inline-flex items-center gap-1 whitespace-nowrap"
++        data-approval="policy"
++      >
++        <Shield className="size-3.5 text-muted" aria-hidden />
++        {copy.evidence.byPolicy}
++        <span className="font-mono text-xs text-muted">{approval.by}</span>
++      </span>
++    );
++  return (
++    <span
++      className="inline-flex items-center gap-1 whitespace-nowrap"
++      data-approval="person"
++    >
++      <UserCheck className="size-3.5 text-muted" aria-hidden />
++      {approverName(approval.by)}
++    </span>
++  );
++}
++
++function Summary({ evidence }: { evidence: Evidence }) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const { run, policy, spec, release, audit } = evidence;
++  const ok = spec.validations.filter((v) => v.ok).length;
++  const specLine = [
++    spec.validations.length
++      ? copy.evidence.validations(ok, spec.validations.length)
++      : null,
++    spec.critic ? copy.evidence.critic(spec.critic) : null,
++    spec.planApproval
++      ? copy.evidence.planApprovedBy(
++          spec.planApproval.kind === "policy"
++            ? spec.planApproval.by
++            : approverName(spec.planApproval.by),
++        )
++      : null,
++  ].filter(Boolean);
++  let releaseLine: string = copy.evidence.notReleased;
++  if (release)
++    releaseLine =
++      release.kind === "policy"
++        ? copy.evidence.releasedByPolicy(release.sha.slice(0, 10))
++        : copy.evidence.released(
++            approverName(release.by),
++            release.sha.slice(0, 10),
++          );
++
++  return (
++    <dl
++      className="grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2 xl:grid-cols-3"
++      data-testid="factory-evidence-summary"
++    >
++      <Item label={copy.pipeline.labels.state}>
++        <RunStatePill state={run.state} />
++      </Item>
++      <Item label={copy.evidence.labels.policy}>
++        <span className="font-mono">{policy.actor}</span>
++      </Item>
++      <Item label={copy.evidence.labels.autonomy}>
++        {copy.autopilot.autonomy[run.autonomy]?.label ?? run.autonomy}
++      </Item>
++      <Item label={copy.evidence.labels.cost}>
++        {copy.autopilot.cost(
++          formatMoney(run.costUsd, i18n.language),
++          formatMoney(run.budgetUsd, i18n.language),
++        )}
++      </Item>
++      <Item label={copy.evidence.labels.spec}>
++        {specLine.length ? specLine.join(" · ") : copy.common.none}
++      </Item>
++      <Item label={copy.evidence.labels.release}>
++        <span data-testid="factory-evidence-release">{releaseLine}</span>
++      </Item>
++      <Item label={copy.evidence.labels.chain}>
++        <span
++          data-testid="factory-evidence-chain"
++          className={
++            audit.chain.ok
++              ? "inline-flex items-center gap-1.5"
++              : "inline-flex items-center gap-1.5 text-feedback-error"
++          }
++        >
++          {audit.chain.ok ? (
++            <ShieldCheck className="size-4 text-success" aria-hidden />
++          ) : (
++            <ShieldAlert className="size-4" aria-hidden />
++          )}
++          {audit.chain.ok
++            ? copy.evidence.chainOk(audit.events)
++            : copy.evidence.chainBroken(audit.chain.brokenAt ?? 0)}
++        </span>
++      </Item>
++    </dl>
++  );
++}
++
++function Item({
++  label,
++  children,
++}: {
++  label: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <div className="flex min-w-0 flex-col gap-0.5">
++      <dt className="text-xs text-muted">{label}</dt>
++      <dd className="text-foreground">{children}</dd>
++    </div>
++  );
++}
++
++function SectionHeading({
++  id,
++  title,
++  help,
++}: {
++  id: string;
++  title: string;
++  help?: string;
++}) {
++  return (
++    <div>
++      <h2 id={id} className="text-sm font-semibold text-foreground">
++        {title}
++      </h2>
++      {help ? <p className="text-xs text-muted">{help}</p> : null}
++    </div>
++  );
++}
++
++function HiddenStatus({ lastOk }: { lastOk: boolean | null }) {
++  const copy = useFactoryCopy();
++  if (lastOk === null)
++    return (
++      <CircleDashed
++        className="size-4 shrink-0 text-muted"
++        aria-label={copy.evidence.notRun}
++      />
++    );
++  return lastOk ? (
++    <CircleCheck
++      className="size-4 shrink-0 text-success"
++      aria-label={copy.pipeline.labels.passed}
++    />
++  ) : (
++    <CircleX
++      className="size-4 shrink-0 text-feedback-error"
++      aria-label={copy.pipeline.labels.failed}
++    />
++  );
++}
++
++function Traceability({ evidence }: { evidence: Evidence }) {
++  const copy = useFactoryCopy();
++  const runBase = `/autopilot/runs/${evidence.run.id}`;
++  return (
++    <section
++      aria-labelledby="factory-evidence-trace"
++      className="flex flex-col gap-3"
++    >
++      <SectionHeading
++        id="factory-evidence-trace"
++        title={copy.evidence.traceability}
++        help={
++          evidence.policy.hiddenTests
++            ? copy.evidence.traceabilityHelp
++            : copy.evidence.hiddenOff
++        }
++      />
++      {evidence.traceability.length ? (
++        <div className={TABLE_WRAP}>
++          <table
++            className="w-full text-left text-sm"
++            data-testid="factory-evidence-trace"
++          >
++            <thead className="bg-surface text-xs text-muted">
++              <tr>
++                <th scope="col" className={TH}>
++                  {copy.evidence.columns.scenario}
++                </th>
++                <th scope="col" className={TH}>
++                  {copy.evidence.columns.hiddenTest}
++                </th>
++                <th scope="col" className={TH}>
++                  {copy.evidence.columns.workOrders}
++                </th>
++              </tr>
++            </thead>
++            <tbody className="divide-y divide-border-subtle">
++              {evidence.traceability.map((s) => (
++                <tr
++                  key={`${s.capability}/${s.requirement}/${s.scenario}`}
++                  className="align-top"
++                >
++                  <td className={TD}>
++                    <span className="block text-xs text-muted">
++                      {`${s.capability} · ${s.requirement}`}
++                    </span>
++                    <span className="text-foreground">{s.scenario}</span>
++                  </td>
++                  <td className={TD}>
++                    {s.hiddenTests.length ? (
++                      <ul className="flex flex-col gap-1">
++                        {s.hiddenTests.map((t) => (
++                          <li
++                            key={t.file}
++                            className="flex flex-wrap items-center gap-x-2 gap-y-0.5"
++                          >
++                            <HiddenStatus lastOk={t.lastOk} />
++                            <span className="font-mono text-xs text-foreground">
++                              {t.file}
++                            </span>
++                            <span className="text-xs text-muted">
++                              {t.runs
++                                ? copy.evidence.ran(t.runs)
++                                : copy.evidence.notRun}
++                            </span>
++                            <span
++                              className="font-mono text-xs text-muted"
++                              title={t.sha256}
++                            >
++                              {t.sha256.slice(0, 12)}
++                            </span>
++                          </li>
++                        ))}
++                      </ul>
++                    ) : (
++                      <span className="text-muted">
++                        {copy.evidence.noHiddenTest}
++                      </span>
++                    )}
++                  </td>
++                  <td className={TD}>
++                    {s.workOrders.length ? (
++                      <ul className="flex flex-col gap-1">
++                        {s.workOrders.map((w) => (
++                          <li
++                            key={w.key}
++                            className="flex flex-wrap items-center gap-x-2 gap-y-0.5"
++                          >
++                            <Link
++                              to={`${runBase}/${w.key}`}
++                              className="font-mono text-xs text-link hover:underline"
++                            >
++                              {w.key}
++                            </Link>
++                            <Approval approval={w.approval} />
++                          </li>
++                        ))}
++                      </ul>
++                    ) : (
++                      <span className="text-muted">{copy.common.none}</span>
++                    )}
++                  </td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++      ) : (
++        <p className="text-sm text-muted">{copy.evidence.noScenarios}</p>
++      )}
++    </section>
++  );
++}
++
++function WorkOrders({ evidence }: { evidence: Evidence }) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  const runBase = `/autopilot/runs/${evidence.run.id}`;
++  if (!evidence.workOrders.length) return null;
++  return (
++    <section
++      aria-labelledby="factory-evidence-wos"
++      className="flex flex-col gap-3"
++    >
++      <SectionHeading
++        id="factory-evidence-wos"
++        title={copy.evidence.workOrders}
++      />
++      <div className={TABLE_WRAP}>
++        <table
++          className="w-full text-left text-sm"
++          data-testid="factory-evidence-work-orders"
++        >
++          <thead className="bg-surface text-xs text-muted">
++            <tr>
++              <th scope="col" className={TH}>
++                {copy.evidence.columns.workOrder}
++              </th>
++              <th scope="col" className={TH}>
++                {copy.evidence.columns.risk}
++              </th>
++              <th scope="col" className={TH}>
++                {copy.evidence.columns.checks}
++              </th>
++              <th scope="col" className={TH}>
++                {copy.evidence.columns.review}
++              </th>
++              <th scope="col" className={TH}>
++                {copy.evidence.columns.approval}
++              </th>
++              <th scope="col" className={TH}>
++                {copy.evidence.columns.reasons}
++              </th>
++            </tr>
++          </thead>
++          <tbody className="divide-y divide-border-subtle">
++            {evidence.workOrders.map((w) => (
++              <tr key={w.key} className="align-top" data-wo={w.key}>
++                <td className={TD}>
++                  <Link
++                    to={`${runBase}/${w.key}`}
++                    className="font-mono text-xs text-link hover:underline"
++                  >
++                    {w.key}
++                  </Link>
++                  <span className="block text-foreground">{w.title}</span>
++                  <span className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-muted">
++                    <WorkOrderStatePill state={w.state} />
++                    <span>{copy.evidence.builders(w.builders)}</span>
++                    <span className="tabular-nums">
++                      {formatMoney(w.costUsd, i18n.language)}
++                    </span>
++                  </span>
++                </td>
++                <td className={TD}>
++                  <RiskChip risk={w.risk} />
++                  {w.controls.length ? (
++                    <span className="mt-1 block font-mono text-xs text-muted">
++                      {w.controls.join(", ")}
++                    </span>
++                  ) : null}
++                </td>
++                <td className={`${TD} whitespace-nowrap text-muted`}>
++                  {copy.evidence.checks(w.checks.passed, w.checks.failed)}
++                </td>
++                <td className={`${TD} whitespace-nowrap text-muted`}>
++                  {w.review
++                    ? copy.evidence.review(w.review.verdict, w.review.findings)
++                    : copy.common.none}
++                </td>
++                <td className={TD}>
++                  <Approval approval={w.approval} />
++                  {w.mergeSha ? (
++                    <span
++                      className="block font-mono text-xs text-muted"
++                      title={w.mergeSha}
++                    >
++                      {w.mergeSha.slice(0, 10)}
++                    </span>
++                  ) : null}
++                </td>
++                <td className={`${TD} text-muted`}>
++                  {w.mergeReasons.length ? (
++                    <ul className="flex list-disc flex-col gap-0.5 pl-4">
++                      {w.mergeReasons.map((r) => (
++                        <li key={r}>{r}</li>
++                      ))}
++                    </ul>
++                  ) : w.approval?.kind === "policy" ? (
++                    copy.evidence.allRulesHeld
++                  ) : null}
++                </td>
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      </div>
++    </section>
++  );
++}
++
++function Controls({ evidence }: { evidence: Evidence }) {
++  const copy = useFactoryCopy();
++  const runBase = `/autopilot/runs/${evidence.run.id}`;
++  if (!evidence.workOrders.length) return null;
++  return (
++    <section
++      aria-labelledby="factory-evidence-controls"
++      className="flex flex-col gap-3"
++    >
++      <SectionHeading
++        id="factory-evidence-controls"
++        title={copy.evidence.controls}
++        help={copy.evidence.controlsHelp}
++      />
++      {evidence.controls.length ? (
++        <ul className="flex flex-col gap-1.5 text-sm">
++          {evidence.controls.map((c) => (
++            <li
++              key={c.control}
++              className="flex flex-wrap items-center gap-x-3 gap-y-1"
++            >
++              <span className="w-16 font-mono text-foreground">
++                {c.control}
++              </span>
++              {c.workOrders.map((w) => (
++                <span key={w.key} className="inline-flex items-center gap-2">
++                  <Link
++                    to={`${runBase}/${w.key}`}
++                    className="font-mono text-xs text-link hover:underline"
++                  >
++                    {w.key}
++                  </Link>
++                  <WorkOrderStatePill state={w.state} />
++                </span>
++              ))}
++            </li>
++          ))}
++        </ul>
++      ) : (
++        <p className="text-sm text-muted">{copy.evidence.noControls}</p>
++      )}
++    </section>
++  );
++}
++
++function Decisions({ evidence }: { evidence: Evidence }) {
++  const copy = useFactoryCopy();
++  const { i18n } = useTranslation("openhands");
++  return (
++    <section
++      aria-labelledby="factory-evidence-decisions"
++      className="flex flex-col gap-3"
++    >
++      <SectionHeading
++        id="factory-evidence-decisions"
++        title={copy.evidence.decisions}
++        help={copy.evidence.decisionsHelp}
++      />
++      {evidence.decisions.length ? (
++        <div className={TABLE_WRAP}>
++          <table
++            className="w-full text-left text-sm"
++            data-testid="factory-evidence-decisions"
++          >
++            <thead className="bg-surface text-xs text-muted">
++              <tr>
++                <th scope="col" className={TH}>
++                  {copy.evidence.columns.when}
++                </th>
++                <th scope="col" className={TH}>
++                  {copy.evidence.columns.kind}
++                </th>
++                <th scope="col" className={TH}>
++                  {copy.evidence.columns.choice}
++                </th>
++                <th scope="col" className={TH}>
++                  {copy.evidence.columns.by}
++                </th>
++                <th scope="col" className={TH}>
++                  {copy.evidence.columns.note}
++                </th>
++              </tr>
++            </thead>
++            <tbody className="divide-y divide-border-subtle">
++              {evidence.decisions.map((d) => (
++                <tr
++                  key={`${d.kind}-${d.at}-${d.workOrder}`}
++                  className="align-top"
++                >
++                  <td className={`${TD} whitespace-nowrap text-muted`}>
++                    {d.at ? (
++                      <time dateTime={d.at}>
++                        {formatWhen(d.at, i18n.language)}
++                      </time>
++                    ) : null}
++                  </td>
++                  <td className={TD}>
++                    <span className="text-foreground">
++                      {copy.inbox.kinds[d.kind] ?? d.kind}
++                    </span>
++                    {d.workOrder ? (
++                      <span className="ml-2 font-mono text-xs text-muted">
++                        {d.workOrder}
++                      </span>
++                    ) : null}
++                  </td>
++                  <td className={`${TD} text-foreground`}>
++                    {d.choice ?? copy.inbox.dismissed}
++                  </td>
++                  <td className={`${TD} whitespace-nowrap`}>
++                    {d.by ? approverName(d.by) : null}
++                  </td>
++                  <td className={`${TD} text-muted`}>{d.note}</td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++      ) : (
++        <p className="text-sm text-muted">{copy.evidence.noDecisions}</p>
++      )}
++    </section>
++  );
++}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..66a1671
+index 0000000..40e2574
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,875 @@
+@@ -0,0 +1,886 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -3244,6 +4135,7 @@ index 0000000..66a1671
 +  MessageSquare,
 +  Pause,
 +  Play,
++  ScrollText,
 +  Shield,
 +  X,
 +} from "lucide-react";
@@ -3601,13 +4493,23 @@ index 0000000..66a1671
 +      <SpecSection run={run} />
 +      {run.hiddenTests.length ? <HiddenTests run={run} /> : null}
 +
-+      <Link
-+        to={`/audit-log?q=${encodeURIComponent(run.id)}`}
-+        className="inline-flex items-center gap-1.5 self-start text-sm text-link hover:underline"
-+      >
-+        <History className="size-4" aria-hidden />
-+        {copy.pipeline.activity}
-+      </Link>
++      <div className="flex flex-wrap gap-x-6 gap-y-2">
++        <Link
++          to={`${base}/evidence`}
++          data-testid="factory-run-evidence"
++          className="inline-flex items-center gap-1.5 text-sm text-link hover:underline"
++        >
++          <ScrollText className="size-4" aria-hidden />
++          {copy.evidence.open}
++        </Link>
++        <Link
++          to={`/audit-log?q=${encodeURIComponent(run.id)}`}
++          className="inline-flex items-center gap-1.5 text-sm text-link hover:underline"
++        >
++          <History className="size-4" aria-hidden />
++          {copy.pipeline.activity}
++        </Link>
++      </div>
 +    </>
 +  );
 +}
