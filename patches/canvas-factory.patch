@@ -91,10 +91,10 @@ index 0000000..cfc572e
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..c039abe
+index 0000000..6fad498
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,489 @@
+@@ -0,0 +1,496 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -289,7 +289,9 @@ index 0000000..c039abe
 +  baseBranch: string;
 +  integrationBranch: string;
 +  costUsd: number;
-+  budgetUsd: number | null;
++  /** The budget that applies: the run's own, or the policy's per change (budgetSource). */
++  budgetUsd: number;
++  budgetSource: "run" | "policy";
 +  policyHash: string | null;
 +  createdBy: string;
 +  createdAt: string;
@@ -318,6 +320,8 @@ index 0000000..c039abe
 +  state: AutopilotWorkOrderState;
 +  branch: string | null;
 +  costUsd: number;
++  /** What it may spend: the policy's per work order, plus what people added. */
++  budgetUsd: number;
 +  /** Builder conversations so far. */
 +  attempts: number;
 +  /** Messages sent to the latest builder (1 = the brief, 2+ = repairs). */
@@ -431,6 +435,8 @@ index 0000000..c039abe
 +  hiddenTests: HiddenTestView[];
 +  /** null until a work order has merged. */
 +  etaMs: number | null;
++  /** Spent so far plus the merged average for each work order left; null until one has merged. */
++  projectedCostUsd: number | null;
 +}
 +
 +export interface AgentProfileSummary {
@@ -455,6 +461,7 @@ index 0000000..c039abe
 +    hash: string;
 +    error: string | null;
 +    autonomy: { default: Autonomy; max: Autonomy } | null;
++    budget: { perChangeUsd: number; perWorkOrderUsd: number } | null;
 +  };
 +  /** Where alerts go (SF_NOTIFY_WEBHOOK), and the hour of the daily digest. */
 +  notifications: {
@@ -1631,10 +1638,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..66fad9c
+index 0000000..9c668a8
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,893 @@
+@@ -0,0 +1,907 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1734,7 +1741,10 @@ index 0000000..66fad9c
 +    autonomyCapped: (max: string) =>
 +      `Your policy allows up to ${max}; a higher choice starts at ${max}.`,
 +    budgetLabel: "Budget in dollars (optional)",
-+    budgetHelp: "Shown against the run's live agent cost.",
++    budgetHelp: (perChange: string | null) =>
++      perChange
++        ? `Autopilot pauses the run when its agents have spent this much. Empty: the policy's ${perChange}.`
++        : "Autopilot pauses the run when its agents have spent this much.",
 +    start: "Start Autopilot",
 +    starting: "Starting…",
 +    runs: "Runs",
@@ -1769,6 +1779,8 @@ index 0000000..66fad9c
 +    cost: (cost: string, budget: string | null) =>
 +      budget ? `${cost} of ${budget}` : cost,
 +    eta: (text: string) => `About ${text} left`,
++    projected: (cost: string) => `About ${cost} at the end`,
++    policyBudget: "the policy's",
 +    by: (who: string) => `by ${who}`,
 +    runStates: {
 +      spec: "Writing the spec",
@@ -2077,6 +2089,8 @@ index 0000000..66fad9c
 +      "autopilot.notification_sent": "Told the team",
 +      "autopilot.hidden_tests_written": "The validator wrote hidden tests",
 +      "autopilot.hidden_tests_missing": "The validator wrote no hidden tests",
++      "autopilot.budget_reached": "Reached a budget",
++      "autopilot.budget_raised": "Raised a budget",
 +    } as Record<string, string>,
 +  },
 +};
@@ -2174,7 +2188,10 @@ index 0000000..66fad9c
 +    autonomyCapped: (max) =>
 +      `Su política permite hasta ${max}; una opción superior empieza en ${max}.`,
 +    budgetLabel: "Presupuesto en dólares (opcional)",
-+    budgetHelp: "Se muestra junto al coste en vivo de los agentes.",
++    budgetHelp: (perChange) =>
++      perChange
++        ? `El piloto automático pausa la ejecución cuando sus agentes gastan esto. Vacío: el ${perChange} de la política.`
++        : "El piloto automático pausa la ejecución cuando sus agentes gastan esto.",
 +    start: "Iniciar piloto automático",
 +    starting: "Iniciando…",
 +    runs: "Ejecuciones",
@@ -2205,6 +2222,8 @@ index 0000000..66fad9c
 +    needsYou: (n) => (n === 1 ? "1 le necesita" : `${n} le necesitan`),
 +    cost: (cost, budget) => (budget ? `${cost} de ${budget}` : cost),
 +    eta: (text) => `Faltan unos ${text}`,
++    projected: (cost) => `Unos ${cost} al terminar`,
++    policyBudget: "de la política",
 +    by: (who) => `por ${who}`,
 +    runStates: {
 +      spec: "Redactando la especificación",
@@ -2516,6 +2535,8 @@ index 0000000..66fad9c
 +      "autopilot.hidden_tests_written": "El validador escribió pruebas ocultas",
 +      "autopilot.hidden_tests_missing":
 +        "El validador no escribió pruebas ocultas",
++      "autopilot.budget_reached": "Alcanzó un presupuesto",
++      "autopilot.budget_raised": "Aumentó un presupuesto",
 +    },
 +  },
 +};
@@ -3164,10 +3185,10 @@ index 0000000..380b38f
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..176d801
+index 0000000..a3ed43f
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,813 @@
+@@ -0,0 +1,829 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -3419,7 +3440,7 @@ index 0000000..176d801
 +          >
 +            {copy.autopilot.cost(
 +              money(run.costUsd),
-+              run.budgetUsd === null ? null : money(run.budgetUsd),
++              `${money(run.budgetUsd)}${run.budgetSource === "policy" ? ` (${copy.autopilot.policyBudget})` : ""}`,
 +            )}
 +          </dd>
 +        </div>
@@ -3428,6 +3449,14 @@ index 0000000..176d801
 +            <dt className="sr-only">{copy.pipeline.labels.progress}</dt>
 +            <dd className="tabular-nums text-foreground">
 +              {copy.autopilot.progress(run.counts.merged, run.counts.total)}
++            </dd>
++          </div>
++        ) : null}
++        {run.projectedCostUsd !== null ? (
++          <div>
++            <dt className="sr-only">{copy.pipeline.labels.cost}</dt>
++            <dd className="text-muted">
++              {copy.autopilot.projected(money(run.projectedCostUsd))}
 +            </dd>
 +          </div>
 +        ) : null}
@@ -3651,8 +3680,16 @@ index 0000000..176d801
 +          <span>{copy.pipeline.attempt(wo.attempts, wo.round)}</span>
 +        ) : null}
 +        {wo.costUsd ? (
-+          <span className="tabular-nums">
-+            {formatMoney(wo.costUsd, i18n.language)}
++          <span
++            className={cn(
++              "tabular-nums",
++              wo.costUsd >= wo.budgetUsd && "text-warning",
++            )}
++          >
++            {copy.autopilot.cost(
++              formatMoney(wo.costUsd, i18n.language),
++              formatMoney(wo.budgetUsd, i18n.language),
++            )}
 +          </span>
 +        ) : null}
 +        {wo.dependsOn.length && wo.state === "pending" ? (
@@ -3983,10 +4020,10 @@ index 0000000..176d801
 +}
 diff --git a/src/factory/routes/autopilot.tsx b/src/factory/routes/autopilot.tsx
 new file mode 100644
-index 0000000..3bd096a
+index 0000000..5df27b9
 --- /dev/null
 +++ b/src/factory/routes/autopilot.tsx
-@@ -0,0 +1,371 @@
+@@ -0,0 +1,372 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
@@ -4202,7 +4239,11 @@ index 0000000..3bd096a
 +          />
 +        </div>
 +        <p id="factory-budget-help" className="pb-2 text-xs text-muted">
-+          {copy.autopilot.budgetHelp}
++          {copy.autopilot.budgetHelp(
++            status?.policy.budget
++              ? `$${status.policy.budget.perChangeUsd.toFixed(2)}`
++              : null,
++          )}
 +        </p>
 +        <BrandButton
 +          testId="factory-start-run"
@@ -4340,10 +4381,7 @@ index 0000000..3bd096a
 +          </span>
 +        ) : null}
 +        <span className="tabular-nums">
-+          {copy.autopilot.cost(
-+            money(run.costUsd),
-+            run.budgetUsd === null ? null : money(run.budgetUsd),
-+          )}
++          {copy.autopilot.cost(money(run.costUsd), money(run.budgetUsd))}
 +        </span>
 +        {run.openInbox ? (
 +          <span className="inline-flex items-center gap-1 text-foreground">

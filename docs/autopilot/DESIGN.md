@@ -199,7 +199,21 @@ live in the ledger's `meta` table (schema v4); a failed send is retried.
 - `GET /runs/:id` includes `hiddenTests` (file, scenario, requires, sha256,
   runs, lastOk); the Pipeline lists them.
 
-## 11. Changes since the first build
+## 11. Budgets
+
+Checked in every step from the agents' accumulated cost, before the stage
+moves on. The change's budget is the run's (`budgetUsd`, typed on Home) or
+`policy.budget.perChangeUsd`; reaching it pauses the run and its agents with a
+run-level `budget_reached` item (raise by half or double, or cancel), and
+Resume refuses until it's raised. A work order in `building` or `reviewing`
+that reaches `perWorkOrderUsd + budgetExtraUsd` has its conversations paused
+and goes to `needs_attention` with its own `budget_reached` item (raise by one
+more `perWorkOrderUsd`, skip, cancel); the rest of the run goes on. Raising is
+audited (`autopilot.budget_raised`). `GET /runs/:id` reports the effective
+budgets and `projectedCostUsd` (spent so far plus the merged average for each
+work order left).
+
+## 12. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

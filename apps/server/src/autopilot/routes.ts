@@ -40,6 +40,21 @@ function etaMs(state: string, workOrders: WorkOrder[], attempts: Attempt[], para
   return median * rounds;
 }
 
+/**
+ * What the change will have cost when it's done: spent so far, plus the
+ * average of merged work orders for each one still to finish. null until one
+ * has merged, and once the run isn't building.
+ */
+function projectedCost(state: string, workOrders: WorkOrder[], spent: number, costOf: (id: string) => number): number | null {
+  if (state !== "building") return null;
+  const merged = workOrders.filter((w) => w.state === "merged");
+  if (!merged.length) return null;
+  const average = merged.reduce((sum, w) => sum + costOf(w.id), 0) / merged.length;
+  const left = workOrders.filter((w) => !FINISHED_WO.has(w.state));
+  const leftSpent = left.reduce((sum, w) => sum + costOf(w.id), 0);
+  return money(spent + Math.max(0, left.length * average - leftSpent));
+}
+
 export function createAutopilotRoutes(o: Orchestrator) {
   const { ledger } = o;
   const app = new Hono();
@@ -72,7 +87,9 @@ export function createAutopilotRoutes(o: Orchestrator) {
       baseBranch: run.baseBranch,
       integrationBranch: run.integrationBranch,
       costUsd: money(ledger.runCost(run.id)),
-      budgetUsd: run.budgetUsd,
+      // The budget that applies: the run's own, or the policy's per change.
+      budgetUsd: run.budgetUsd ?? pinnedPolicy(run).budget.perChangeUsd,
+      budgetSource: run.budgetUsd === null ? "policy" : "run",
       policyHash: run.policyHash,
       createdBy: run.createdBy,
       createdAt: run.createdAt,
@@ -115,6 +132,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       state: wo.state,
       branch: wo.branch,
       costUsd: money(ledger.workOrderCost(wo.id)),
+      budgetUsd: money(pinnedPolicy(ledger.getRun(wo.runId) ?? { policy: null }).budget.perWorkOrderUsd + wo.budgetExtraUsd),
       attempts: builds.length,
       round: last?.turns ?? 0,
       conversationId: last?.conversationId ?? null,
@@ -152,6 +170,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       inbox: ledger.listInbox({ state: "all", runId: run.id }).map(inboxView),
       hiddenTests: hiddenView(run.id),
       etaMs: etaMs(run.state, workOrders, attempts, pinnedPolicy(run).parallel),
+      projectedCostUsd: projectedCost(run.state, workOrders, ledger.runCost(run.id), (id) => ledger.workOrderCost(id)),
     });
   });
 

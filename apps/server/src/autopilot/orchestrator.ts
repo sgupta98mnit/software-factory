@@ -1059,7 +1059,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   function needsAttention(
     run: Run,
     wo: WorkOrder,
-    kind: "work_order_failed" | "error",
+    kind: "work_order_failed" | "error" | "budget_reached",
     title: string,
     body: string,
     options: InboxOption[],
@@ -1171,6 +1171,88 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
     for (const w of ledger.listWorkOrders(run.id)) if (w.state === "merging") ledger.updateWorkOrder(w.id, { preMergeSha: null, mergeSha: null });
     record(actor, "autopilot.integration_restored", run.id, { branch: run.integrationBranch, from: tip, to: sha });
+  }
+
+  // ---- budgets ----
+
+  const usd = (n: number) => `$${n.toFixed(2)}`;
+  /** The change's budget: the run's own, or the policy's. */
+  const runBudget = (run: Run) => run.budgetUsd ?? pinnedPolicy(run).budget.perChangeUsd;
+  /** A work order's budget: the policy's, plus whatever people added when it ran out. */
+  const workOrderBudget = (run: Run, wo: WorkOrder) => pinnedPolicy(run).budget.perWorkOrderUsd + wo.budgetExtraUsd;
+
+  /**
+   * Stops spending at the budget, from the agents' accumulated cost (polled
+   * just before). The change's budget pauses the run and its agents; a work
+   * order's pauses that work order's agents and asks a person, and the rest
+   * of the run goes on. Returns true when the run stopped.
+   */
+  async function enforceBudgets(run: Run): Promise<boolean> {
+    const cost = ledger.runCost(run.id);
+    const limit = runBudget(run);
+    if (cost >= limit) {
+      ledger.transaction(() => {
+        openItem(
+          run,
+          "budget_reached",
+          `${run.change} reached its budget (${usd(limit)})`,
+          [
+            `Its agents have spent ${usd(cost)}, and the budget for this change is ${usd(limit)}${run.budgetUsd === null ? " (the policy's default)" : ""}. Autopilot paused the run and every agent working on it.`,
+            "",
+            `Raise the budget to go on, or cancel. ${ledger.listWorkOrders(run.id).filter((w) => w.state === "merged").length} of ${ledger.listWorkOrders(run.id).length} work orders are merged so far.`,
+          ].join("\n"),
+          [
+            { id: "raise_half", label: `Add ${usd(limit / 2)} and go on`, tone: "primary" },
+            { id: "raise_double", label: `Add ${usd(limit)} and go on` },
+            { id: "cancel", label: "Cancel run", tone: "danger" },
+          ],
+        );
+        moveRun(run, "paused", {
+          patch: { resumeState: run.state, pausedReason: `Reached its budget (${usd(limit)})` },
+          action: "autopilot.budget_reached",
+          data: { scope: "change", costUsd: cost, budgetUsd: limit },
+        });
+      });
+      await Promise.all([pauseAgents(run.id), stopJobs(run.id)]);
+      return true;
+    }
+    for (const wo of ledger.listWorkOrders(run.id)) {
+      if (!["building", "reviewing"].includes(wo.state)) continue; // states where its agents spend
+      const spent = ledger.workOrderCost(wo.id);
+      const woLimit = workOrderBudget(run, wo);
+      if (spent < woLimit) continue;
+      for (const a of ledger.listAttempts({ runId: run.id, workOrderId: wo.id })) {
+        if (a.state !== "running") continue;
+        const ok = await client.pause(a.conversationId).then(() => true, (err: unknown) => (warn(err), false));
+        if (ok) ledger.updateAttempt(a.id, { state: "paused" });
+      }
+      const extra = pinnedPolicy(run).budget.perWorkOrderUsd;
+      record(SYSTEM, "autopilot.budget_reached", run.id, { scope: "work_order", workOrder: `WO-${wo.seq}`, costUsd: spent, budgetUsd: woLimit });
+      needsAttention(
+        run,
+        wo,
+        "budget_reached",
+        `WO-${wo.seq} of ${run.change} reached its budget (${usd(woLimit)}): ${wo.title}`,
+        `Its agents have spent ${usd(spent)} of the ${usd(woLimit)} a work order may spend. They're paused; the rest of the run goes on.\n\nGive it more to go on from where it stopped, or skip it.`,
+        [
+          { id: "raise", label: `Give it another ${usd(extra)}`, tone: "primary" },
+          { id: "skip", label: "Skip this work order" },
+          { id: "cancel", label: "Cancel run", tone: "danger" },
+        ],
+      );
+      if (ledger.getRun(run.id)?.state !== run.state) return true; // that made three failing: the run paused
+    }
+    return false;
+  }
+
+  /** Back to work where the budget stopped it: its state, and its paused conversations resumed. */
+  async function resumeWorkOrder(wo: WorkOrder, actor: string) {
+    for (const a of ledger.listAttempts({ runId: wo.runId, workOrderId: wo.id })) {
+      if (a.state !== "paused") continue;
+      await client.resume(a.conversationId).catch(warn);
+      ledger.updateAttempt(a.id, { state: "running", seenRunning: false, lastSentAt: now() });
+    }
+    moveWorkOrder(wo, wo.resumeState ?? "pending", { actor, patch: { resumeState: null } });
   }
 
   // ---- integrate stage: one merge at a time ----
@@ -1429,6 +1511,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       }
     }
     const run = ledger.getRun(runId);
+    if (run && !TERMINAL.has(run.state) && run.state !== "paused" && (await enforceBudgets(run))) return;
     if (run?.state === "spec") await specStep(run);
     else if (run?.state === "critic") await criticStep(run);
     else if (run?.state === "building") await buildStep(run);
@@ -1594,6 +1677,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return locked(runId, async () => {
       const run = mustRun(runId);
       if (run.state !== "paused") throw new Error(`The run isn't paused (it's ${run.state}).`);
+      if (ledger.listInbox({ runId }).some((i) => i.kind === "budget_reached" && !i.workOrderId)) {
+        throw new Error("The run reached its budget. Raise it in the Inbox to go on, or cancel the run.");
+      }
       // Resuming answers the item the pause came with. A work order's own error item stays for its work order.
       for (const item of ledger.listInbox({ runId })) {
         const decision = item.kind === "run_paused" ? "resume" : item.kind === "error" && !item.workOrderId ? "retry" : null;
@@ -1642,6 +1728,22 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       case "run_paused:resume":
         if (run.state === "paused") await unpause(run, actor);
         return;
+      case "budget_reached:raise_half":
+      case "budget_reached:raise_double": {
+        const before = runBudget(run);
+        const budgetUsd = Math.round(before * (choice === "raise_half" ? 1.5 : 2) * 100) / 100;
+        record(actor, "autopilot.budget_raised", run.id, { scope: "change", from: before, to: budgetUsd });
+        const raised = ledger.updateRun(run.id, { budgetUsd });
+        if (raised.state === "paused") await unpause(raised, actor);
+        return;
+      }
+      case "budget_reached:raise": {
+        const wo = workOrderOf(item);
+        const extra = pinnedPolicy(run).budget.perWorkOrderUsd;
+        record(actor, "autopilot.budget_raised", run.id, { scope: "work_order", workOrder: `WO-${wo.seq}`, from: workOrderBudget(run, wo), to: workOrderBudget(run, wo) + extra });
+        await resumeWorkOrder(ledger.updateWorkOrder(wo.id, { budgetExtraUsd: wo.budgetExtraUsd + extra }), actor);
+        return;
+      }
       case "integration_moved:restore":
         await restoreIntegration(run, actor);
         if (run.state === "paused") await unpause(run, actor);
@@ -1658,6 +1760,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         await repair(run, workOrderOf(item), [{ source: "review", severity: "high", title: "A person asks for changes before this merges", detail: note ?? "" }]);
         return;
       case "merge_approval:skip":
+      case "budget_reached:skip":
       case "error:skip":
       case "work_order_failed:skip": {
         const wo = workOrderOf(item);
@@ -1682,7 +1785,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const note = input.note?.trim() || null;
       if (option.needsNote && !note) throw new Error(`"${option.label}" needs a note.`);
       const run = mustRun(item.runId);
-      if (run.state === "paused" && !["error", "run_paused", "integration_moved"].includes(item.kind) && input.choice !== "cancel") {
+      if (run.state === "paused" && !["error", "run_paused", "integration_moved", "budget_reached"].includes(item.kind) && input.choice !== "cancel") {
         throw new Error("The run is paused. Resume it first.");
       }
 
@@ -1718,10 +1821,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       digestHour = p.policy.notify.digestHour;
       const missing = agent.reachable ? await missingProfiles(p.policy) : [];
       const error = missing.length ? `${p.source}: the agent server has no profile for ${missing.join(", ")}` : null;
-      return { source: p.source, hash: p.hash, error, autonomy: autonomyOf(p.policy) as ReturnType<typeof autonomyOf> | null };
+      return { source: p.source, hash: p.hash, error, autonomy: autonomyOf(p.policy) as ReturnType<typeof autonomyOf> | null, budget: p.policy.budget as Policy["budget"] | null };
     };
     const policy = branch
-      ? await loadPolicy(workspace, branch).then(checked, (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err), autonomy: null }))
+      ? await loadPolicy(workspace, branch).then(checked, (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err), autonomy: null, budget: null }))
       : await checked({ policy: DEFAULT_POLICY, hash: policyHash(DEFAULT_POLICY), source: "defaults" });
     const webhook = process.env.SF_NOTIFY_WEBHOOK?.trim();
     return {

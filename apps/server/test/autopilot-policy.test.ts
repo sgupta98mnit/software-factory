@@ -247,7 +247,7 @@ test("createRun pins the base branch's policy, audited: its autonomy default and
     const loaded = listAudit(5000).filter((e) => e.subject === run.id && e.action === "autopilot.policy_loaded");
     assert.deepEqual(loaded.map((e) => [e.actor, e.data]), [["autopilot", { hash, source: ".factory/policy.yml@main", policy }]]);
     // Home preselects the default and offers up to the max, both capped by the policy's max.
-    assert.deepEqual((await o.status()).policy, { source: ".factory/policy.yml@main", hash, error: null, autonomy: { default: "supervised", max: "supervised" } });
+    assert.deepEqual((await o.status()).policy, { source: ".factory/policy.yml@main", hash, error: null, autonomy: { default: "supervised", max: "supervised" }, budget: DEFAULT_POLICY.budget });
 
     // A broken policy on the base branch: no run starts on rules nobody wrote, and the status shows why.
     writePolicy(workspace, "parallel: lots\n");
@@ -259,6 +259,7 @@ test("createRun pins the base branch's policy, audited: its autonomy default and
       hash: "",
       error: ".factory/policy.yml@main: parallel must be a whole number from 1 up",
       autonomy: null,
+      budget: null,
     });
     assert.equal(ledger.getRun(run.id)?.policyHash, hash); // runs already going keep theirs
   } finally {
