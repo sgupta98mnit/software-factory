@@ -119,7 +119,11 @@ or its work orders move.
 ## 7. Invariants the tests hold
 
 - A run is handled by one thing at a time (`inflight` per run): the scheduler's
-  step, or a person's action, which waits for that step.
+  step, or a person's action, which waits for that step. Steps are short: gates
+  and a merge's re-test run as jobs outside the lock (at most
+  `SF_GATE_CONCURRENCY`, default 2, factory-wide); a step starts the job and a
+  later step records its outcome. Pause, Cancel and a run-level stop kill the
+  run's jobs; a stopped job records nothing and runs again on resume.
 - Attempts are written before the agent server is called (write-ahead) with a
   fixed conversation id, so a restart can start the same conversation again.
 - An end state right after a follow-up counts only once the conversation was

@@ -102,7 +102,7 @@ function killTree(child: ChildProcess) {
   }
 }
 
-function runGate(dir: string, gate: Gate): Promise<GateResult> {
+function runGate(dir: string, gate: Gate, signal?: AbortSignal): Promise<GateResult> {
   const started = Date.now();
   const timeoutSec = gate.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
   return new Promise((resolve) => {
@@ -135,12 +135,19 @@ function runGate(dir: string, gate: Gate): Promise<GateResult> {
       killTree(child);
       finishSoon(null, CLOSE_GRACE_MS);
     }, timeoutSec * 1000);
+    // Stopped from outside (the run was paused or cancelled): kill it now; the caller ignores the result.
+    const abort = () => {
+      killTree(child);
+      finishSoon(null, 500);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
     const finish = (exitCode: number | null) => {
       if (done) return;
       done = true;
       running.delete(child);
       clearTimeout(timer);
       clearTimeout(grace);
+      signal?.removeEventListener("abort", abort);
       if (timedOut) add(`\n[Stopped: still running after ${timeoutSec} s]`);
       resolve({ name: gate.name, run: gate.run, ok: !timedOut && exitCode === 0, exitCode: timedOut ? null : exitCode, durationMs: Date.now() - started, output, timedOut });
     };
@@ -157,21 +164,31 @@ function runGate(dir: string, gate: Gate): Promise<GateResult> {
   });
 }
 
+export interface GatesOutcome {
+  ok: boolean;
+  results: GateResult[];
+  /** Stopped by the signal: the results say nothing about the work, so nobody should record them. */
+  aborted: boolean;
+}
+
 /**
  * Runs the gates one after another in `dir`. A failing install stops the
  * rest, since nothing after it can pass. No gates at all is a failure too.
+ * `signal` stops the gate that's running and the rest.
  */
-export async function runGates(dir: string, gates: Gate[]): Promise<{ ok: boolean; results: GateResult[] }> {
+export async function runGates(dir: string, gates: Gate[], opts: { signal?: AbortSignal } = {}): Promise<GatesOutcome> {
   if (!gates.length) {
-    return { ok: false, results: [{ name: "gates", run: "", ok: false, exitCode: null, durationMs: 0, output: NO_GATES, timedOut: false }] };
+    return { ok: false, aborted: false, results: [{ name: "gates", run: "", ok: false, exitCode: null, durationMs: 0, output: NO_GATES, timedOut: false }] };
   }
   const results: GateResult[] = [];
   for (const gate of gates) {
-    const result = await runGate(dir, gate);
+    if (opts.signal?.aborted) break;
+    const result = await runGate(dir, gate, opts.signal);
     results.push(result);
     if (!result.ok && /(^|:)install$/.test(gate.name)) break;
   }
-  return { ok: results.every((r) => r.ok), results };
+  const aborted = !!opts.signal?.aborted;
+  return { ok: !aborted && results.every((r) => r.ok), results, aborted };
 }
 
 /** One finding per failed gate, with the end of its output for the builder. */

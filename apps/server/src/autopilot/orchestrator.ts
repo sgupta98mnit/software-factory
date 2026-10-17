@@ -18,7 +18,7 @@ import path from "node:path";
 import { audit, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
-import { detectGates, gateFindings, runGates, type GateResult } from "./gates.js";
+import { detectGates, gateFindings, runGates, type GateResult, type GatesOutcome } from "./gates.js";
 import {
   addWorktree,
   changedFiles,
@@ -37,7 +37,7 @@ import {
   removeWorktree,
   resetHard,
 } from "./git.js";
-import { mergeAndTest } from "./integrator.js";
+import { prepareMerge, settleMerge, type MergeResult, type Prepared } from "./integrator.js";
 import type {
   Attempt,
   AttemptRole,
@@ -164,6 +164,73 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   const inflight = new Map<string, Promise<void>>(); // runId -> what's being done for it
   let timer: NodeJS.Timeout | undefined;
 
+  // ---- gate jobs: gates run outside the run's lock ----
+  //
+  // A step starts a work order's gates (or a merge's re-test) as a job and
+  // returns; a later step records the outcome. So the run's lock is held for
+  // moments, a person's decision never waits behind a test suite, and Pause
+  // or Cancel can stop a gate that's running. Outcomes live in memory only:
+  // after a restart the work order is still verifying (or merging) and its
+  // gates simply run again.
+  interface Job {
+    runId: string;
+    controller: AbortController;
+    promise: Promise<void>;
+    outcome?: GatesOutcome | { error: unknown };
+  }
+  const jobs = new Map<string, Job>(); // "<workOrderId>#build" | "<workOrderId>#integrate"
+  const prepared = new Map<string, Extract<Prepared, { outcome: "ready" }>>(); // a merge's job key -> the merge it tests
+  const GATE_SLOTS = Math.max(1, Number(process.env.SF_GATE_CONCURRENCY) || 2); // gate jobs at once, factory-wide
+  let gateSlots = GATE_SLOTS;
+  const waiting: (() => void)[] = [];
+  const slot = async () => {
+    while (gateSlots <= 0) await new Promise<void>((resolve) => waiting.push(resolve));
+    gateSlots--;
+  };
+  const freeSlot = () => {
+    gateSlots++;
+    waiting.shift()?.();
+  };
+
+  function startJob(runId: string, key: string, work: (signal: AbortSignal) => Promise<GatesOutcome>) {
+    const controller = new AbortController();
+    const job: Job = { runId, controller, promise: Promise.resolve() };
+    job.promise = (async () => {
+      await slot();
+      try {
+        job.outcome = controller.signal.aborted ? { ok: false, results: [], aborted: true } : await work(controller.signal);
+      } catch (err) {
+        job.outcome = { error: err };
+      } finally {
+        freeSlot();
+        changed(runId);
+        if (timer) void tick(); // record the outcome now rather than on the next tick
+      }
+    })();
+    jobs.set(key, job);
+  }
+
+  /** The job's outcome once it's done (and forgets the job), "running", or null when there's none. */
+  function takeJob(key: string): GatesOutcome | "running" | null {
+    const job = jobs.get(key);
+    if (!job) return null;
+    if (!job.outcome) return "running";
+    jobs.delete(key);
+    if ("error" in job.outcome) throw job.outcome.error;
+    return job.outcome;
+  }
+
+  /** Stops the run's gate jobs (pause, cancel) and waits for their processes to go. */
+  async function stopJobs(runId: string) {
+    const mine = [...jobs.entries()].filter(([, j]) => j.runId === runId);
+    for (const [, j] of mine) j.controller.abort();
+    await Promise.all(mine.map(([, j]) => j.promise));
+    for (const [key] of mine) {
+      jobs.delete(key);
+      prepared.delete(key);
+    }
+  }
+
   const changed = (runId: string) => broadcast({ type: "autopilot.changed", runId });
   const record = (actor: string, action: string, runId: string, data: Record<string, unknown> = {}) => {
     audit(actor, action, runId, data).catch(() => undefined); // audit.ts logs write failures
@@ -256,7 +323,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         data: { error: clip(message) },
       });
     });
-    await pauseAgents(runId);
+    await Promise.all([pauseAgents(runId), stopJobs(runId)]);
   }
 
   // ---- attempts (one agent conversation each) ----
@@ -612,16 +679,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    */
   async function buildStep(run: Run) {
     if (!(await guardIntegration(run))) return;
-    // ponytail: one work order's gates and one merge's integration gates per step, so polling and a person's action wait for two gate runs at most; give gates their own task if suites get slow.
-    let gated = false;
     for (const wo of ledger.listWorkOrders(run.id)) {
       try {
         if (wo.state === "building") await builderStep(run, wo);
         else if (wo.state === "reviewing") await reviewStep(run, wo);
-        else if (wo.state === "verifying" && !gated) {
-          gated = true;
-          await verify(run, wo);
-        }
+        else if (wo.state === "verifying") await verify(run, wo);
       } catch (err) {
         if (runWide(err)) throw err;
         if (!unreachable(err)) workOrderError(run, wo, err);
@@ -706,7 +768,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** The factory's own checks on the committed work: pass -> a reviewer, fail -> a repair round. */
   async function verify(run: Run, wo: WorkOrder) {
     const dir = wo.worktree as string;
-    const { ok, results } = await runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir));
+    const key = `${wo.id}#build`;
+    const outcome = takeJob(key);
+    if (outcome === "running") return;
+    if (!outcome || outcome.aborted) {
+      startJob(run.id, key, (signal) => runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal }));
+      return;
+    }
+    const { ok, results } = outcome;
     recordGates(run, wo, "build", results);
     if (!ok) return repair(run, wo, gateFindings(results));
     await discardChanges(dir); // what the gates left (build output), so anything left after the review is the reviewer's
@@ -1035,6 +1104,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    */
   async function integrate(run: Run, wo: WorkOrder) {
     const dir = run.integrationDir as string;
+    const jobKey = `${wo.id}#integrate`;
+    const outcome = takeJob(jobKey);
+    if (outcome === "running") return;
     const { actor, reasons } = await mergeActor(run, wo);
     const key = `WO-${wo.seq}`;
     // Saved before merging, so a restart (or a failure) knows where the integration branch was.
@@ -1043,7 +1115,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       pre = await headSha(dir);
       ledger.updateWorkOrder(wo.id, { preMergeSha: pre });
     }
-    const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre, pinnedPolicy(run).gates);
+    let r: MergeResult;
+    const tested = prepared.get(jobKey);
+    prepared.delete(jobKey);
+    if (outcome && !outcome.aborted && tested) r = await settleMerge(dir, tested, pre, outcome);
+    else {
+      // Safe to repeat (after a restart, or a job that was stopped): a merge already made is found, not made twice.
+      const merge = await prepareMerge(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre);
+      if (merge.outcome === "ready") {
+        prepared.set(jobKey, merge);
+        startJob(run.id, jobKey, (signal) => runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal }));
+        return;
+      }
+      r = merge;
+    }
     if (r.results.length) recordGates(run, wo, "integrate", r.results);
     if (r.outcome === "merged") {
       ledger.transaction(() => {
@@ -1145,7 +1230,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     else if (run?.state === "critic") await criticStep(run);
     else if (run?.state === "building") await buildStep(run);
     // The step paused the run (three work orders failing, a moved integration branch): its agents stop too.
-    if (run?.state !== "paused" && ledger.getRun(runId)?.state === "paused") await pauseAgents(runId);
+    if (run?.state !== "paused" && ledger.getRun(runId)?.state === "paused") await Promise.all([pauseAgents(runId), stopJobs(runId)]);
   }
 
   /** Cheap: hands each live run to advance(), skipping runs that are still busy. */
@@ -1155,8 +1240,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
   }
 
+  /** Resolves when no step and no gate job is running (tests, shutdown). */
   async function idle() {
-    while (inflight.size) await Promise.all(inflight.values());
+    while (inflight.size || [...jobs.values()].some((j) => !j.outcome)) {
+      await Promise.all([...inflight.values(), ...[...jobs.values()].map((j) => j.promise)]);
+    }
   }
 
   // ---- what people do ----
@@ -1241,6 +1329,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   async function cancelRun(run: Run, actor: string, note: string | null) {
     if (TERMINAL.has(run.state)) throw new Error(`The run is already ${run.state}.`);
+    await stopJobs(run.id); // before their worktrees go
     for (const a of ledger.listAttempts({ runId: run.id })) {
       if (!ACTIVE.has(a.state) && a.state !== "paused") continue;
       await client.pause(a.conversationId).catch(warn);
@@ -1290,7 +1379,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         action: "autopilot.run_paused",
         data: { note: note ? clip(note) : null },
       });
-      await pauseAgents(runId);
+      await Promise.all([pauseAgents(runId), stopJobs(runId)]);
       return paused;
     });
   }

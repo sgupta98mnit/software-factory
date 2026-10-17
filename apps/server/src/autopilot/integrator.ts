@@ -7,7 +7,7 @@
 // from merging again once the builder has fixed them.
 import { rmSync } from "node:fs";
 import path from "node:path";
-import { detectGates, gateFindings, runGates, type Gate, type GateResult } from "./gates.js";
+import { detectGates, gateFindings, runGates, type Gate, type GateResult, type GatesOutcome } from "./gates.js";
 import { diffStat, discardChanges, headSha, isAncestor, merge, resetHard } from "./git.js";
 import type { Finding } from "./ledger.js";
 
@@ -33,16 +33,20 @@ export function conflictFinding(files: string[]): Finding {
 export const integrationFindings = (results: GateResult[]): Finding[] =>
   gateFindings(results).map((f) => ({ ...f, source: "integration", title: `After merging into the integration branch: ${f.title}` }));
 
+export type Prepared =
+  | { outcome: "conflict"; conflicts: string[]; results: GateResult[]; findings: Finding[] }
+  | { outcome: "ready"; sha: string; files: number; linesChanged: number; installed: string[] };
+
 /**
- * Merges `branch` into the integration worktree `dir` and runs the gates
- * there: the policy's `gates`, or those detected once merged. `preMergeSha`
- * is the integration sha before this merge, which the caller has saved
- * first, so this is safe to run again after a restart: a merge left half
- * done is thrown away and made again, and one already made goes straight to
- * the gates. A conflict leaves `dir` as it was; failing gates reset it to
- * `preMergeSha`.
+ * The merge half: merges `branch` into the integration worktree `dir`, or
+ * finds it already merged. `preMergeSha` is the integration sha before this
+ * merge, which the caller has saved first, so this is safe to run again
+ * after a restart: a merge left half done is thrown away and made again, and
+ * one already made is just reported. A conflict leaves `dir` as it was.
+ * Installed packages for manifests the merge changed are removed, so the
+ * gates install them fresh.
  */
-export async function mergeAndTest(dir: string, branch: string, message: string, preMergeSha: string, gates: Gate[] | null = null): Promise<MergeResult> {
+export async function prepareMerge(dir: string, branch: string, message: string, preMergeSha: string): Promise<Prepared> {
   await discardChanges(dir); // also ends a merge that a restart interrupted
   if (!(await isAncestor(dir, branch, "HEAD"))) {
     const merged = await merge(dir, branch, message);
@@ -51,14 +55,28 @@ export async function mergeAndTest(dir: string, branch: string, message: string,
   const sha = await headSha(dir);
   const stat = await diffStat(dir, preMergeSha, sha);
   const installed = stat.files.filter((f) => MANIFEST.test(f.path)).map((f) => path.join(dir, path.posix.dirname(f.path), "node_modules"));
-  const uninstall = () => installed.forEach((d) => rmSync(d, { recursive: true, force: true, maxRetries: 3 }));
-  uninstall();
-  const { ok, results } = await runGates(dir, gates ?? detectGates(dir));
+  installed.forEach((d) => rmSync(d, { recursive: true, force: true, maxRetries: 3 }));
+  return { outcome: "ready", sha, files: stat.files.length, linesChanged: stat.linesChanged, installed };
+}
+
+/**
+ * The settle half, once the gates ran on the merged code: kept, or reset to
+ * `preMergeSha` with the findings for the builder.
+ */
+export async function settleMerge(dir: string, prepared: Extract<Prepared, { outcome: "ready" }>, preMergeSha: string, gates: GatesOutcome): Promise<MergeResult> {
   await discardChanges(dir); // what the gates left behind (build output)
-  if (!ok) {
+  if (!gates.ok) {
     await resetHard(dir, preMergeSha);
-    uninstall(); // installed for the merge that's gone; the next merge installs from the reset manifest
-    return { outcome: "reverted", results, findings: integrationFindings(results) };
+    // Installed for the merge that's gone; the next merge installs from the reset manifest.
+    prepared.installed.forEach((d) => rmSync(d, { recursive: true, force: true, maxRetries: 3 }));
+    return { outcome: "reverted", results: gates.results, findings: integrationFindings(gates.results) };
   }
-  return { outcome: "merged", sha, files: stat.files.length, linesChanged: stat.linesChanged, results };
+  return { outcome: "merged", sha: prepared.sha, files: prepared.files, linesChanged: prepared.linesChanged, results: gates.results };
+}
+
+/** Both halves at once: merge, the gates (the policy's, or those detected once merged), then keep or reset. */
+export async function mergeAndTest(dir: string, branch: string, message: string, preMergeSha: string, gates: Gate[] | null = null): Promise<MergeResult> {
+  const prepared = await prepareMerge(dir, branch, message, preMergeSha);
+  if (prepared.outcome === "conflict") return prepared;
+  return settleMerge(dir, prepared, preMergeSha, await runGates(dir, gates ?? detectGates(dir)));
 }

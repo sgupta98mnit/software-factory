@@ -328,3 +328,46 @@ test("#13: auditIdle resolves once queued records are on disk", async () => {
   assert.deepEqual(written.sort(), [1, 2, 3]);
   await Promise.all(pending);
 });
+
+test("#4: gates run outside the run's lock: Pause and Cancel come back at once while a slow gate runs, and stop it", { skip: process.platform === "win32" }, async () => {
+  // The gate says it started (with its pid), then takes 30 s.
+  const slowGate = `node -e "require('fs').writeFileSync('gate.pid', String(process.pid)); setTimeout(() => {}, 30000)"`;
+  const t = await setup(byRole({ builder: build }), { policy: `gates:\n  - { name: slow, run: ${JSON.stringify(slowGate)} }\n` });
+  const { existsSync, readFileSync } = await import("node:fs");
+  const waitFor = async (done: () => boolean) => {
+    for (let i = 0; i < 200 && !done(); i++) {
+      await t.o.tick();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(done());
+  };
+  const alive = (pid: number) => {
+    try {
+      return !/\) Z/.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+    } catch {
+      return false;
+    }
+  };
+  try {
+    const run = await t.buildingRun(1);
+    const pidFile = () => path.join(t.ledger.getWorkOrder(`${run.id}/WO-1`)?.worktree ?? "/nonexistent", "gate.pid");
+    await waitFor(() => existsSync(pidFile()));
+    const pid = Number(readFileSync(pidFile(), "utf8"));
+
+    let started = Date.now();
+    await t.o.pause(run.id, { actor: "user:test" });
+    assert.ok(Date.now() - started < 3000, `pause took ${Date.now() - started} ms`);
+    assert.equal(alive(pid), false, "the gate was stopped");
+    assert.equal(t.ledger.getWorkOrder(`${run.id}/WO-1`)?.state, "verifying"); // its gates run again on resume
+    assert.deepEqual(t.ledger.listChecks({ runId: run.id }).filter((c) => c.stage === "build"), []); // a stopped gate isn't a result
+
+    await t.o.resume(run.id, { actor: "user:test" });
+    await waitFor(() => existsSync(pidFile()) && Number(readFileSync(pidFile(), "utf8")) !== pid);
+    started = Date.now();
+    await t.o.cancel(run.id, { actor: "user:test" });
+    assert.ok(Date.now() - started < 3000, `cancel took ${Date.now() - started} ms`);
+    assert.equal(t.ledger.getRun(run.id)?.state, "cancelled");
+  } finally {
+    await t.close();
+  }
+});
