@@ -5,7 +5,8 @@ import { existsSync, watch } from "node:fs";
 import path from "node:path";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import { audit, listAudit, verifyAudit } from "./audit.js";
+import { audit, auditIdle, listAudit, verifyAudit } from "./audit.js";
+import { killAllGates } from "./autopilot/gates.js";
 import { openLedger } from "./autopilot/ledger.js";
 import { OpenHandsClient } from "./autopilot/openhands.js";
 import { createOrchestrator } from "./autopilot/orchestrator.js";
@@ -128,10 +129,14 @@ serve({ fetch: app.fetch, port: PORT, hostname: HOST }, () => {
 });
 void audit("system", "server.started", "server", { workspace: path.basename(WORKSPACE) });
 
+// Stop scheduling, stop running gates, and let queued audit records reach the disk (a few seconds at most) before exiting.
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
-  process.on(sig, () => {
+  process.once(sig, () => {
     autopilot.stop();
-    ledger.close();
-    process.exit(0);
+    killAllGates();
+    void Promise.race([auditIdle(), new Promise((resolve) => setTimeout(resolve, 3000))]).finally(() => {
+      ledger.close();
+      process.exit(0);
+    });
   });
 }

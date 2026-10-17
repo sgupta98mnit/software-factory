@@ -272,3 +272,59 @@ test("#5: when three failing work orders pause the run, the agents still working
     await t.close();
   }
 });
+
+const { gateEnv, runGates } = await import("../src/autopilot/gates.js");
+const { auditIdle } = await import("../src/audit.js");
+
+test("#6: whatever a passing gate left running in the background is stopped with it", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "sf-harden-gate-"));
+  const { ok } = await runGates(dir, [{ name: "leaky", run: "sleep 30 & echo $! > leftover.pid; echo started" }]);
+  assert.equal(ok, true);
+  const { readFileSync } = await import("node:fs");
+  const pid = Number(readFileSync(path.join(dir, "leftover.pid"), "utf8"));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  // Gone, or a zombie waiting for a reaper (killed, but nothing has collected its exit status yet).
+  const state = (() => {
+    try {
+      return /\) (\S)/.exec(readFileSync(`/proc/${pid}/stat`, "utf8"))?.[1] ?? "?";
+    } catch {
+      return "gone";
+    }
+  })();
+  assert.ok(state === "gone" || state === "Z", `the background sleep is still running (state ${state})`);
+});
+
+test("#7: gates don't see the factory's secrets; SF_GATE_ENV lets a named one through", async () => {
+  const env = gateEnv({
+    PATH: "/usr/bin",
+    HTTPS_PROXY: "http://proxy:3128",
+    SF_AGENT_SERVER_KEY: "k1",
+    LOCAL_BACKEND_API_KEY: "k2",
+    ANTHROPIC_API_KEY: "k3",
+    GITHUB_TOKEN: "k4",
+    DB_PASSWORD: "k5",
+    NPM_TOKEN: "k6",
+    NODE_TEST_CONTEXT: "child",
+    SF_GATE_ENV: "NPM_TOKEN",
+  });
+  assert.deepEqual(Object.keys(env).sort(), ["CI", "FORCE_COLOR", "HTTPS_PROXY", "NO_COLOR", "NPM_TOKEN", "PATH"]);
+
+  // And for real, in a gate's process.
+  process.env.SF_TEST_SECRET_KEY = "should-not-leak";
+  try {
+    const dir = mkdtempSync(path.join(tmpdir(), "sf-harden-env-"));
+    const { results } = await runGates(dir, [{ name: "env", run: `node -e "console.log(Object.keys(process.env).join(','))"` }]);
+    assert.ok(!results[0]!.output.includes("SF_TEST_SECRET_KEY"));
+    assert.match(results[0]!.output, /PATH/);
+  } finally {
+    delete process.env.SF_TEST_SECRET_KEY;
+  }
+});
+
+test("#13: auditIdle resolves once queued records are on disk", async () => {
+  const pending = [1, 2, 3].map((n) => audit("test", "test.queued", "test", { n }));
+  await auditIdle();
+  const written = listAudit(5000).filter((e) => e.action === "test.queued").map((e) => e.data.n);
+  assert.deepEqual(written.sort(), [1, 2, 3]);
+  await Promise.all(pending);
+});

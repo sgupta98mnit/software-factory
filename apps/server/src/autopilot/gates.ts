@@ -62,6 +62,32 @@ export function detectGates(dir: string): Gate[] {
   return ["", ...subs].flatMap((sub) => packageGates(dir, sub));
 }
 
+/** Gates running right now, so shutdown can stop them (their process groups outlive the factory otherwise). */
+const running = new Set<ChildProcess>();
+
+/** Stops every gate still running: for the factory's shutdown. */
+export function killAllGates() {
+  for (const child of running) killTree(child);
+}
+
+/**
+ * The environment a gate runs with: the factory's, minus anything that looks
+ * like a credential. Gates run code agents wrote (tests, install scripts), so
+ * they never see the agent server's key or other secrets. SF_GATE_ENV lists
+ * names to pass through anyway (comma-separated), for a build that truly needs one.
+ */
+export function gateEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const keep = new Set((env.SF_GATE_ENV ?? "").split(",").map((n) => n.trim()).filter(Boolean));
+  const secret = /KEY|TOKEN|SECRET|PASSW|CREDENTIAL|COOKIE/i;
+  const out: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (name === "NODE_TEST_CONTEXT") continue; // so `node --test` in a gate reports normally under the factory's own tests
+    if (!keep.has(name) && (name.startsWith("SF_") || name.startsWith("LOCAL_BACKEND_") || secret.test(name))) continue;
+    out[name] = value;
+  }
+  return { ...out, CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" };
+}
+
 /** Kills the gate and everything it started (a shell's children keep the output pipe open otherwise). */
 function killTree(child: ChildProcess) {
   if (!child.pid) return;
@@ -79,9 +105,6 @@ function killTree(child: ChildProcess) {
 function runGate(dir: string, gate: Gate): Promise<GateResult> {
   const started = Date.now();
   const timeoutSec = gate.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
-  // Plain, non-interactive output. NODE_TEST_CONTEXT is dropped so `node --test` in a gate
-  // reports normally when the factory itself runs under node --test.
-  const { NODE_TEST_CONTEXT: _, ...env } = process.env;
   return new Promise((resolve) => {
     let output = "";
     let timedOut = false;
@@ -89,10 +112,11 @@ function runGate(dir: string, gate: Gate): Promise<GateResult> {
     const child = spawn(gate.run, {
       cwd: gate.cwd ? path.join(dir, gate.cwd) : dir,
       shell: true,
-      env: { ...env, CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" },
+      env: gateEnv(),
       windowsHide: true,
       detached: process.platform !== "win32",
     });
+    running.add(child);
     child.stdout?.setEncoding("utf8").on("data", add);
     child.stderr?.setEncoding("utf8").on("data", add);
     let done = false;
@@ -114,6 +138,7 @@ function runGate(dir: string, gate: Gate): Promise<GateResult> {
     const finish = (exitCode: number | null) => {
       if (done) return;
       done = true;
+      running.delete(child);
       clearTimeout(timer);
       clearTimeout(grace);
       if (timedOut) add(`\n[Stopped: still running after ${timeoutSec} s]`);
@@ -123,7 +148,11 @@ function runGate(dir: string, gate: Gate): Promise<GateResult> {
       add(`\n${err.message}`);
       finish(null);
     });
-    child.on("exit", (code) => finishSoon(code, CLOSE_GRACE_MS));
+    child.on("exit", (code) => {
+      // Whatever the gate left running in the background (a test's server, `sleep &`) goes with it.
+      killTree(child);
+      finishSoon(code, CLOSE_GRACE_MS);
+    });
     child.on("close", (code) => finish(code));
   });
 }

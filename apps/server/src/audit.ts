@@ -72,6 +72,9 @@ export function audit(actor: string, action: string, subject: string, data: Reco
   return job;
 }
 
+/** Resolves when every queued write is on disk: for a clean shutdown. */
+export const auditIdle = () => queue;
+
 export function listAudit(limit = 500): AuditEvent[] {
   return readAll().slice(-limit).reverse();
 }
