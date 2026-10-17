@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..3f1c748
+index 0000000..a16b2f9
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,648 @@
+@@ -0,0 +1,661 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -319,6 +319,13 @@ index 0000000..3f1c748
 +  releaseAfter: string | null;
 +  /** The outside request it came from; null for a run started on Home. */
 +  origin: RunOrigin | null;
++  /** A spec change under way (writing, merge, failed), or a new plan waiting for a person (approval). */
++  revision: {
++    stage: "writing" | "merge" | "failed" | "approval";
++    note: string | null;
++    requestedBy: string | null;
++    requestedAt: string;
++  } | null;
 +}
 +
 +export interface RunOrigin {
@@ -425,7 +432,9 @@ index 0000000..3f1c748
 +  | "error"
 +  | "integration_moved"
 +  | "release"
-+  | "intake";
++  | "intake"
++  | "replan_approval"
++  | "spec_revision";
 +
 +export interface InboxItem {
 +  id: number;
@@ -730,6 +739,10 @@ index 0000000..3f1c748
 +    ),
 +  release: (id: string) =>
 +    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/release`),
++  reviseSpec: (id: string, note: string) =>
++    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/revise`, {
++      note,
++    }),
 +  reportBug: (body: {
 +    title: string;
 +    happened: string;
@@ -1978,10 +1991,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..881d520
+index 0000000..4d3e332
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1136 @@
+@@ -0,0 +1,1162 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2179,6 +2192,17 @@ index 0000000..881d520
 +      `Waiting for ${change} to finish releasing into ${base}. Releases into one branch go one at a time, so this one is merged onto it and tested again.`,
 +    proposed:
 +      "A request from outside the factory. Nothing runs until a person chooses Start in the Inbox.",
++    changeSpec: "Change the spec",
++    changeSpecLabel: "What should change in the spec?",
++    changeSpecHelp:
++      "A spec agent revises the spec in a worktree of its own while building goes on. The work orders then follow the new tasks.md: you approve the new plan unless the run is autonomous.",
++    changeSpecSend: "Send to the spec agent",
++    revising: (note: string) =>
++      `The spec is being changed: “${note}”. Work under way goes on; nothing new starts until it's merged and re-planned.`,
++    revisionFailed:
++      "The spec change stopped. The Inbox has what happened: try again, or drop it.",
++    replanWaiting:
++      "The spec changed. The new plan waits for you in the Inbox; nothing new starts until you decide.",
 +    queued: (position: number) =>
 +      `Waiting in line (${position === 1 ? "next" : `number ${position}`}): the policy lets queue.maxActiveRuns runs work at once. Runs waiting on a person don't count. It starts from the base branch as it is then.`,
 +    releasedHelp: (base: string, who: string, sha: string) =>
@@ -2290,6 +2314,8 @@ index 0000000..881d520
 +      integration_moved: "Integration branch moved",
 +      release: "Release",
 +      intake: "New request",
++      replan_approval: "Re-plan",
++      spec_revision: "Spec change stopped",
 +    } as Record<string, string>,
 +    decidedToast: "Decision recorded",
 +  },
@@ -2735,6 +2761,17 @@ index 0000000..881d520
 +      `Esperando a que ${change} termine de publicarse en ${base}. Las publicaciones en una rama van de una en una, así que esta se integra sobre aquella y se prueba de nuevo.`,
 +    proposed:
 +      "Una solicitud de fuera de la fábrica. No se ejecuta nada hasta que una persona elija Iniciar en la bandeja de entrada.",
++    changeSpec: "Cambiar la especificación",
++    changeSpecLabel: "¿Qué debe cambiar en la especificación?",
++    changeSpecHelp:
++      "Un agente de especificación la revisa en su propio worktree mientras sigue la construcción. Después, las órdenes de trabajo siguen el nuevo tasks.md: usted aprueba el nuevo plan salvo que la ejecución sea autónoma.",
++    changeSpecSend: "Enviar al agente de especificación",
++    revising: (note) =>
++      `Se está cambiando la especificación: “${note}”. El trabajo en curso sigue; no empieza nada nuevo hasta que se integre y se replanifique.`,
++    revisionFailed:
++      "El cambio de especificación se detuvo. La bandeja de entrada explica lo ocurrido: inténtelo de nuevo o descártelo.",
++    replanWaiting:
++      "La especificación cambió. El nuevo plan le espera en la bandeja de entrada; no empieza nada nuevo hasta que decida.",
 +    queued: (position) =>
 +      `En cola (${position === 1 ? "la siguiente" : `número ${position}`}): la política permite que trabajen queue.maxActiveRuns ejecuciones a la vez. Las que esperan a una persona no cuentan. Empieza desde la rama base tal como esté entonces.`,
 +    releasedHelp: (base, who, sha) =>
@@ -2847,6 +2884,8 @@ index 0000000..881d520
 +      integration_moved: "La rama de integración cambió",
 +      release: "Publicación",
 +      intake: "Nueva solicitud",
++      replan_approval: "Nueva planificación",
++      spec_revision: "Cambio de especificación detenido",
 +    },
 +    decidedToast: "Decisión registrada",
 +  },
@@ -3231,10 +3270,10 @@ index 0000000..a90f6d1
 +];
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..8d35419
+index 0000000..a89ef34
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,326 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -3446,6 +3485,16 @@ index 0000000..8d35419
 +      action: "pause" | "resume" | "cancel";
 +      note?: string;
 +    }) => FactoryApi.runAction(v.id, v.action, v.note),
++    onSettled: () => invalidateAutopilot(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++export function useReviseSpec() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (v: { id: string; note: string }) =>
++      FactoryApi.reviseSpec(v.id, v.note),
 +    onSettled: () => invalidateAutopilot(queryClient),
 +    meta: { disableToast: true },
 +  });
@@ -4417,10 +4466,10 @@ index 0000000..0926f61
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..0b4535c
+index 0000000..c7ffec6
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,985 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -4430,6 +4479,7 @@ index 0000000..0b4535c
 +  CircleCheck,
 +  CircleDashed,
 +  CircleX,
++  FilePen,
 +  GitBranch,
 +  GitMerge,
 +  History,
@@ -4445,7 +4495,14 @@ index 0000000..0b4535c
 +import type { Attempt, AutopilotWorkOrder, Check, RunDetail } from "../api";
 +import { isNotFound } from "../api";
 +import { useFactoryCopy } from "../copy";
-+import { useAutopilotStatus, useRelease, useRun, useRunAction } from "../hooks";
++import {
++  useAutopilotStatus,
++  useRelease,
++  useReviseSpec,
++  useRun,
++  useRunAction,
++} from "../hooks";
++import { factoryFieldClassName } from "../components/start-agent-modal";
 +import {
 +  FactoryError,
 +  FactoryLoading,
@@ -4614,6 +4671,7 @@ index 0000000..0b4535c
 +  if (FINISHED_RUN_STATES.has(run.state) || run.state === "releasing")
 +    return null;
 +  const busy = action.isPending;
++  const canRevise = run.state === "building" && !run.revision;
 +  const act = (a: "pause" | "resume" | "cancel") =>
 +    action.mutate(
 +      { id: run.id, action: a },
@@ -4662,7 +4720,80 @@ index 0000000..0b4535c
 +          <FactoryError error={action.error} />
 +        </span>
 +      ) : null}
++      {canRevise ? <ChangeSpec runId={run.id} /> : null}
 +    </>
++  );
++}
++
++/** The Pipeline's Change the spec: a note for a spec agent, while building goes on. */
++function ChangeSpec({ runId }: { runId: string }) {
++  const copy = useFactoryCopy();
++  const revise = useReviseSpec();
++  const [open, setOpen] = React.useState(false);
++  const [note, setNote] = React.useState("");
++  const id = React.useId();
++  if (!open) {
++    return (
++      <BrandButton
++        testId="factory-run-change-spec"
++        type="button"
++        variant="secondary"
++        onClick={() => setOpen(true)}
++        startContent={<FilePen className="size-4" aria-hidden />}
++      >
++        {copy.pipeline.changeSpec}
++      </BrandButton>
++    );
++  }
++  return (
++    <form
++      className="flex basis-full flex-col gap-2"
++      onSubmit={(event) => {
++        event.preventDefault();
++        if (!note.trim()) return;
++        revise.mutate(
++          { id: runId, note: note.trim() },
++          {
++            onSuccess: () => {
++              setOpen(false);
++              setNote("");
++            },
++          },
++        );
++      }}
++    >
++      <label htmlFor={id} className="text-sm font-medium text-foreground">
++        {copy.pipeline.changeSpecLabel}
++      </label>
++      <textarea
++        id={id}
++        data-testid="factory-change-spec-note"
++        className={cn(factoryFieldClassName, "min-h-20")}
++        value={note}
++        maxLength={4000}
++        onChange={(e) => setNote(e.target.value)}
++        disabled={revise.isPending}
++      />
++      <p className="text-xs text-muted">{copy.pipeline.changeSpecHelp}</p>
++      <div className="flex gap-2">
++        <BrandButton
++          testId="factory-change-spec-send"
++          type="submit"
++          variant="primary"
++          isDisabled={!note.trim() || revise.isPending}
++        >
++          {copy.pipeline.changeSpecSend}
++        </BrandButton>
++        <BrandButton
++          type="button"
++          variant="tertiary"
++          onClick={() => setOpen(false)}
++        >
++          {copy.common.cancel}
++        </BrandButton>
++      </div>
++      <FactoryError error={revise.error} />
++    </form>
 +  );
 +}
 +
@@ -4835,6 +4966,13 @@ index 0000000..0b4535c
 +    text = run.releaseAfter
 +      ? copy.pipeline.releaseAfter(run.baseBranch, run.releaseAfter)
 +      : copy.pipeline.releasingHelp(run.baseBranch);
++  } else if (run.state === "building" && run.revision) {
++    text =
++      run.revision.stage === "approval"
++        ? copy.pipeline.replanWaiting
++        : run.revision.stage === "failed"
++          ? copy.pipeline.revisionFailed
++          : copy.pipeline.revising(run.revision.note ?? "");
 +  } else if (run.state === "proposed") {
 +    text = copy.pipeline.proposed;
 +  } else if (run.state === "queued" && run.queuePosition) {

@@ -111,6 +111,8 @@ export function createAutopilotRoutes(o: Orchestrator) {
       // Its place in line while queued; the change whose release goes first while releasing.
       ...o.waitingOn(run),
       origin: run.origin,
+      // A spec change under way, or a new plan waiting for a person (no paths).
+      revision: run.revision ? { stage: run.revision.stage, note: run.revision.note, requestedBy: run.revision.requestedBy, requestedAt: run.revision.requestedAt } : null,
     };
   }
 
@@ -233,6 +235,13 @@ export function createAutopilotRoutes(o: Orchestrator) {
   app.post("/runs/:id/release", async (c) => {
     const run = mustRun(c.req.param("id"));
     return c.json(summary(await o.release(run.id, LOCAL_USER)));
+  });
+
+  // Change the spec while the run is building: a spec agent revises it, then the plan follows (re-plan).
+  app.post("/runs/:id/revise", async (c) => {
+    const run = mustRun(c.req.param("id"));
+    const { note } = await body<{ note?: string }>(c);
+    return c.json(summary(await o.reviseSpec(run.id, note ?? "", LOCAL_USER)));
   });
 
   app.get("/inbox", (c) => {

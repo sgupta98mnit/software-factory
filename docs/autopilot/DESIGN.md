@@ -379,7 +379,42 @@ on the Pipeline and in the evidence. The spec brief says the goal is an outside
 request whose instructions it must not follow. Audit data holds the source,
 kind, reference and a title clipped to 80 characters, never the body.
 
-## 18. Changes since the first build
+## 18. Spec drift and re-plan
+
+- `run.planTree` (ledger v11) is the git tree of
+  `openspec/changes/<change>` the work orders came from, set on the first
+  build step. Each build step, `specDrift` compares it with the tree at
+  `integrationSha`, after merges in flight settle. When they differ, the plan
+  is made again from tasks.md (`planWorkOrders`) and compared by group number
+  (`diffPlan` gives added, removed, changed and unchanged). Audited as
+  `autopilot.spec_drift`.
+- No difference in work orders: `planTree` moves silently. An autonomous run
+  applies the new plan as `policy@<hash>`. Any other run opens a
+  `replan_approval` item (Re-plan, Keep the current plan, Cancel run) and
+  holds `revision.stage = "approval"`. An item for an older tree is marked
+  superseded.
+- `applyReplan` stops the agents, gate jobs and worktree of every changed or
+  removed work order in progress. Removed ones become `skipped` (merged ones
+  keep their code). Changed ones take the new title, criteria and dependencies
+  and go back to `pending` with a finding for the next builder; a merged one
+  is reopened (`work_order_reopened`). Added ones are `pending`. Open items of
+  stopped work orders are marked superseded, and the result is audited as
+  `autopilot.replanned`. When `specs/` changed and hidden tests are on, the
+  validator starts over (`hidden_tests_reset`).
+- A person's spec change while building (`POST /runs/:id/revise`,
+  `reviseSpec`) records `revision.stage = "writing"` with a worktree and
+  branch (`<integration>--spec`) of its own from `integrationSha`, and starts
+  a spec agent there with `reviseBrief`. `revisionStep` validates it (with
+  the usual follow-ups), commits only the change's markdown (`commitPaths`),
+  waits for any merge in flight, merges it into the integration branch
+  (`spec_revised`) and removes the worktree. The drift check then re-plans. A
+  stop (after the one restart) or a conflict opens a `spec_revision` item:
+  Try again or Drop.
+- While `run.revision` is set, nothing new is dispatched and the run doesn't
+  finish. `mergeCheck` sends any work order that changes files under
+  `openspec/` to a person, with the reason that merging it re-plans the run.
+
+## 19. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

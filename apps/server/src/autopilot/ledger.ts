@@ -54,7 +54,9 @@ export type InboxKind =
   | "error"
   | "integration_moved"
   | "release"
-  | "intake";
+  | "intake"
+  | "replan_approval"
+  | "spec_revision";
 export type Risk = "low" | "medium" | "high";
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -91,6 +93,8 @@ export interface Run {
   releasedAt: string | null;
   releaseRequestedAt: string | null; // releases into one base branch go in this order
   origin: RunOrigin | null; // where an intake request came from; null for runs started on Home
+  planTree: string | null; // git tree of the change folder the work orders were planned from
+  revision: SpecRevision | null; // a person's spec change while building, or a re-plan waiting for approval
   state: RunState;
   resumeState: RunState | null; // where to go back to after "paused"
   pausedReason: string | null;
@@ -100,6 +104,22 @@ export interface Run {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** A spec change while building: written by a spec agent in its own worktree, merged, then re-planned. */
+export interface SpecRevision {
+  stage: "writing" | "merge" | "failed" | "approval";
+  /** What the person asked for (writing, merge, failed); null for a spec changed by a merge. */
+  note: string | null;
+  requestedBy: string | null;
+  requestedAt: string;
+  /** writing, merge, failed: the revision's worktree, branch, the integration sha it started from, and (merge) its commit. */
+  dir?: string;
+  branch?: string;
+  base?: string;
+  sha?: string | null;
+  /** approval: the change folder's tree the new plan comes from. */
+  tree?: string;
 }
 
 export interface WorkOrder {
@@ -351,11 +371,17 @@ const SCHEMA_V10 = `
 ALTER TABLE runs ADD COLUMN origin TEXT;
 `;
 
+// v11: spec drift: the change folder the plan came from, and a revision in progress.
+const SCHEMA_V11 = `
+ALTER TABLE runs ADD COLUMN plan_tree TEXT;
+ALTER TABLE runs ADD COLUMN revision TEXT;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
-const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "requires", "origin"]);
+const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "requires", "origin", "revision"]);
 const FLAG_COLUMNS = new Set(["seen_running", "ok"]);
 const toColumn = (field: string) => field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toField = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -415,6 +441,7 @@ export function openLedger(file: string) {
   if (version < 8) transaction(() => db.exec(`${SCHEMA_V8}\nPRAGMA user_version = 8;`));
   if (version < 9) transaction(() => db.exec(`${SCHEMA_V9}\nPRAGMA user_version = 9;`));
   if (version < 10) transaction(() => db.exec(`${SCHEMA_V10}\nPRAGMA user_version = 10;`));
+  if (version < 11) transaction(() => db.exec(`${SCHEMA_V11}\nPRAGMA user_version = 11;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

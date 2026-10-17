@@ -127,3 +127,25 @@ export function planWorkOrders(dir: string, change: string): NewWorkOrder[] {
     };
   });
 }
+
+/** How a new plan differs from the work orders a run has. Matched by group number. */
+export interface PlanDiff<W extends { seq: number; title: string; acceptance: string[]; dependsOn: number[] }> {
+  added: NewWorkOrder[];
+  removed: W[];
+  /** Same group number, different title, acceptance criteria or dependencies. */
+  changed: { wo: W; next: NewWorkOrder }[];
+  unchanged: { wo: W; next: NewWorkOrder }[];
+}
+
+export function diffPlan<W extends { seq: number; title: string; acceptance: string[]; dependsOn: number[] }>(current: W[], next: NewWorkOrder[]): PlanDiff<W> {
+  const bySeq = new Map(next.map((n) => [n.seq, n]));
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const diff: PlanDiff<W> = { added: next.filter((n) => !current.some((w) => w.seq === n.seq)), removed: [], changed: [], unchanged: [] };
+  for (const wo of current) {
+    const n = bySeq.get(wo.seq);
+    if (!n) diff.removed.push(wo);
+    else if (wo.title === n.title && same(wo.acceptance, n.acceptance) && same([...wo.dependsOn].sort(), [...n.dependsOn].sort())) diff.unchanged.push({ wo, next: n });
+    else diff.changed.push({ wo, next: n });
+  }
+  return diff;
+}

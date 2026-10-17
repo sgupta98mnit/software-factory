@@ -101,6 +101,7 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
       queuePosition: null,
       releaseAfter: null,
       origin: null,
+      revision: null,
     });
 
     // The org-wide cap clamps autonomy; the same goal gets the next free name.

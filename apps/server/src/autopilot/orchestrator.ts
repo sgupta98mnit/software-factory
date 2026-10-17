@@ -13,7 +13,7 @@
 // One run is handled by one thing at a time: the scheduler's step for it, or
 // a person's decision, pause or cancel, which wait for that step to finish.
 import { randomBytes, randomUUID } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { audit, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
@@ -76,6 +76,7 @@ import {
   validateFollowUp,
   validatorBrief,
   quietNudge,
+  reviseBrief,
   verdictReminder,
 } from "./prompts.js";
 import { describeOrigin, fromBugForm, fromGithub, fromWebhook, goalFor, originOf, type IntakeRequest, type IntakeSource, type RunOrigin } from "./intake.js";
@@ -92,7 +93,7 @@ import {
   takenChangeNames,
   type CriticVerdict,
 } from "./spec.js";
-import { planWorkOrders } from "./waves.js";
+import { diffPlan, planWorkOrders } from "./waves.js";
 
 export interface OrchestratorDeps {
   ledger: Ledger;
@@ -156,6 +157,15 @@ const INTEGRATION_MOVED: InboxOption[] = [
 const INTAKE: InboxOption[] = [
   { id: "start", label: "Start a run", tone: "primary" },
   { id: "cancel", label: "Not now" },
+];
+const REPLAN: InboxOption[] = [
+  { id: "replan", label: "Re-plan", tone: "primary" },
+  { id: "keep", label: "Keep the current plan" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const REVISION_FAILED: InboxOption[] = [
+  { id: "retry", label: "Try again", tone: "primary" },
+  { id: "drop", label: "Drop the spec change" },
 ];
 const RUN_PAUSED: InboxOption[] = [
   { id: "resume", label: "Resume", tone: "primary" },
@@ -490,6 +500,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo }) : builderBrief({ change: run.change, wo, gates: pinnedPolicy(run).gates });
     if (a.role === "critic") return criticBrief({ change: run.change });
     if (a.role === "validator") return validatorBrief({ change: run.change, workOrders: ledger.listWorkOrders(run.id), run: pinnedPolicy(run).hiddenTests.run });
+    if (run.revision?.stage === "writing" && run.revision.note) {
+      return reviseBrief({ goal: run.goal, change: run.change, note: run.revision.note, openspecVersion: tools.openspec.version, origin: run.origin });
+    }
     // A spec agent started after one that failed (or whose tasks.md couldn't be planned) hears why.
     const before = ledger.listAttempts({ runId: run.id, role: "spec" }).filter((x) => x.id < a.id).at(-1);
     const problem = (before?.result as { reason?: string } | null)?.reason ?? null;
@@ -501,7 +514,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const run = ledger.getRun(a.runId);
     const wo = a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined;
     // Builders and reviewers work in their work order's worktree; the validator in the hidden-tests folder.
-    const dir = wo ? wo.worktree : a.role === "validator" && run ? hiddenDir(run) : run?.integrationDir;
+    // A spec agent revising the spec while building works in the revision's worktree (the integration worktree is where merges happen).
+    const revising = a.role === "spec" && run?.revision?.stage === "writing" ? run.revision.dir : undefined;
+    const dir = wo ? wo.worktree : a.role === "validator" && run ? hiddenDir(run) : (revising ?? run?.integrationDir);
     if (!run || !dir || !a.agentProfile) throw new Error(`Attempt ${a.id} has no worktree or agent profile to start with`);
     try {
       const snap = await client.start({
@@ -842,6 +857,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    */
   async function buildStep(run: Run) {
     if (!(await guardIntegration(run))) return;
+    await revisionStep(run);
+    await specDrift(run);
+    if (ledger.getRun(run.id)?.state !== "building") return;
     await validatorStep(run);
     for (const wo of ledger.listWorkOrders(run.id)) {
       try {
@@ -856,6 +874,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
     await integrateStep(run);
     if (ledger.getRun(run.id)?.state !== "building") return; // done, or too many failures paused it
+    // Nothing new starts while the spec is being changed, or a new plan waits for a person: it may not need it.
+    if (ledger.getRun(run.id)?.revision) return;
     // Pending work orders whose dependencies are merged or skipped, in wave order, while there's room.
     const wos = ledger.listWorkOrders(run.id);
     const stateOf = new Map(wos.map((w) => [w.seq, w.state]));
@@ -1009,17 +1029,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function validatorStep(run: Run) {
     if (!pinnedPolicy(run).hiddenTests.enabled) return;
     const v = latest(run.id, "validator");
-    if (!v) {
-      const dir = hiddenDir(run);
-      mkdirSync(path.join(dir, "tests"), { recursive: true });
-      const change = path.join(run.integrationDir as string, "openspec", "changes", run.change);
-      if (existsSync(change)) cpSync(change, path.join(dir, "spec"), { recursive: true });
-      const plan = ledger.listWorkOrders(run.id).map((w) =>
-        [`## WO-${w.seq}: ${w.title}`, `Wave ${w.wave}${w.dependsOn.length ? `, after ${w.dependsOn.map((d) => `WO-${d}`).join(", ")}` : ""}`, ...w.acceptance.map((x) => `- ${x}`), ""].join("\n"),
-      );
-      writeFileSync(path.join(dir, "plan.md"), `# Plan for ${run.change}\n\n${plan.join("\n")}`);
-      return startAgent(run, "validator");
-    }
+    if (!v) return startValidator(run);
     if (ACTIVE.has(v.state) || v.state === "paused" || handled(v)) return;
     if (restartable(v)) return restart(run, v, await whyStopped(v, "The validator"));
     const tests = v.state === "finished" ? listHiddenTestFiles(testsDir(run)) : [];
@@ -1033,6 +1043,266 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       ...(v.state === "finished" ? {} : { validator: v.state }),
     });
     changed(run.id);
+  }
+
+  /** A validator in the hidden-tests folder with a fresh copy of the change and the plan. `reset`: the spec changed, so its tests start over. */
+  async function startValidator(run: Run, reset = false) {
+    const dir = hiddenDir(run);
+    if (reset) {
+      rmSync(dir, { recursive: true, force: true });
+      ledger.setHiddenTests(run.id, []);
+      record(SYSTEM, "autopilot.hidden_tests_reset", run.id, { reason: "the spec's scenarios changed" });
+    }
+    mkdirSync(path.join(dir, "tests"), { recursive: true });
+    const change = path.join(run.integrationDir as string, "openspec", "changes", run.change);
+    if (existsSync(change)) cpSync(change, path.join(dir, "spec"), { recursive: true });
+    const plan = ledger.listWorkOrders(run.id).map((w) =>
+      [`## WO-${w.seq}: ${w.title}`, `Wave ${w.wave}${w.dependsOn.length ? `, after ${w.dependsOn.map((d) => `WO-${d}`).join(", ")}` : ""}`, ...w.acceptance.map((x) => `- ${x}`), ""].join("\n"),
+    );
+    writeFileSync(path.join(dir, "plan.md"), `# Plan for ${run.change}\n\n${plan.join("\n")}`);
+    await startAgent(run, "validator");
+  }
+
+  // ---- the spec changing while building ----
+
+  /** The change folder's git tree at `ref` (a commit or a tree), or null when it has none. */
+  async function treeAt(ref: string, sub: string): Promise<string | null> {
+    const r = await git(workspace, ["rev-parse", "--verify", "-q", `${ref}:${sub}`], { allowFail: true });
+    return r.code === 0 ? r.stdout.trim() : null;
+  }
+
+  /**
+   * A spec change a person asked for while building: a fresh spec agent edits
+   * the change in its own worktree (the integration worktree is where merges
+   * happen). Once it validates, the change's markdown alone is committed and
+   * merged into the integration branch (after any merge in flight); the drift
+   * check then re-plans from it.
+   */
+  async function revisionStep(run: Run) {
+    const rev = ledger.getRun(run.id)?.revision;
+    if (!rev || (rev.stage !== "writing" && rev.stage !== "merge")) return;
+    const dir = rev.dir as string;
+    if (rev.stage === "writing") {
+      const a = latest(run.id, "spec");
+      if (!a || ACTIVE.has(a.state) || a.state === "paused" || handled(a)) return;
+      if (a.state !== "finished") {
+        const why = await whyStopped(a, "The spec agent");
+        if (restartable(a)) return restart(ledger.getRun(run.id) ?? run, a, why);
+        markHandled(a, { outcome: "failed" });
+        return revisionFailed(run, why);
+      }
+      const check = await checkChange(run.change, dir);
+      const tries = check.ok ? 0 : invalidStreak(run, a) + 1;
+      const { validateTries } = pinnedPolicy(run).spec;
+      if (!check.ok && tries < validateTries) await sendFollowUp(a, validateFollowUp(run.change, check.output), "validate");
+      ledger.addCheck({ runId: run.id, stage: "spec", name: "openspec-validate", ok: check.ok, exitCode: check.ok ? 0 : 1, durationMs: check.durationMs, output: check.output });
+      changed(run.id);
+      if (!check.ok) {
+        if (tries >= validateTries) {
+          markHandled(a, { outcome: "invalid" });
+          return revisionFailed(run, `\`openspec validate ${run.change} --strict\` still fails after ${tries} tries:\n\n${check.output}`);
+        }
+        return;
+      }
+      // Back on the revision branch where it started if the agent moved it, keeping its files; then the change's markdown alone.
+      if ((await currentBranch(dir)) !== rev.branch || (await headSha(dir)) !== rev.base) {
+        await git(dir, ["symbolic-ref", "HEAD", `refs/heads/${rev.branch}`]);
+        await git(dir, ["reset", "-q", "--mixed", rev.base as string]);
+      }
+      const changeDir = `openspec/changes/${run.change}`;
+      const isSpec = (f: string) => f.startsWith(`${changeDir}/`) && (f.endsWith(".md") || f === `${changeDir}/.openspec.yaml`);
+      const sha = await commitPaths(dir, isSpec, `spec(${run.change}): ${clip(rev.note ?? "revision", 72)}`);
+      const extra = await changedFiles(dir);
+      if (extra.length) {
+        await discardChanges(dir);
+        ledger.addCheck({ runId: run.id, stage: "spec", name: "spec-edits-discarded", ok: false, output: `The spec agent changed files that aren't the change's markdown. They were thrown away:\n${extra.map((f) => `- ${f}`).join("\n")}` });
+        record(SYSTEM, "autopilot.edits_discarded", run.id, { role: "spec", attempt: a.id, files: extra.length });
+      }
+      markHandled(a, { outcome: "valid", sha });
+      if (!sha) {
+        await endRevision(run);
+        record(SYSTEM, "autopilot.spec_revision_unchanged", run.id, { attempt: a.id });
+        return;
+      }
+      record(SYSTEM, "autopilot.spec_committed", run.id, { change: run.change, branch: rev.branch, sha, revision: true });
+      ledger.updateRun(run.id, { revision: { ...rev, stage: "merge", sha } });
+      changed(run.id);
+    }
+    const ready = ledger.getRun(run.id)?.revision;
+    if (ready?.stage !== "merge" || ledger.listWorkOrders(run.id).some((w) => w.state === "merging")) return;
+    // Markdown only, so nothing for the gates to test; the merge is the factory's, like a work order's.
+    const merged = await merge(run.integrationDir as string, ready.sha as string, `Merge the spec change for ${run.change}`);
+    if (!merged.ok) return revisionFailed(run, `The changed spec conflicts with the integration branch in: ${merged.conflicts.join(", ")}.`);
+    ledger.transaction(() => {
+      ledger.updateRun(run.id, { integrationSha: merged.sha });
+      record(SYSTEM, "autopilot.spec_revised", run.id, { sha: merged.sha, requestedBy: ready.requestedBy, note: ready.note ? clip(ready.note) : null });
+    });
+    await endRevision(run);
+  }
+
+  /** The revision is over (merged, unchanged or dropped): its worktree and branch go. */
+  async function endRevision(run: Run) {
+    const rev = ledger.getRun(run.id)?.revision;
+    ledger.updateRun(run.id, { revision: null });
+    if (rev?.dir) await removeWorktree(workspace, rev.dir).catch(warn);
+    if (rev?.branch) await deleteBranch(workspace, rev.branch).catch(warn);
+    changed(run.id);
+  }
+
+  function revisionFailed(run: Run, why: string) {
+    const rev = ledger.getRun(run.id)?.revision;
+    if (!rev) return;
+    ledger.transaction(() => {
+      ledger.updateRun(run.id, { revision: { ...rev, stage: "failed" } });
+      openItem(
+        run,
+        "spec_revision",
+        `The spec change for ${run.change} stopped`,
+        `${rev.requestedBy ? `${rev.requestedBy.replace(/^user:/, "")} asked for this change to the spec:\n\n> ${mdText(rev.note ?? "")}\n\n` : ""}It stopped on this:\n\n${why}\n\nTry again starts a fresh spec agent in the same worktree. Drop keeps the spec and the plan as they are. Either way, building goes on.`,
+        REVISION_FAILED,
+      );
+    });
+  }
+
+  /**
+   * The change folder on the integration branch isn't the one the plan came
+   * from: a person's spec change merged, or a work order a person let change
+   * the spec. The plan is made again from tasks.md and compared with the work
+   * orders; an autonomous run applies it at once, any other asks a person.
+   * Merges in flight settle first.
+   */
+  async function specDrift(run: Run) {
+    const fresh = ledger.getRun(run.id);
+    if (!fresh?.integrationSha) return;
+    const tree = await treeAt(fresh.integrationSha, `openspec/changes/${fresh.change}`);
+    if (!fresh.planTree) {
+      if (tree) ledger.updateRun(run.id, { planTree: tree });
+      return;
+    }
+    if (!tree || tree === fresh.planTree) return;
+    if (fresh.revision && !(fresh.revision.stage === "approval" && fresh.revision.tree !== tree)) return; // being written, or already waiting for a person
+    if (ledger.listWorkOrders(run.id).some((w) => w.state === "merging")) return;
+    let plan: ReturnType<typeof planWorkOrders>;
+    try {
+      plan = planWorkOrders(fresh.integrationDir as string, fresh.change);
+    } catch (err) {
+      throw new Error(`The spec changed, and its tasks.md can't be planned: ${errorText(err)}`);
+    }
+    const diff = diffPlan(ledger.listWorkOrders(run.id), plan);
+    const scenarios = (await treeAt(fresh.planTree, "specs")) !== (await treeAt(tree, "specs"));
+    const keys = (list: { seq: number }[]) => list.map((w) => `WO-${w.seq}`);
+    record(SYSTEM, "autopilot.spec_drift", run.id, { from: fresh.planTree, to: tree, added: keys(diff.added), removed: keys(diff.removed), changed: keys(diff.changed.map((c) => c.wo)), scenarios });
+    const nothing = !diff.added.length && !diff.removed.length && !diff.changed.length;
+    if (nothing || fresh.autonomy === "autonomous") return applyReplan(fresh, plan, tree, nothing ? SYSTEM : policyActor(fresh), scenarios);
+    ledger.transaction(() => {
+      for (const old of ledger.listInbox({ runId: run.id }).filter((i) => i.kind === "replan_approval")) {
+        ledger.decideInbox(old.id, { decision: "superseded", note: "The spec changed again", by: SYSTEM });
+      }
+      ledger.updateRun(run.id, { revision: { stage: "approval", tree, note: null, requestedBy: null, requestedAt: now() } });
+      openItem(fresh, "replan_approval", `The spec for ${fresh.change} changed: re-plan?`, replanBody(diff, scenarios), REPLAN);
+    });
+  }
+
+  function replanBody(diff: ReturnType<typeof diffPlan<WorkOrder>>, scenarios: boolean): string {
+    const label = (w: { seq: number; title: string }) => `WO-${w.seq}: ${mdText(w.title)}`;
+    const fate = (w: WorkOrder, verb: string) =>
+      w.state === "merged" ? `already merged; ${verb === "removed" ? "its code stays on the integration branch" : "it's reopened and a fresh builder updates it"}` : w.state === "pending" ? "not started" : `${w.state.replaceAll("_", " ")} now; it stops${verb === "removed" ? "" : " and starts again from the new plan"}`;
+    const lines = [
+      ...diff.added.map((n) => `- **Added** ${label(n)}`),
+      ...diff.changed.map(({ wo, next }) => `- **Changed** ${label(next)} (${fate(wo, "changed")})`),
+      ...diff.removed.map((w) => `- **Removed** ${label(w)} (${fate(w, "removed")})`),
+    ];
+    return [
+      "The change folder on the integration branch is no longer the one the work orders were planned from. tasks.md now gives:",
+      "",
+      ...lines,
+      "",
+      ...(scenarios ? ["The scenarios changed too, so the hidden acceptance tests are written again (when they're on).", ""] : []),
+      "Re-plan applies this. Keep the current plan leaves the work orders as they are. Until you decide, the work under way goes on and nothing new starts.",
+    ].join("\n");
+  }
+
+  /** Stops one work order's agents and gates and removes its worktree; its branch stays. */
+  async function stopWorkOrder(run: Run, wo: WorkOrder) {
+    for (const key of [`${wo.id}#build`, `${wo.id}#integrate`]) {
+      const job = jobs.get(key);
+      if (!job) continue;
+      job.controller.abort();
+      await job.promise;
+      jobs.delete(key);
+      prepared.delete(key);
+    }
+    for (const a of ledger.listAttempts({ runId: run.id, workOrderId: wo.id })) {
+      if (!ACTIVE.has(a.state) && a.state !== "paused") continue;
+      await client.pause(a.conversationId).catch(warn);
+      ledger.updateAttempt(a.id, { state: "cancelled", finishedAt: now() });
+    }
+    if (wo.worktree) await removeWorktree(workspace, wo.worktree).catch(warn);
+  }
+
+  /**
+   * The new plan, applied: added work orders wait their turn; removed ones
+   * stop and are skipped (merged ones keep their code); changed ones take the
+   * new title, criteria and dependencies and start again, a merged one
+   * reopened with a note to its next builder. Hidden tests start over when the
+   * scenarios changed.
+   */
+  async function applyReplan(run: Run, plan: ReturnType<typeof planWorkOrders>, tree: string, actor: string, scenarios: boolean) {
+    const diff = diffPlan(ledger.listWorkOrders(run.id), plan);
+    const touched = [...diff.removed, ...diff.changed.map((c) => c.wo)].filter((w) => !["merged", "skipped", "cancelled", "pending"].includes(w.state));
+    for (const wo of touched) await stopWorkOrder(run, wo);
+    const stopped = new Set(touched.map((w) => w.id));
+    const keys = (list: { seq: number }[]) => list.map((w) => `WO-${w.seq}`);
+    const reopened = diff.changed.filter((c) => c.wo.state === "merged").map((c) => c.wo);
+    ledger.transaction(() => {
+      for (const wo of diff.removed) {
+        if (["merged", "skipped", "cancelled"].includes(wo.state)) continue;
+        moveWorkOrder(ledger.getWorkOrder(wo.id) ?? wo, "skipped", { actor, patch: { worktree: null, resumeState: null }, action: "autopilot.work_order_superseded", data: { reason: "no longer in the plan" } });
+      }
+      for (const { wo, next } of diff.changed) {
+        const fields = { title: next.title, acceptance: next.acceptance, controls: next.controls, dependsOn: next.dependsOn, wave: next.wave, risk: next.risk, riskScore: next.riskScore ?? 0 };
+        if (wo.state === "skipped" || wo.state === "cancelled") {
+          ledger.updateWorkOrder(wo.id, fields); // a person's skip stands
+          continue;
+        }
+        const note = wo.state === "merged"
+          ? "The spec changed for this work order after it was merged. Its earlier version is already on the integration branch your worktree starts from: update it to the acceptance criteria in your brief, with tests."
+          : "The spec changed for this work order. Build it to the acceptance criteria in your brief.";
+        moveWorkOrder(ledger.getWorkOrder(wo.id) ?? wo, "pending", {
+          actor,
+          patch: { ...fields, worktree: null, resumeState: null, mergedBy: null, findings: [{ source: "agent", severity: "high", title: note, detail: "" }] },
+          action: wo.state === "merged" ? "autopilot.work_order_reopened" : "autopilot.work_order_replanned",
+        });
+      }
+      for (const { wo, next } of diff.unchanged) ledger.updateWorkOrder(wo.id, { controls: next.controls, wave: next.wave, risk: next.risk, riskScore: next.riskScore ?? 0 });
+      if (diff.added.length) ledger.addWorkOrders(run.id, diff.added);
+      for (const item of ledger.listInbox({ runId: run.id })) {
+        if (item.workOrderId && stopped.has(item.workOrderId)) ledger.decideInbox(item.id, { decision: "superseded", note: "The plan changed", by: actor });
+      }
+      ledger.updateRun(run.id, { planTree: tree, revision: null });
+      record(actor, "autopilot.replanned", run.id, { added: keys(diff.added), removed: keys(diff.removed), changed: keys(diff.changed.map((c) => c.wo)), reopened: keys(reopened), scenarios });
+    });
+    changed(run.id);
+    if (scenarios && pinnedPolicy(run).hiddenTests.enabled) await startValidator(ledger.getRun(run.id) ?? run, true);
+  }
+
+  /** A person's spec change while the run is building (the Pipeline's Change the spec). */
+  async function reviseSpec(runId: string, note: string, actor: string): Promise<Run> {
+    return locked(runId, async () => {
+      const run = mustRun(runId);
+      const text = typeof note === "string" ? note.trim() : "";
+      if (!text || text.length > 4000) throw new Error("Say what should change in the spec (1 to 4000 characters).");
+      if (run.state !== "building") throw new Error(`The spec can be changed while the run is building (this one is ${run.state}).`);
+      if (run.revision) throw new Error("A spec change is already under way for this run.");
+      const dir = path.join(worktrees, run.id, "spec");
+      const branch = `${run.integrationBranch}--spec`;
+      const base = run.integrationSha ?? (await headSha(workspace, run.integrationBranch));
+      await addWorktree(workspace, dir, branch, base);
+      const revising = ledger.updateRun(run.id, { revision: { stage: "writing", note: text, requestedBy: actor, requestedAt: now(), dir, branch, base, sha: null } });
+      record(actor, "autopilot.spec_revision_requested", run.id, { note: clip(text) });
+      await startAgent(revising, "spec");
+      return ledger.getRun(run.id) ?? revising;
+    });
   }
 
   /** The gates, then (when they pass) the hidden tests in `tests`, as one outcome. */
@@ -1434,7 +1704,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     for (const wo of ledger.listWorkOrders(run.id)) if (wo.state === "merged" && wo.worktree) await cleanUp(run, wo);
     // Done once everything is merged or skipped, and every merged work order's worktree is gone (a failed clean-up retries first).
     const all = ledger.listWorkOrders(run.id);
-    if (ledger.getRun(run.id)?.state === "building" && all.every((w) => DONE_WO.has(w.state)) && !all.some((w) => w.state === "merged" && w.worktree)) await finish(run);
+    // Not while the spec is changing, or a new plan waits for a person: there may be more to build.
+    const current = ledger.getRun(run.id);
+    if (current?.state === "building" && !current.revision && all.every((w) => DONE_WO.has(w.state)) && !all.some((w) => w.state === "merged" && w.worktree)) await finish(run);
   }
 
   /**
@@ -1463,6 +1735,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       linesChanged: stat.linesChanged,
       newDependencies: await newDependencies(workspace, base, head, files),
     });
+    // A work order doesn't get to change what it's measured against on its own say-so.
+    const spec = files.filter((f) => f.startsWith("openspec/"));
+    if (spec.length) {
+      const listed = `${spec.slice(0, 5).join(", ")}${spec.length > 5 ? ` and ${spec.length - 5} more` : ""}`;
+      return { auto: false, reasons: [...decision.reasons, `Changes the spec (${listed}). Only a person lets a work order change what it's measured against; merging it re-plans the run.`], stat };
+    }
     return { ...decision, stat };
   }
 
@@ -2014,6 +2292,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (wo.branch) await deleteBranch(workspace, wo.branch).catch(warn);
       if (!DONE_WO.has(wo.state)) moveWorkOrder(wo, "cancelled", { actor, patch: { worktree: null, resumeState: null } });
     }
+    if (run.revision?.dir) await removeWorktree(workspace, run.revision.dir).catch(warn);
     // The integration branch stays: it holds whatever was committed so far.
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir).catch(warn);
     ledger.dismissInbox({ runId: run.id });
@@ -2134,6 +2413,35 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         return;
       case "release:hold":
         return; // stays done; Release on the Pipeline asks again
+      case "replan_approval:replan": {
+        const tree = run.revision?.stage === "approval" ? run.revision.tree : undefined;
+        if (!tree) throw new Error("There's no new plan waiting for this run.");
+        let plan: ReturnType<typeof planWorkOrders>;
+        try {
+          plan = planWorkOrders(run.integrationDir as string, run.change);
+        } catch (err) {
+          throw new Error(`The changed tasks.md can't be planned: ${errorText(err)}`);
+        }
+        const scenarios = run.planTree ? (await treeAt(run.planTree, "specs")) !== (await treeAt(tree, "specs")) : true;
+        await applyReplan(run, plan, tree, actor, scenarios);
+        return;
+      }
+      case "replan_approval:keep":
+        // The spec as it is now becomes the plan's source; the work orders stay.
+        ledger.updateRun(run.id, { planTree: run.revision?.tree ?? run.planTree, revision: null });
+        record(actor, "autopilot.replan_declined", run.id, {});
+        return;
+      case "spec_revision:retry": {
+        const rev = run.revision;
+        if (rev?.stage !== "failed") throw new Error("There's no stopped spec change to try again.");
+        const writing = ledger.updateRun(run.id, { revision: { ...rev, stage: "writing" } });
+        await startAgent(writing, "spec");
+        return;
+      }
+      case "spec_revision:drop":
+        await endRevision(run);
+        record(actor, "autopilot.spec_revision_dropped", run.id, {});
+        return;
       case "intake:start":
         // In line like any new run: it starts (and gets its branch) when the queue has room.
         if (run.state !== "proposed") throw new Error(`This run isn't waiting to be started (it's ${run.state}).`);
@@ -2240,6 +2548,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     waitingOn,
     createRun,
     intake,
+    reviseSpec,
     decide,
     pause,
     resume,
