@@ -27,6 +27,17 @@ run against the fake agent server), and the Phase 1 UI review.
 | 13 | low | Audit records could be lost on shutdown: SIGINT/SIGTERM exited without draining the audit queue. | Fixed in "gates clean up after themselves and don't see secrets" (#13) |
 | 14 | low | `pause()` marked attempts paused before moving the run, so a crash in between left a building run with paused attempts nobody polls. | Fixed in "a paused run stops spending": the run moves first, then its agents pause |
 
+## Found by the review of the fixes above (all fixed in "review fixes for the hardening")
+
+| # | Severity | Issue |
+| --- | --- | --- |
+| 15 | high | With gates out of the lock, a work order dispatched while a merge was still being re-tested branched from that untested merge (the live ref), so a merge that was then reset came back through it, outside any diff the policy checked. The "own merge" exception in #1's guard could also be forged: a two-parent commit of the factory's tip and the work order's branch, with any content. Now builders branch from `integrationSha`, merges start from it, and the guard accepts only the saved `mergeSha` (or, after a restart, a commit whose tree is exactly the clean merge of its two parents). |
+| 16 | medium | Pause and Cancel still waited when the run's gate job was queued behind another run's gate slot. The slot wait is now abortable. |
+| 17 | high | Git hooks (`pre-commit` and friends) an agent writes into the shared `.git/hooks`, or `core.hooksPath`/`core.fsmonitor` set in the repo's config, ran inside the factory's own commits and could add files to the spec commit. The factory's git runs with hooks pointed at `/dev/null` (`NUL` on Windows), fsmonitor off, and diffs without external diff or textconv. |
+| 18 | medium | One failed poll of a conversation failed its attempt and threw away the builder's work; now it takes three in a row. |
+| 19 | medium | A script placed in the change folder rode along in the spec commit; only the change's markdown and `.openspec.yaml` are committed now. |
+| 20 | low | A deleted integration worktree wasn't treated as "moved", and couldn't be put back; it is, and Restore recreates it. A pause the agent server refused marked the attempt paused anyway; it stays running and is polled after Resume. |
+
 ## Plausible, not fixed yet (tracked for later phases)
 
 - **No watchdog.** An agent-server outage keeps attempts `starting` and the run
@@ -34,6 +45,11 @@ run against the fake agent server), and the Phase 1 UI review.
   `running` in the ledger. (Phase 4: self-healing.)
 - **Cold starts.** `classify`'s 20 s grace could count an ACP conversation that
   stays `idle` for 20 s after start as finished. (Phase 4: watchdog.)
+- **Repo-level git config is still the agents' to write.** Hooks and fsmonitor
+  are off for the factory's git, but a `filter.<name>.clean` driver set in
+  `.git/config` with a matching `.gitattributes` runs on `git add`. Gates also
+  keep `HOME`, so `~/.npmrc` and similar files are readable by code agents wrote.
+  Both need agents in a sandbox (Docker), not more flags.
 - **The base branch is whatever the workspace has checked out.** A hand-started
   agent working in the workspace could switch it. The real fix is running agents
   in a sandbox (Docker), which also keeps them out of `data/` (hidden tests).

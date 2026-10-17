@@ -12,10 +12,16 @@ export interface GitResult {
   stderr: string;
 }
 
-// Same line endings and author on every machine, and paths printed as-is.
+// Same line endings and author on every machine, and paths printed as-is. Agents can write the
+// repo's .git (worktrees share it), so nothing there may run code inside the factory's own git:
+// hooks point at a path nobody can create, and fsmonitor is off. (Repo-level filters and other
+// config are a residual risk until agents run in a sandbox; see OPEN-ISSUES.md.)
+const NO_HOOKS = process.platform === "win32" ? "NUL" : "/dev/null";
 const BASE_ARGS = [
   "-c", "core.autocrlf=false",
   "-c", "core.quotepath=false",
+  "-c", `core.hooksPath=${NO_HOOKS}`,
+  "-c", "core.fsmonitor=false",
   "-c", "user.name=Software Factory",
   "-c", "user.email=factory@localhost",
 ];
@@ -143,10 +149,12 @@ export async function commitAll(dir: string, message: string): Promise<string | 
   return headSha(dir);
 }
 
-/** Commits only `paths` (and nothing else that's staged). null when they had nothing to commit. */
-export async function commitPaths(dir: string, paths: string[], message: string): Promise<string | null> {
+/** Commits only the changed files `keep` accepts (and nothing else that's staged). null when there were none. */
+export async function commitPaths(dir: string, keep: (file: string) => boolean, message: string): Promise<string | null> {
   await git(dir, ["reset", "-q"]); // unstage anything else
-  await git(dir, ["add", "-A", "--", ...paths]);
+  const files = (await changedFiles(dir)).filter(keep);
+  if (!files.length) return null;
+  await git(dir, ["add", "-A", "--", ...files.map((f) => `:(literal)${f}`)]);
   if ((await git(dir, ["diff", "--cached", "--quiet"], { allowFail: true })).code === 0) return null;
   await git(dir, ["commit", "-m", message]);
   return headSha(dir);
@@ -165,6 +173,12 @@ export async function squash(dir: string, base: string, message: string): Promis
     await git(dir, ["commit", "-q", "-m", message]);
   }
   return headSha(dir);
+}
+
+/** The tree a clean merge of `a` and `b` would have, or null when they conflict. */
+export async function mergeTree(dir: string, a: string, b: string): Promise<string | null> {
+  const r = await git(dir, ["merge-tree", "--write-tree", "--no-messages", a, b], { allowFail: true });
+  return r.code === 0 ? (r.stdout.trim().split("\n")[0] ?? null) : null;
 }
 
 /** Files with uncommitted changes (new, changed or deleted), installed packages left out. */
@@ -195,7 +209,7 @@ export async function resetHard(dir: string, sha: string): Promise<void> {
 /** Lines added and deleted per file between `base` and `head` (from their merge base). Binary files count 0. */
 export async function diffStat(dir: string, base: string, head = "HEAD") {
   // -z: paths as they are. Without it git quotes one with a " or tab in it, and the policy's sensitive-path check would miss it.
-  const out = (await git(dir, ["diff", "--numstat", "-z", "--no-renames", `${base}...${head}`])).stdout;
+  const out = (await git(dir, ["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", `${base}...${head}`])).stdout;
   const files = out
     .split("\0")
     .filter(Boolean)
@@ -209,7 +223,7 @@ export async function diffStat(dir: string, base: string, head = "HEAD") {
 
 /** Every added line between `base` and `head` with its number in the new file, for the secret scan. */
 export async function addedLines(dir: string, base: string, head = "HEAD"): Promise<{ path: string; line: string; number: number }[]> {
-  const out = (await git(dir, ["diff", "--unified=0", "--no-color", "--no-renames", "--no-prefix", `${base}...${head}`])).stdout;
+  const out = (await git(dir, ["diff", "--unified=0", "--no-color", "--no-renames", "--no-prefix", "--no-ext-diff", "--no-textconv", `${base}...${head}`])).stdout;
   const lines: { path: string; line: string; number: number }[] = [];
   let file = "";
   let next = 0;

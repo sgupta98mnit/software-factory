@@ -418,3 +418,163 @@ test("#9: the ETA counts rounds per remaining wave, and is null for a run that i
     await t.close();
   }
 });
+
+// ---- Phase 2 review: defects in the fixes above ----
+
+test("review 1: a work order dispatched while a merge is still being re-tested branches from the factory's tested tip, not the untested merge", async () => {
+  // The integration gate fails WO-1's first merge; work-order gates always pass.
+  const gate = `node -e "const fs=require('fs'); process.exit(process.cwd().includes('integration') && fs.existsSync('wo-1.js') && !fs.existsSync('wo-1.fixed') ? 1 : 0)"`;
+  const t = await setup(
+    byRole({
+      builder: (conv) => {
+        if (conv.tags.sfwo === "1" && conv.messages.length > 1) writeFileSync(path.join(conv.workingDir, "wo-1.fixed"), "");
+        return build(conv);
+      },
+    }),
+    { policy: `parallel: 1\ngates:\n  - { name: unit, run: ${JSON.stringify(gate)} }\n` },
+  );
+  try {
+    const run = await t.buildingRun(2);
+    t.ledger.updateWorkOrder(`${run.id}/WO-2`, { wave: 2 }); // WO-2 goes once WO-1 is out of building
+    await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+    const dispatched = (await import("../src/audit.js")).listAudit(5000).filter((e) => e.subject === run.id && e.action === "autopilot.work_order_dispatched" && e.data.workOrder === "WO-2").reverse();
+    assert.ok(dispatched.length > 0);
+    for (const e of dispatched) {
+      const files = (await git(t.workspace, ["ls-tree", "-r", "--name-only", String(e.data.baseSha)])).stdout.split("\n");
+      // Before WO-1 merged, or after its fixed merge passed: never the merge whose re-test failed.
+      assert.ok(!files.includes("wo-1.js") || files.includes("wo-1.fixed"), `WO-2 branched from the untested merge ${e.data.baseSha}`);
+    }
+  } finally {
+    await t.close();
+  }
+});
+
+test("review 1: a forged 'merge' (the factory's tip and the work order's branch as parents, content of its own) doesn't pass for the factory's merge", { skip: process.platform === "win32" }, async () => {
+  const slow = `node -e "setTimeout(() => {}, process.cwd().includes('integration') ? 3000 : 0)"`;
+  const t = await setup(byRole({ builder: build }), { policy: `gates:\n  - { name: unit, run: ${JSON.stringify(slow)} }\n` });
+  try {
+    const run = await t.buildingRun(1);
+    for (let i = 0; i < 100 && !t.ledger.getWorkOrder(`${run.id}/WO-1`)?.mergeSha; i++) {
+      await t.o.tick();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const wo = t.ledger.getWorkOrder(`${run.id}/WO-1`)!;
+    assert.ok(wo.mergeSha, "the merge is being re-tested");
+    // Same parents as the real merge, a tree with a backdoor in it.
+    writeFileSync(path.join(t.workspace, "backdoor.js"), "export const open = true;\n");
+    const blob = (await git(t.workspace, ["hash-object", "-w", "backdoor.js"])).stdout.trim();
+    const realTree = (await git(t.workspace, ["rev-parse", `${wo.mergeSha}^{tree}`])).stdout.trim();
+    const listing = (await git(t.workspace, ["ls-tree", realTree])).stdout + `100644 blob ${blob}\tbackdoor.js\n`;
+    const { execFileSync } = await import("node:child_process");
+    const forgedTree = execFileSync("git", ["mktree"], { cwd: t.workspace, input: listing }).toString().trim();
+    const branchHead = await headSha(t.workspace, wo.branch!);
+    const forged = (await git(t.workspace, ["commit-tree", forgedTree, "-p", run.integrationSha!, "-p", branchHead, "-m", "Merge WO-1: Task 1"])).stdout.trim();
+    await git(t.workspace, ["update-ref", `refs/heads/${run.integrationBranch}`, forged]);
+    await t.o.tick();
+    await t.o.idle();
+    assert.equal(t.ledger.getRun(run.id)?.state, "paused");
+    assert.ok(t.ledger.listInbox({ runId: run.id }).some((i) => i.kind === "integration_moved"));
+  } finally {
+    await t.close();
+  }
+});
+
+test("review 2: pausing a run whose gate waits for a slot (another run holds it) comes back at once", { skip: process.platform === "win32" }, async () => {
+  process.env.SF_GATE_CONCURRENCY = "1";
+  const slowGate = `node -e "require('fs').writeFileSync('gate.started', ''); setTimeout(() => {}, 8000)"`;
+  const t = await setup(byRole({ builder: build }), { policy: `gates:\n  - { name: slow, run: ${JSON.stringify(slowGate)} }\n` });
+  delete process.env.SF_GATE_CONCURRENCY;
+  const { existsSync } = await import("node:fs");
+  try {
+    const a = await t.buildingRun(1);
+    const b = await t.buildingRun(1);
+    const started = (runId: string) => existsSync(path.join(t.ledger.getWorkOrder(`${runId}/WO-1`)?.worktree ?? "/nonexistent", "gate.started"));
+    const verifying = (runId: string) => t.ledger.getWorkOrder(`${runId}/WO-1`)?.state === "verifying";
+    for (let i = 0; i < 200 && !(verifying(a.id) && verifying(b.id) && (started(a.id) || started(b.id))); i++) {
+      await t.o.tick();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const queued = started(a.id) ? b : a;
+    assert.equal(started(queued.id), false, "one run's gate waits for the slot");
+    const t0 = Date.now();
+    await t.o.pause(queued.id, { actor: "user:test" });
+    assert.ok(Date.now() - t0 < 1500, `pause took ${Date.now() - t0} ms`);
+    await t.o.cancel(a.id, { actor: "user:test" }).catch(() => undefined);
+    await t.o.cancel(b.id, { actor: "user:test" }).catch(() => undefined);
+  } finally {
+    await t.close();
+  }
+});
+
+test("review 3: hooks in the workspace's .git never run inside the factory's own commits", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "sf-harden-hooks-"));
+  writeFileSync(path.join(dir, "a.txt"), "a\n");
+  await ensureRepo(dir);
+  const hooks = (await git(dir, ["rev-parse", "--git-common-dir"])).stdout.trim();
+  const hook = path.join(path.isAbsolute(hooks) ? hooks : path.join(dir, hooks), "hooks", "pre-commit");
+  writeFileSync(hook, "#!/bin/sh\necho hooked > hooked.txt\ngit add hooked.txt\n", { mode: 0o755 });
+  await git(dir, ["config", "core.hooksPath", path.dirname(hook)]); // and pointed at by the repo's own config
+  writeFileSync(path.join(dir, "b.txt"), "b\n");
+  await commitAll(dir, "b");
+  assert.deepEqual((await git(dir, ["ls-files"])).stdout.trim().split("\n").sort(), ["a.txt", "b.txt"]);
+  const { existsSync } = await import("node:fs");
+  assert.equal(existsSync(path.join(dir, "hooked.txt")), false);
+});
+
+test("review: one failed poll doesn't throw away a builder's work; a pause the agent server refuses leaves the attempt running", async () => {
+  const t = await setup(byRole({ builder: build }));
+  try {
+    const run = await t.buildingRun(1);
+    await t.until(() => t.builders(run.id, 1).length === 1);
+    const id = t.builders(run.id, 1)[0]!.conversationId;
+    let blips = 1;
+    t.fake.setFault((method, p) => (method === "GET" && p === `/api/conversations/${id}` && blips-- > 0 ? [500, { detail: "blip" }] : undefined));
+    await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+    assert.deepEqual(t.builders(run.id, 1).map((a) => a.state), ["finished"]); // the same builder, not a fresh one
+
+    const second = await t.buildingRun(1);
+    await t.until(() => t.builders(second.id, 1).length === 1 && t.builders(second.id, 1)[0]!.state === "running");
+    t.fake.setFault((method, p) => (method === "POST" && p.endsWith("/pause") ? [500, { detail: "no" }] : undefined));
+    t.ledger.updateAttempt(t.builders(second.id, 1)[0]!.id, { state: "running" });
+    await t.o.pause(second.id, { actor: "user:test" });
+    assert.equal(t.builders(second.id, 1)[0]?.state, "running");
+  } finally {
+    t.fake.setFault(undefined);
+    await t.close();
+  }
+});
+
+test("review: a script in the change folder isn't part of the spec commit; a deleted integration worktree is put back with the branch", async () => {
+  const t = await setup(
+    byRole({
+      spec: (conv) => {
+        const change = writeSpec(conv);
+        writeFileSync(path.join(conv.workingDir, "openspec", "changes", change, "sneaky.test.js"), "process.exit(0);\n");
+        return { response: "Wrote it.", cost: 0.1 };
+      },
+      builder: build,
+    }),
+  );
+  try {
+    const run = await t.o.createRun({ goal: "Add a status page", autonomy: "autonomous", actor: "user:test" });
+    await t.until(() => t.ledger.getRun(run.id)?.state === "building");
+    const tip = t.ledger.getRun(run.id)!.integrationSha!;
+    assert.equal(await fileAt(t.workspace, tip, `openspec/changes/${run.change}/sneaky.test.js`), null);
+    assert.notEqual(await fileAt(t.workspace, tip, `openspec/changes/${run.change}/proposal.md`), null);
+    assert.match(t.ledger.listChecks({ runId: run.id }).find((c) => c.name === "spec-edits-discarded")?.output ?? "", /sneaky\.test\.js/);
+
+    const { rmSync, existsSync } = await import("node:fs");
+    t.o.stop();
+    await t.o.idle();
+    await git(t.workspace, ["worktree", "remove", "--force", run.integrationDir!]);
+    rmSync(run.integrationDir!, { recursive: true, force: true });
+    await t.step();
+    const item = t.ledger.listInbox({ runId: run.id }).find((i) => i.kind === "integration_moved")!;
+    assert.match(item.body, /worktree is gone/);
+    await t.o.decide(item.id, { choice: "restore" }, "user:test");
+    assert.equal(existsSync(run.integrationDir!), true);
+    await t.until(() => t.ledger.getRun(run.id)?.state === "done");
+  } finally {
+    await t.close();
+  }
+});

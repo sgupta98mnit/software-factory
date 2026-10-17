@@ -135,7 +135,13 @@ or its work orders move.
   before every build step and before delivering, a branch that moved (or a
   worktree switched to another branch) pauses the run with an
   `integration_moved` item whose `restore` puts it back.
-- The spec commit holds `openspec/changes/<change>/` only; anything else the
+- Builders branch from `integrationSha`, never the live ref (a merge being
+  re-tested isn't a base). While a merge is tested the guard accepts exactly its
+  `mergeSha`; after a restart, only a commit whose tree is the clean merge of
+  the factory's tip and the work order's branch.
+- The factory's git never runs repo hooks or fsmonitor, and diffs without
+  external diff drivers or textconv.
+- The spec commit holds the change's markdown and `.openspec.yaml` in `openspec/changes/<change>/` only; anything else the
   spec agent wrote or committed is discarded and recorded (`spec-edits-discarded`).
 - A merge whose gates fail is reset (not reverted) so the fixed branch can merge again.
 - An exception in one work order's step, or a conversation of its that the

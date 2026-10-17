@@ -108,6 +108,7 @@ export interface WorkOrder {
   worktree: string | null;
   baseSha: string | null; // integration sha the branch was created from / last synced with
   preMergeSha: string | null; // integration sha before the current merge, for the revert
+  mergeSha: string | null; // the merge commit the factory made and is testing; the only tip besides integrationSha it accepts
   findings: Finding[] | null; // what triggered the latest repair
   budgetExtraUsd: number;
   mergedBy: string | null; // "policy@<hash>" or "user:<name>"
@@ -267,6 +268,11 @@ const SCHEMA_V2 = `
 ALTER TABLE runs ADD COLUMN integration_sha TEXT;
 `;
 
+// v3: the merge commit being tested, so nothing else can pass for it.
+const SCHEMA_V3 = `
+ALTER TABLE work_orders ADD COLUMN merge_sha TEXT;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox"];
 
@@ -323,6 +329,7 @@ export function openLedger(file: string) {
   const { user_version: version } = db.prepare("PRAGMA user_version").get() as { user_version: number };
   if (version < 1) transaction(() => db.exec(`${SCHEMA_V1}\nPRAGMA user_version = 1;`));
   if (version < 2) transaction(() => db.exec(`${SCHEMA_V2}\nPRAGMA user_version = 2;`));
+  if (version < 3) transaction(() => db.exec(`${SCHEMA_V3}\nPRAGMA user_version = 3;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),
