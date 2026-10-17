@@ -107,6 +107,8 @@ export function createAutopilotRoutes(o: Orchestrator) {
         pending: count("pending"),
       },
       openInbox: ledger.listInbox({ runId: run.id }).length,
+      // Its place in line while queued; the change whose release goes first while releasing.
+      ...o.waitingOn(run),
     };
   }
 

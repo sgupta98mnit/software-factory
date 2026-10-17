@@ -44,6 +44,8 @@ export interface Policy {
    * conflictRounds: merge-conflict rounds a work order gets on top of `repair` (the conflict comes from another work order's merge).
    */
   selfHealing: { quietMinutes: number; rerunFailedGates: boolean; conflictRounds: number };
+  /** Runs working at once (in spec, critic, building or releasing); more wait in line, oldest first. */
+  queue: { maxActiveRuns: number };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -74,6 +76,7 @@ export const DEFAULT_POLICY: Policy = {
   notify: { digestHour: 17 },
   release: { auto: false },
   selfHealing: { quietMinutes: 20, rerunFailedGates: true, conflictRounds: 3 },
+  queue: { maxActiveRuns: 2 },
 };
 
 // ---- reading and checking policy.yml ----
@@ -137,6 +140,7 @@ const RULES: Record<string, Rule> = {
   "selfHealing.quietMinutes": whole(1, 1440),
   "selfHealing.rerunFailedGates": flag,
   "selfHealing.conflictRounds": whole(0, 20),
+  "queue.maxActiveRuns": whole(1, 50),
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */

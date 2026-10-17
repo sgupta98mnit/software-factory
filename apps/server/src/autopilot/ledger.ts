@@ -13,6 +13,7 @@ import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqli
 
 export type Autonomy = "suggest" | "supervised" | "autonomous";
 export type RunState =
+  | "queued"
   | "spec"
   | "critic"
   | "awaiting_spec_approval"
@@ -85,6 +86,7 @@ export interface Run {
   releasedBy: string | null; // who released it into the base branch (asked for it, while releasing)
   releasedSha: string | null; // the base branch's release merge
   releasedAt: string | null;
+  releaseRequestedAt: string | null; // releases into one base branch go in this order
   state: RunState;
   resumeState: RunState | null; // where to go back to after "paused"
   pausedReason: string | null;
@@ -335,6 +337,11 @@ ALTER TABLE work_orders ADD COLUMN conflict_rounds INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE attempts ADD COLUMN free_turns INTEGER NOT NULL DEFAULT 0;
 `;
 
+// v9: releases into one base branch, one at a time in the order they were asked for.
+const SCHEMA_V9 = `
+ALTER TABLE runs ADD COLUMN release_requested_at TEXT;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
@@ -397,6 +404,7 @@ export function openLedger(file: string) {
   if (version < 6) transaction(() => db.exec(`${SCHEMA_V6}\nPRAGMA user_version = 6;`));
   if (version < 7) transaction(() => db.exec(`${SCHEMA_V7}\nPRAGMA user_version = 7;`));
   if (version < 8) transaction(() => db.exec(`${SCHEMA_V8}\nPRAGMA user_version = 8;`));
+  if (version < 9) transaction(() => db.exec(`${SCHEMA_V9}\nPRAGMA user_version = 9;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

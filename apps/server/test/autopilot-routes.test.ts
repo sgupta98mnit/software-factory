@@ -98,6 +98,8 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
       updatedAt: run.updatedAt,
       counts: { total: 0, merged: 0, active: 0, failed: 0, pending: 0 },
       openInbox: 0,
+      queuePosition: null,
+      releaseAfter: null,
     });
 
     // The org-wide cap clamps autonomy; the same goal gets the next free name.
@@ -246,6 +248,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
       notifications: { channel: null, digestHour: 17 },
       openInbox: 0,
       activeRuns: 0,
+      queuedRuns: 0,
     });
     await call("POST", "/runs", { goal: "Add a status page" });
     s = (await call("GET", "/status")).json;

@@ -92,10 +92,10 @@ index 0000000..8bd5ba0
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..a7e5d8b
+index 0000000..b3a42a6
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,621 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -244,6 +244,7 @@ index 0000000..a7e5d8b
 +];
 +
 +export type RunState =
++  | "queued"
 +  | "spec"
 +  | "critic"
 +  | "awaiting_spec_approval"
@@ -311,6 +312,10 @@ index 0000000..a7e5d8b
 +    pending: number;
 +  };
 +  openInbox: number;
++  /** Its place in line while queued (1 = next). */
++  queuePosition: number | null;
++  /** While releasing: the change whose release into the same base goes first. */
++  releaseAfter: string | null;
 +}
 +
 +export interface AutopilotWorkOrder {
@@ -479,6 +484,7 @@ index 0000000..a7e5d8b
 +  };
 +  openInbox: number;
 +  activeRuns: number;
++  queuedRuns: number;
 +}
 +
 +/** An error answer from the factory API, with its HTTP status. */
@@ -844,10 +850,10 @@ index 0000000..2305eef
 +}
 diff --git a/src/factory/components/autopilot-badges.tsx b/src/factory/components/autopilot-badges.tsx
 new file mode 100644
-index 0000000..c9bc963
+index 0000000..23dec8a
 --- /dev/null
 +++ b/src/factory/components/autopilot-badges.tsx
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,152 @@
 +import { cn } from "#/utils/utils";
 +import type { AutopilotWorkOrderState, RunState } from "../api";
 +import { useFactoryCopy } from "../copy";
@@ -863,6 +869,7 @@ index 0000000..c9bc963
 +};
 +
 +const RUN_TONE: Record<RunState, Tone> = {
++  queued: "quiet",
 +  spec: "active",
 +  critic: "active",
 +  awaiting_spec_approval: "waiting",
@@ -1761,10 +1768,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..19bb718
+index 0000000..1d15f4b
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1073 @@
+@@ -0,0 +1,1083 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1908,6 +1915,7 @@ index 0000000..19bb718
 +    policyBudget: "the policy's",
 +    by: (who: string) => `by ${who}`,
 +    runStates: {
++      queued: "Waiting in line",
 +      spec: "Writing the spec",
 +      critic: "Reviewing the spec",
 +      awaiting_spec_approval: "Spec waits for you",
@@ -1956,6 +1964,10 @@ index 0000000..19bb718
 +      `Everything is merged and re-tested on ${branch}. Releasing merges it into ${base}; that's your call.`,
 +    releasingHelp: (base: string) =>
 +      `Merging into ${base}. If ${base} moved since the run started, the merge is tested first.`,
++    releaseAfter: (base: string, change: string) =>
++      `Waiting for ${change} to finish releasing into ${base}. Releases into one branch go one at a time, so this one is merged onto it and tested again.`,
++    queued: (position: number) =>
++      `Waiting in line (${position === 1 ? "next" : `number ${position}`}): the policy lets queue.maxActiveRuns runs work at once. Runs waiting on a person don't count. It starts from the base branch as it is then.`,
 +    releasedHelp: (base: string, who: string, sha: string) =>
 +      `Released into ${base} by ${who} (${sha}).`,
 +    release: (base: string) => `Release into ${base}`,
@@ -2433,6 +2445,7 @@ index 0000000..19bb718
 +    policyBudget: "de la política",
 +    by: (who) => `por ${who}`,
 +    runStates: {
++      queued: "En cola",
 +      spec: "Redactando la especificación",
 +      critic: "Revisando la especificación",
 +      awaiting_spec_approval: "La especificación le espera",
@@ -2481,6 +2494,10 @@ index 0000000..19bb718
 +      `Todo está integrado y comprobado de nuevo en ${branch}. Publicar lo integra en ${base}; esa decisión es suya.`,
 +    releasingHelp: (base) =>
 +      `Integrando en ${base}. Si ${base} cambió desde que empezó la ejecución, primero se prueba la integración.`,
++    releaseAfter: (base, change) =>
++      `Esperando a que ${change} termine de publicarse en ${base}. Las publicaciones en una rama van de una en una, así que esta se integra sobre aquella y se prueba de nuevo.`,
++    queued: (position) =>
++      `En cola (${position === 1 ? "la siguiente" : `número ${position}`}): la política permite que trabajen queue.maxActiveRuns ejecuciones a la vez. Las que esperan a una persona no cuentan. Empieza desde la rama base tal como esté entonces.`,
 +    releasedHelp: (base, who, sha) =>
 +      `Publicada en ${base} por ${who} (${sha}).`,
 +    release: (base) => `Publicar en ${base}`,
@@ -4122,10 +4139,10 @@ index 0000000..34c36a7
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..40e2574
+index 0000000..0b339ac
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,891 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -4194,6 +4211,7 @@ index 0000000..40e2574
 +/** How far the run has come: the stage it's in (or stopped in). */
 +function currentStage(run: RunDetail): Stage {
 +  switch (run.state) {
++    case "queued":
 +    case "spec":
 +    case "critic":
 +    case "awaiting_spec_approval":
@@ -4533,7 +4551,11 @@ index 0000000..40e2574
 +    text = copy.pipeline.doneHelp(run.integrationBranch, run.baseBranch);
 +    tone = "success";
 +  } else if (run.state === "releasing") {
-+    text = copy.pipeline.releasingHelp(run.baseBranch);
++    text = run.releaseAfter
++      ? copy.pipeline.releaseAfter(run.baseBranch, run.releaseAfter)
++      : copy.pipeline.releasingHelp(run.baseBranch);
++  } else if (run.state === "queued" && run.queuePosition) {
++    text = copy.pipeline.queued(run.queuePosition);
 +  } else if (run.state === "released") {
 +    text = copy.pipeline.releasedHelp(
 +      run.baseBranch,

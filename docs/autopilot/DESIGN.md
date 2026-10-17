@@ -311,7 +311,27 @@ filename="evidence-<change>-<run>.json"` and records
 - `pinnedPolicy` fills in settings added after a run was pinned with their
   defaults, so older runs keep working as the policy grows.
 
-## 16. Changes since the first build
+## 16. Queue and release order
+
+- `queue.maxActiveRuns` (default 2). Working runs are in `spec`, `critic`,
+  `building` or `releasing`. Runs waiting on a person (approvals, questions,
+  paused, done) hold no slot. `createRun` past the limit, or behind any run
+  already waiting, makes a `queued` run: change name reserved, policy pinned,
+  no integration branch or worktree. Each tick starts the oldest queued run
+  when its pinned policy's limit allows (one a tick). `dequeue` adds the
+  integration worktree from the base branch as it is then, moves the run to
+  `spec`, and audits `autopilot.run_started` with `waitedSeconds` and the base
+  sha. Pause, resume and cancel work on queued runs like any other.
+- Releases into one base branch go one at a time. `requestRelease` stamps
+  `releaseRequestedAt` (ledger v9), and `releaseStep` waits while a release
+  asked for earlier (`releaseAhead`) is still `releasing`. The later release
+  then merges onto the earlier one and, since the base moved, is tested again,
+  where before the two raced and the loser went back to a person.
+- The API's run summary has `queuePosition` and `releaseAfter` (the change
+  going first), and `/status` has `queuedRuns`. The Pipeline banner says what
+  the run waits on.
+
+## 17. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

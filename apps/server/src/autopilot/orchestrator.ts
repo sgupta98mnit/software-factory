@@ -111,6 +111,7 @@ export interface OrchestratorDeps {
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
 const TERMINAL = new Set<RunState>(["done", "released", "failed", "cancelled"]);
 const ACTIVE = new Set<string>(["starting", "running"]); // attempts the scheduler starts or polls
+const WORKING = new Set<RunState>(["spec", "critic", "building", "releasing"]); // count against policy.queue (waiting on a person doesn't)
 const BUSY_WO = new Set<WorkOrderState>(["building", "verifying", "reviewing"]); // count against policy.parallel
 const DONE_WO = new Set<WorkOrderState>(["merged", "skipped"]); // what dependents wait for
 const SYSTEM = "autopilot";
@@ -1654,8 +1655,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     changed(run.id);
   }
 
+  // Strictly increasing, so two releases asked for in the same millisecond still have an order.
+  let lastRequest = "";
   function requestRelease(run: Run, actor: string) {
-    return moveRun(run, "releasing", { actor, patch: { releasedBy: actor }, action: "autopilot.release_requested", data: { base: run.baseBranch, branch: run.integrationBranch } });
+    let at = now();
+    if (at <= lastRequest) at = new Date(Date.parse(lastRequest) + 1).toISOString();
+    lastRequest = at;
+    return moveRun(run, "releasing", { actor, patch: { releasedBy: actor, releaseRequestedAt: at }, action: "autopilot.release_requested", data: { base: run.baseBranch, branch: run.integrationBranch } });
   }
 
   /** Back to done with the reason, and a fresh release decision. */
@@ -1678,6 +1684,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const key = `${run.id}#release`;
     const outcome = takeJob(key);
     if (outcome === "running") return;
+    // One release into a base branch at a time, in the order they were asked for: the base won't move under this one.
+    if (!releases.has(run.id) && releaseAhead(run)) return;
     const dir = releaseDir(run);
     const tip = await headSha(workspace, run.integrationBranch).catch(() => null);
     if (!tip || tip !== run.integrationSha) return releaseFailed(run, `\`${run.integrationBranch}\` moved since the run finished, so it isn't what was checked.`);
@@ -1786,11 +1794,47 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (run?.state !== "paused" && ledger.getRun(runId)?.state === "paused") await Promise.all([pauseAgents(runId), stopJobs(runId)]);
   }
 
+  /** A queued run's turn: its integration branch from the base as it is now, then the spec stage. */
+  async function dequeue(runId: string) {
+    const run = ledger.getRun(runId);
+    if (run?.state !== "queued") return;
+    const integrationDir = path.join(worktrees, run.id, "integration");
+    await addWorktree(workspace, integrationDir, run.integrationBranch, run.baseBranch);
+    const integrationSha = await headSha(integrationDir);
+    moveRun(run, "spec", {
+      patch: { integrationDir, integrationSha },
+      action: "autopilot.run_started",
+      data: { waitedSeconds: Math.round((Date.now() - Date.parse(run.createdAt)) / 1000), base: integrationSha },
+    });
+  }
+
+  /**
+   * What a run waits on, for people: its place in line (1 = next) while
+   * queued, and the change whose release into the same base goes first
+   * while releasing.
+   */
+  function waitingOn(run: Run): { queuePosition: number | null; releaseAfter: string | null } {
+    const runs = ledger.listRuns();
+    const line = runs.filter((r) => r.state === "queued").reverse();
+    const ahead = run.state === "releasing" ? releaseAhead(run, runs) : undefined;
+    return { queuePosition: run.state === "queued" ? line.findIndex((r) => r.id === run.id) + 1 : null, releaseAfter: ahead?.change ?? null };
+  }
+
+  /** The release into the same base branch that was asked for before this one and is still going. */
+  function releaseAhead(run: Run, runs = ledger.listRuns()): Run | undefined {
+    const key = (r: Run) => `${r.releaseRequestedAt ?? ""}|${r.id}`;
+    return runs.filter((r) => r.id !== run.id && r.state === "releasing" && r.baseBranch === run.baseBranch && key(r) < key(run)).sort((a, b) => key(a).localeCompare(key(b)))[0];
+  }
+
   /** Cheap: hands each live run to advance(), skipping runs that are still busy. */
   async function tick() {
     for (const run of ledger.listRuns()) {
-      if (!TERMINAL.has(run.state) && run.state !== "paused") launch(run.id, () => advance(run.id));
+      if (!TERMINAL.has(run.state) && run.state !== "paused" && run.state !== "queued") launch(run.id, () => advance(run.id));
     }
+    // The oldest waiting run starts when a slot is free; one a tick, so the count is never stale.
+    const runs = ledger.listRuns();
+    const next = runs.filter((r) => r.state === "queued").at(-1);
+    if (next && runs.filter((r) => WORKING.has(r.state)).length < pinnedPolicy(next).queue.maxActiveRuns) launch(next.id, () => dequeue(next.id));
     void notifier.tick(); // the daily digest, when it's time
   }
 
@@ -1859,12 +1903,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     for (const r of ledger.listRuns()) taken.add(r.change);
     const change = changeNameFor(goal, taken);
     const id = `ap-${randomBytes(4).toString("hex")}`;
-    const integrationDir = path.join(worktrees, id, "integration");
     const integrationBranch = `autopilot/${change}`;
-    await addWorktree(workspace, integrationDir, integrationBranch, baseBranch);
-    const integrationSha = await headSha(integrationDir);
+    // Past the policy's limit (or behind runs already waiting), it waits in line; its integration
+    // branch is made when it starts, from the base as it is then (with anything released meanwhile).
+    const runs = ledger.listRuns();
+    const queued = runs.some((r) => r.state === "queued") || runs.filter((r) => WORKING.has(r.state)).length >= policy.queue.maxActiveRuns;
+    let integrationDir: string | null = null;
+    let integrationSha: string | null = null;
+    if (!queued) {
+      integrationDir = path.join(worktrees, id, "integration");
+      await addWorktree(workspace, integrationDir, integrationBranch, baseBranch);
+      integrationSha = await headSha(integrationDir);
+    }
 
-    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, integrationSha, policy, policyHash: hash, createdBy: input.actor });
+    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, integrationSha, policy, policyHash: hash, createdBy: input.actor, state: queued ? "queued" : "spec" });
     record(input.actor, "autopilot.run_created", id, {
       change,
       autonomy,
@@ -1873,6 +1925,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       goalSha256: sha256(goal),
       budgetUsd,
       policyHash: hash,
+      ...(queued ? { queued: true } : {}),
     });
     record(SYSTEM, "autopilot.policy_loaded", id, { hash, source, policy });
     changed(id);
@@ -2110,12 +2163,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       notifications: { channel: webhook ? channelOf(webhook) : null, digestHour },
       openInbox: ledger.openInboxCount(),
       activeRuns: ledger.listRuns().filter((r) => !TERMINAL.has(r.state)).length,
+      queuedRuns: ledger.listRuns().filter((r) => r.state === "queued").length,
     };
   }
 
   return {
     ledger,
     workspace,
+    waitingOn,
     createRun,
     decide,
     pause,
