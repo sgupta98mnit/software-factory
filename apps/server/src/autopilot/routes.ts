@@ -91,6 +91,9 @@ export function createAutopilotRoutes(o: Orchestrator) {
       budgetUsd: run.budgetUsd ?? pinnedPolicy(run).budget.perChangeUsd,
       budgetSource: run.budgetUsd === null ? "policy" : "run",
       policyHash: run.policyHash,
+      releasedBy: run.releasedBy,
+      releasedSha: run.releasedSha,
+      releasedAt: run.releasedAt,
       createdBy: run.createdBy,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -182,6 +185,11 @@ export function createAutopilotRoutes(o: Orchestrator) {
       return c.json(summary(updated));
     });
   }
+
+  app.post("/runs/:id/release", async (c) => {
+    const run = mustRun(c.req.param("id"));
+    return c.json(summary(await o.release(run.id, LOCAL_USER)));
+  });
 
   app.get("/inbox", (c) => {
     const s = c.req.query("state");

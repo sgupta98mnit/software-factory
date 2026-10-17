@@ -91,10 +91,10 @@ index 0000000..cfc572e
 +once, one touches `src/auth/` so its merge waits for you) and pass review.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..6fad498
+index 0000000..fdb8028
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,504 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -250,6 +250,8 @@ index 0000000..6fad498
 +  | "awaiting_plan_approval"
 +  | "building"
 +  | "done"
++  | "releasing"
++  | "released"
 +  | "paused"
 +  | "failed"
 +  | "cancelled";
@@ -293,6 +295,10 @@ index 0000000..6fad498
 +  budgetUsd: number;
 +  budgetSource: "run" | "policy";
 +  policyHash: string | null;
++  /** Who released it into the base branch (while releasing: who asked), and the release merge. */
++  releasedBy: string | null;
++  releasedSha: string | null;
++  releasedAt: string | null;
 +  createdBy: string;
 +  createdAt: string;
 +  updatedAt: string;
@@ -585,6 +591,8 @@ index 0000000..6fad498
 +      `/autopilot/runs/${encodeURIComponent(id)}/${action}`,
 +      note ? { note } : {},
 +    ),
++  release: (id: string) =>
++    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/release`),
 +  inbox: (state: "open" | "decided" | "all" = "open") =>
 +    request<InboxItem[]>(`/autopilot/inbox?state=${state}`),
 +  inboxCount: () => request<{ open: number }>("/autopilot/inbox/count"),
@@ -724,10 +732,10 @@ index 0000000..2305eef
 +}
 diff --git a/src/factory/components/autopilot-badges.tsx b/src/factory/components/autopilot-badges.tsx
 new file mode 100644
-index 0000000..804d266
+index 0000000..c9bc963
 --- /dev/null
 +++ b/src/factory/components/autopilot-badges.tsx
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,151 @@
 +import { cn } from "#/utils/utils";
 +import type { AutopilotWorkOrderState, RunState } from "../api";
 +import { useFactoryCopy } from "../copy";
@@ -750,6 +758,8 @@ index 0000000..804d266
 +  awaiting_plan_approval: "waiting",
 +  building: "active",
 +  done: "good",
++  releasing: "active",
++  released: "good",
 +  paused: "waiting",
 +  failed: "bad",
 +  cancelled: "quiet",
@@ -778,6 +788,7 @@ index 0000000..804d266
 +]);
 +export const FINISHED_RUN_STATES = new Set<RunState>([
 +  "done",
++  "released",
 +  "failed",
 +  "cancelled",
 +]);
@@ -1638,10 +1649,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..9c668a8
+index 0000000..1495e93
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,907 @@
+@@ -0,0 +1,927 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1789,7 +1800,9 @@ index 0000000..9c668a8
 +      awaiting_answers: "Questions for you",
 +      awaiting_plan_approval: "Plan waits for you",
 +      building: "Building",
-+      done: "Done",
++      done: "Done, ready to release",
++      releasing: "Releasing",
++      released: "Released",
 +      paused: "Paused",
 +      failed: "Failed",
 +      cancelled: "Cancelled",
@@ -1826,7 +1839,12 @@ index 0000000..9c668a8
 +    failedHelp:
 +      "Nothing was merged, so there's nothing to deliver. The audit log has what happened.",
 +    doneHelp: (branch: string, base: string) =>
-+      `Everything is merged and re-tested on ${branch}. Review it and merge it into ${base} when you're ready.`,
++      `Everything is merged and re-tested on ${branch}. Releasing merges it into ${base}; that's your call.`,
++    releasingHelp: (base: string) =>
++      `Merging into ${base}. If ${base} moved since the run started, the merge is tested first.`,
++    releasedHelp: (base: string, who: string, sha: string) =>
++      `Released into ${base} by ${who} (${sha}).`,
++    release: (base: string) => `Release into ${base}`,
 +    stages: {
 +      spec: "Spec",
 +      plan: "Plan",
@@ -2091,6 +2109,9 @@ index 0000000..9c668a8
 +      "autopilot.hidden_tests_missing": "The validator wrote no hidden tests",
 +      "autopilot.budget_reached": "Reached a budget",
 +      "autopilot.budget_raised": "Raised a budget",
++      "autopilot.release_requested": "Asked to release",
++      "autopilot.release_failed": "A release didn't go through",
++      "autopilot.run_released": "Released into the base branch",
 +    } as Record<string, string>,
 +  },
 +};
@@ -2232,7 +2253,9 @@ index 0000000..9c668a8
 +      awaiting_answers: "Preguntas para usted",
 +      awaiting_plan_approval: "El plan le espera",
 +      building: "Construyendo",
-+      done: "Terminada",
++      done: "Terminada, lista para publicar",
++      releasing: "Publicando",
++      released: "Publicada",
 +      paused: "En pausa",
 +      failed: "Fallida",
 +      cancelled: "Cancelada",
@@ -2269,7 +2292,12 @@ index 0000000..9c668a8
 +    failedHelp:
 +      "No se integró nada, así que no hay nada que entregar. El registro de auditoría muestra lo ocurrido.",
 +    doneHelp: (branch, base) =>
-+      `Todo está integrado y comprobado de nuevo en ${branch}. Revíselo e intégrelo en ${base} cuando quiera.`,
++      `Todo está integrado y comprobado de nuevo en ${branch}. Publicar lo integra en ${base}; esa decisión es suya.`,
++    releasingHelp: (base) =>
++      `Integrando en ${base}. Si ${base} cambió desde que empezó la ejecución, primero se prueba la integración.`,
++    releasedHelp: (base, who, sha) =>
++      `Publicada en ${base} por ${who} (${sha}).`,
++    release: (base) => `Publicar en ${base}`,
 +    stages: {
 +      spec: "Especificación",
 +      plan: "Plan",
@@ -2537,6 +2565,9 @@ index 0000000..9c668a8
 +        "El validador no escribió pruebas ocultas",
 +      "autopilot.budget_reached": "Alcanzó un presupuesto",
 +      "autopilot.budget_raised": "Aumentó un presupuesto",
++      "autopilot.release_requested": "Pidió publicar",
++      "autopilot.release_failed": "Una publicación no se completó",
++      "autopilot.run_released": "Publicó en la rama base",
 +    },
 +  },
 +};
@@ -2658,10 +2689,10 @@ index 0000000..cba4719
 +];
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..35f5a97
+index 0000000..3a6914e
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,296 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -2862,6 +2893,15 @@ index 0000000..35f5a97
 +      action: "pause" | "resume" | "cancel";
 +      note?: string;
 +    }) => FactoryApi.runAction(v.id, v.action, v.note),
++    onSettled: () => invalidateAutopilot(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++export function useRelease() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (id: string) => FactoryApi.release(id),
 +    onSettled: () => invalidateAutopilot(queryClient),
 +    meta: { disableToast: true },
 +  });
@@ -3185,10 +3225,10 @@ index 0000000..380b38f
 +}
 diff --git a/src/factory/routes/autopilot-run.tsx b/src/factory/routes/autopilot-run.tsx
 new file mode 100644
-index 0000000..1afba08
+index 0000000..66a1671
 --- /dev/null
 +++ b/src/factory/routes/autopilot-run.tsx
-@@ -0,0 +1,838 @@
+@@ -0,0 +1,875 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate, useParams } from "react-router";
@@ -3199,6 +3239,7 @@ index 0000000..1afba08
 +  CircleDashed,
 +  CircleX,
 +  GitBranch,
++  GitMerge,
 +  History,
 +  MessageSquare,
 +  Pause,
@@ -3211,7 +3252,7 @@ index 0000000..1afba08
 +import type { Attempt, AutopilotWorkOrder, Check, RunDetail } from "../api";
 +import { isNotFound } from "../api";
 +import { useFactoryCopy } from "../copy";
-+import { useAutopilotStatus, useRun, useRunAction } from "../hooks";
++import { useAutopilotStatus, useRelease, useRun, useRunAction } from "../hooks";
 +import {
 +  FactoryError,
 +  FactoryLoading,
@@ -3263,6 +3304,8 @@ index 0000000..1afba08
 +    case "awaiting_plan_approval":
 +      return "plan";
 +    case "done":
++    case "releasing":
++    case "released":
 +      return "done";
 +    case "building":
 +      return "build";
@@ -3348,8 +3391,31 @@ index 0000000..1afba08
 +function RunActions({ run }: { run: RunDetail }) {
 +  const copy = useFactoryCopy();
 +  const action = useRunAction();
++  const release = useRelease();
 +  const [confirmCancel, setConfirmCancel] = React.useState(false);
-+  if (FINISHED_RUN_STATES.has(run.state)) return null;
++  if (run.state === "done") {
++    return (
++      <>
++        <BrandButton
++          testId="factory-run-release"
++          type="button"
++          variant="primary"
++          onClick={() => release.mutate(run.id)}
++          isDisabled={release.isPending}
++          startContent={<GitMerge className="size-4" aria-hidden />}
++        >
++          {copy.pipeline.release(run.baseBranch)}
++        </BrandButton>
++        {release.error ? (
++          <span className="basis-full">
++            <FactoryError error={release.error} />
++          </span>
++        ) : null}
++      </>
++    );
++  }
++  if (FINISHED_RUN_STATES.has(run.state) || run.state === "releasing")
++    return null;
 +  const busy = action.isPending;
 +  const act = (a: "pause" | "resume" | "cancel") =>
 +    action.mutate(
@@ -3558,6 +3624,15 @@ index 0000000..1afba08
 +  } else if (run.state === "done") {
 +    text = copy.pipeline.doneHelp(run.integrationBranch, run.baseBranch);
 +    tone = "success";
++  } else if (run.state === "releasing") {
++    text = copy.pipeline.releasingHelp(run.baseBranch);
++  } else if (run.state === "released") {
++    text = copy.pipeline.releasedHelp(
++      run.baseBranch,
++      approverName(run.releasedBy ?? ""),
++      (run.releasedSha ?? "").slice(0, 10),
++    );
++    tone = "success";
 +  }
 +  if (!text) return null;
 +  return (
@@ -3595,7 +3670,9 @@ index 0000000..1afba08
 +      {STAGES.map((stage, i) => {
 +        const count = i >= 2 ? inLane(stage) : 0;
 +        const passed =
-+          i < current || (stage === "done" && run.state === "done");
++          i < current ||
++          (stage === "done" &&
++            (run.state === "done" || run.state === "released"));
 +        const here =
 +          i === current &&
 +          run.state !== "done" &&

@@ -122,6 +122,19 @@ export function addWorktree(repo: string, dir: string, branch: string, startPoin
   });
 }
 
+/** A fresh worktree at `dir` with a detached HEAD at `sha` (no branch), replacing any old one there. */
+export function addDetachedWorktree(repo: string, dir: string, sha: string): Promise<void> {
+  return locked(repo, async () => {
+    if (existsSync(dir)) {
+      await git(repo, ["worktree", "remove", "--force", dir], { allowFail: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+    }
+    await git(repo, ["worktree", "prune"]);
+    mkdirSync(path.dirname(dir), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", dir, sha]);
+  });
+}
+
 /** Removes the worktree folder; the branch stays. A missing folder is fine. */
 export function removeWorktree(repo: string, dir: string): Promise<void> {
   return locked(repo, async () => {

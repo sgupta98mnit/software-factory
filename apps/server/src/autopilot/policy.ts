@@ -36,6 +36,8 @@ export interface Policy {
   budget: { perWorkOrderUsd: number; perChangeUsd: number };
   hiddenTests: { enabled: boolean; run: string };
   notify: { digestHour: number };
+  /** Release into the base branch on its own (autonomous runs only). Off: a person's click, the default. */
+  release: { auto: boolean };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -64,6 +66,7 @@ export const DEFAULT_POLICY: Policy = {
   // Opt-in: one more agent per run, and specs concrete enough to test black-box.
   hiddenTests: { enabled: false, run: "node --test" },
   notify: { digestHour: 17 },
+  release: { auto: false },
 };
 
 // ---- reading and checking policy.yml ----
@@ -123,6 +126,7 @@ const RULES: Record<string, Rule> = {
   "hiddenTests.enabled": flag,
   "hiddenTests.run": text,
   "notify.digestHour": whole(0, 23),
+  "release.auto": flag,
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */

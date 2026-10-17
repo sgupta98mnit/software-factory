@@ -89,7 +89,7 @@ test("#3: a conversation the agent server can't report on fails only its work or
     t.fake.setFault((method, p) => (method === "GET" && p === `/api/conversations/${broken}` ? [500, { detail: "Internal Server Error" }] : undefined));
     await t.until(() => t.ledger.getRun(run.id)?.state === "done");
     assert.deepEqual(t.states(run.id), ["1:merged", "2:merged", "3:merged"]);
-    assert.equal(t.ledger.listInbox({ state: "all", runId: run.id }).length, 0); // nobody was asked
+    assert.deepEqual(t.ledger.listInbox({ state: "all", runId: run.id }).map((i) => i.kind), ["release"]); // nobody was asked anything but to release
     const [first, second] = t.builders(run.id, 2);
     assert.equal(first?.state, "error");
     assert.match((first?.result as { error: string }).error, /couldn't follow this conversation on the agent server: Internal Server Error/);

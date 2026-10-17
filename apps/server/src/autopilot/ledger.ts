@@ -20,6 +20,8 @@ export type RunState =
   | "awaiting_plan_approval"
   | "building"
   | "done"
+  | "releasing"
+  | "released"
   | "paused"
   | "failed"
   | "cancelled";
@@ -80,6 +82,9 @@ export interface Run {
   integrationBranch: string; // "autopilot/<change>"
   integrationDir: string | null; // worktree of the integration branch
   integrationSha: string | null; // where the factory last left the integration branch; anything else moved it
+  releasedBy: string | null; // who released it into the base branch (asked for it, while releasing)
+  releasedSha: string | null; // the base branch's release merge
+  releasedAt: string | null;
   state: RunState;
   resumeState: RunState | null; // where to go back to after "paused"
   pausedReason: string | null;
@@ -136,7 +141,7 @@ export interface Check {
   id: number;
   runId: string;
   workOrderId: string | null;
-  stage: "spec" | "build" | "integrate";
+  stage: "spec" | "build" | "integrate" | "release";
   name: string;
   ok: boolean;
   exitCode: number | null;
@@ -305,6 +310,13 @@ CREATE TABLE hidden_tests (
 );
 `;
 
+// v6: the release into the base branch.
+const SCHEMA_V6 = `
+ALTER TABLE runs ADD COLUMN released_by TEXT;
+ALTER TABLE runs ADD COLUMN released_sha TEXT;
+ALTER TABLE runs ADD COLUMN released_at TEXT;
+`;
+
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "hidden_tests";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "hidden_tests"];
 
@@ -364,6 +376,7 @@ export function openLedger(file: string) {
   if (version < 3) transaction(() => db.exec(`${SCHEMA_V3}\nPRAGMA user_version = 3;`));
   if (version < 4) transaction(() => db.exec(`${SCHEMA_V4}\nPRAGMA user_version = 4;`));
   if (version < 5) transaction(() => db.exec(`${SCHEMA_V5}\nPRAGMA user_version = 5;`));
+  if (version < 6) transaction(() => db.exec(`${SCHEMA_V6}\nPRAGMA user_version = 6;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

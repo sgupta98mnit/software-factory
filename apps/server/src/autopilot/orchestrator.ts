@@ -20,6 +20,7 @@ import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
 import { detectGates, gateFindings, runGates, type GateResult, type GatesOutcome } from "./gates.js";
 import {
+  addDetachedWorktree,
   addWorktree,
   changedFiles,
   commitAll,
@@ -35,6 +36,7 @@ import {
   addedLines,
   isAncestor,
   isRepoRoot,
+  merge,
   mergeTree,
   mergeInto,
   removeWorktree,
@@ -102,7 +104,7 @@ export interface OrchestratorDeps {
 }
 
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
-const TERMINAL = new Set<RunState>(["done", "failed", "cancelled"]);
+const TERMINAL = new Set<RunState>(["done", "released", "failed", "cancelled"]);
 const ACTIVE = new Set<string>(["starting", "running"]); // attempts the scheduler starts or polls
 const BUSY_WO = new Set<WorkOrderState>(["building", "verifying", "reviewing"]); // count against policy.parallel
 const DONE_WO = new Set<WorkOrderState>(["merged", "skipped"]); // what dependents wait for
@@ -1481,10 +1483,137 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const merged = wos.filter((w) => w.state === "merged").length;
     const sha = await headSha(workspace, run.integrationBranch);
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir);
-    moveRun(run, merged ? "done" : "failed", {
+    const done = moveRun(run, merged ? "done" : "failed", {
       patch: { integrationDir: null, resumeState: null },
       action: merged ? "autopilot.run_completed" : "autopilot.run_failed",
       data: { branch: run.integrationBranch, sha, costUsd: ledger.runCost(run.id), merged, skipped: wos.length - merged },
+    });
+    if (merged) await offerRelease(done);
+  }
+
+  // ---- release: the integration branch into the base branch ----
+
+  const RELEASE: InboxOption[] = [
+    { id: "release", label: "Release", tone: "primary" },
+    { id: "hold", label: "Not now" },
+  ];
+  const releaseDir = (run: Run) => path.join(worktrees, run.id, "release");
+  const releases = new Map<string, { sha: string; baseTip: string }>(); // runId -> the release merge being tested
+
+  /** What a person sees before releasing: what's in it, who let each part in, the checks and the cost. */
+  async function releaseBody(run: Run, why?: string): Promise<string> {
+    const wos = ledger.listWorkOrders(run.id);
+    const stat = await diffStat(workspace, `refs/heads/${run.baseBranch}`, run.integrationBranch).catch(() => null);
+    const integrate = ledger.listChecks({ runId: run.id }).filter((c) => c.stage === "integrate");
+    const hidden = ledger.listHiddenTests(run.id);
+    const lines = wos.map((w) =>
+      w.state === "merged"
+        ? `- WO-${w.seq}: ${w.title}: merged ${w.mergedBy?.startsWith("policy@") ? `automatically (${w.mergedBy})` : `by ${w.mergedBy}`}`
+        : `- WO-${w.seq}: ${w.title}: ${w.state}`,
+    );
+    return [
+      ...(why ? [`**The last release didn't go through:** ${why}`, ""] : []),
+      `**${run.change}** is merged and re-tested on \`${run.integrationBranch}\` (${short(run.integrationSha)}). Releasing merges it into \`${run.baseBranch}\`; if \`${run.baseBranch}\` moved since the run started, the merge is tested again first.`,
+      "",
+      "### What's in it",
+      ...lines,
+      "",
+      "### Checks",
+      `- ${integrate.filter((c) => c.ok).length} of ${integrate.length} gate runs on the integration branch passed (failed merges were taken back off).`,
+      ...(hidden.length ? [`- ${hidden.length} hidden acceptance test(s), one per scenario.`] : []),
+      `- Cost: ${usd(ledger.runCost(run.id))} of ${usd(runBudget(run))}.`,
+      ...(stat ? ["", `### ${stat.files.length} file(s), ${stat.linesChanged} line(s) changed from \`${run.baseBranch}\``] : []),
+      "",
+      "Releasing is recorded in the audit log with your name.",
+    ].join("\n");
+  }
+
+  /** At the end of a run: a person's release decision, or (policy release.auto, autonomous runs only) the policy's. */
+  async function offerRelease(run: Run, why?: string) {
+    const policy = pinnedPolicy(run);
+    if (!why && policy.release.auto && run.autonomy === "autonomous") return requestRelease(run, policyActor(run));
+    openItem(run, "release", `Release ${run.change} into ${run.baseBranch}`, await releaseBody(run, why), [{ ...RELEASE[0]!, label: `Release into ${run.baseBranch}` }, RELEASE[1]!]);
+    changed(run.id);
+  }
+
+  function requestRelease(run: Run, actor: string) {
+    return moveRun(run, "releasing", { actor, patch: { releasedBy: actor }, action: "autopilot.release_requested", data: { base: run.baseBranch, branch: run.integrationBranch } });
+  }
+
+  /** Back to done with the reason, and a fresh release decision. */
+  async function releaseFailed(run: Run, why: string) {
+    releases.delete(run.id);
+    await removeWorktree(workspace, releaseDir(run)).catch(warn);
+    const done = moveRun(run, "done", { patch: { releasedBy: null }, action: "autopilot.release_failed", data: { reason: clip(why) } });
+    await offerRelease(done, why);
+  }
+
+  /**
+   * Merges the integration branch into the base branch's tip in a worktree of
+   * its own. When the base hasn't moved since the run branched from it, the
+   * merge is exactly the tested integration tree; otherwise the gates run on
+   * it first (as a job). Then the base branch moves to the merge: with
+   * `merge --ff-only` in the workspace when it has the base checked out (its
+   * files move too), with a compare-and-swap update-ref otherwise.
+   */
+  async function releaseStep(run: Run) {
+    const key = `${run.id}#release`;
+    const outcome = takeJob(key);
+    if (outcome === "running") return;
+    const dir = releaseDir(run);
+    const tip = await headSha(workspace, run.integrationBranch).catch(() => null);
+    if (!tip || tip !== run.integrationSha) return releaseFailed(run, `\`${run.integrationBranch}\` moved since the run finished, so it isn't what was checked.`);
+    let prepared = releases.get(run.id);
+    if (!prepared || !outcome || outcome.aborted) {
+      const baseTip = await headSha(workspace, `refs/heads/${run.baseBranch}`);
+      await addDetachedWorktree(workspace, dir, baseTip);
+      const merged = await merge(dir, run.integrationBranch, `Release ${run.change} (${run.id})`);
+      if (!merged.ok) return releaseFailed(run, `Merging into \`${run.baseBranch}\` conflicts in: ${merged.conflicts.join(", ")}. Resolve that on \`${run.baseBranch}\` or start a new run for it.`);
+      prepared = { sha: merged.sha, baseTip };
+      releases.set(run.id, prepared);
+      const untouched = (await git(workspace, ["merge-base", baseTip, tip])).stdout.trim() === baseTip;
+      if (!untouched) {
+        startJob(run.id, key, (signal) => runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), { signal }));
+        return;
+      }
+    } else {
+      for (const r of outcome.results) ledger.addCheck({ runId: run.id, stage: "release", name: r.name, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, output: r.output });
+      if (!outcome.ok) return releaseFailed(run, `\`${run.baseBranch}\` moved since the run started, and the gates fail on the merge: ${outcome.results.filter((r) => !r.ok).map((r) => r.name).join(", ")}.`);
+    }
+    // The base branch moves to the release merge, only if it's still where the merge started.
+    const onBase = (await currentBranch(workspace)) === run.baseBranch;
+    try {
+      if (onBase) {
+        if ((await git(workspace, ["diff", "--quiet", "HEAD"], { allowFail: true })).code !== 0) {
+          return releaseFailed(run, `The workspace has uncommitted changes on \`${run.baseBranch}\`. Commit or stash them, then release again.`);
+        }
+        if ((await headSha(workspace)) !== prepared.baseTip) return releaseFailed(run, `\`${run.baseBranch}\` moved while the release was tested.`);
+        await git(workspace, ["merge", "--ff-only", "-q", prepared.sha]);
+      } else {
+        await git(workspace, ["update-ref", `refs/heads/${run.baseBranch}`, prepared.sha, prepared.baseTip]);
+      }
+    } catch (err) {
+      return releaseFailed(run, errorText(err));
+    }
+    releases.delete(run.id);
+    await removeWorktree(workspace, dir).catch(warn);
+    moveRun(run, "released", {
+      actor: run.releasedBy ?? SYSTEM,
+      patch: { releasedSha: prepared.sha, releasedAt: now() },
+      action: "autopilot.run_released",
+      data: { base: run.baseBranch, sha: prepared.sha, retested: !!outcome && !outcome.aborted },
+    });
+  }
+
+  /** A person's Release from the Pipeline (the same as choosing it in the Inbox). */
+  async function release(runId: string, actor: string): Promise<Run> {
+    return locked(runId, async () => {
+      const run = mustRun(runId);
+      if (run.state !== "done") throw new Error(`Only a finished run can be released (this one is ${run.state}).`);
+      for (const item of ledger.listInbox({ runId }).filter((i) => i.kind === "release")) {
+        ledger.decideInbox(item.id, { decision: "release", note: "Released from the pipeline", by: actor });
+      }
+      return requestRelease(run, actor);
     });
   }
 
@@ -1533,6 +1662,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (run?.state === "spec") await specStep(run);
     else if (run?.state === "critic") await criticStep(run);
     else if (run?.state === "building") await buildStep(run);
+    else if (run?.state === "releasing") await releaseStep(run);
     // The step paused the run (three work orders failing, a moved integration branch): its agents stop too.
     if (run?.state !== "paused" && ledger.getRun(runId)?.state === "paused") await Promise.all([pauseAgents(runId), stopJobs(runId)]);
   }
@@ -1764,6 +1894,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         await resumeWorkOrder(ledger.updateWorkOrder(wo.id, { budgetExtraUsd: wo.budgetExtraUsd + extra }), actor);
         return;
       }
+      case "release:release":
+        if (run.state !== "done") throw new Error(`Only a finished run can be released (this one is ${run.state}).`);
+        requestRelease(run, actor);
+        return;
+      case "release:hold":
+        return; // stays done; Release on the Pipeline asks again
       case "integration_moved:restore":
         await restoreIntegration(run, actor);
         if (run.state === "paused") await unpause(run, actor);
@@ -1864,6 +2000,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     pause,
     resume,
     cancel,
+    release,
     tick,
     idle,
     status,

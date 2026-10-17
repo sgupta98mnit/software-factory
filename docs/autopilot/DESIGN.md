@@ -45,7 +45,7 @@ Goal ─▶ spec agent ─▶ openspec validate --strict ─▶ commit ─▶ cr
 
 ## 3. States
 
-Run: `spec → critic → (awaiting_answers) → (awaiting_spec_approval) → (awaiting_plan_approval) → building → done`,
+Run: `spec → critic → (awaiting_answers) → (awaiting_spec_approval) → (awaiting_plan_approval) → building → done → releasing → released`,
 plus `paused` (with `resumeState`), `failed` (nothing merged) and `cancelled`.
 
 Work order: `pending → building → verifying → reviewing → ready → (awaiting_merge_approval) → merging → merged`,
@@ -117,7 +117,9 @@ or its work orders move.
 | `run_paused` | resume, cancel |
 | `integration_moved` | restore (put the branch back where the factory left it), cancel |
 
-`budget_reached` and `release` are reserved kinds (see OPEN-ISSUES.md for status).
+| `budget_reached` (run) | raise_half, raise_double, cancel |
+| `budget_reached` (work order) | raise, skip, cancel |
+| `release` | release, hold |
 
 ## 7. Invariants the tests hold
 
@@ -222,7 +224,24 @@ couldn't do the work hands it to a stronger one. The reason is audited with
 the dispatch (`routedBy`). Profiles named in `routing` are checked at
 `createRun` and in `/status`, like `agents`.
 
-## 13. Changes since the first build
+## 13. Release
+
+A run that finishes with something merged opens a `release` item (release,
+not now). Release moves the run to `releasing`; `releaseStep` merges the
+integration branch into the base branch's tip in a detached worktree
+(`worktrees/<run>/release`). If the base didn't move since the run branched,
+the merge is exactly the tested tree; otherwise the gates run on it (a job;
+checks with stage `release`). Then the base branch moves to the merge with a
+compare-and-swap: `merge --ff-only` in the workspace when it has the base
+checked out (refused with uncommitted tracked changes), `update-ref <new>
+<old>` otherwise. A conflict, failing gates, a moved integration branch or a
+base that moved during the test sends the run back to `done` with a new item
+saying why. `released` records `releasedBy` (the person, or `policy@<hash>`
+when `release.auto` and autonomy is autonomous), `releasedSha` and
+`releasedAt`; audited as `autopilot.release_requested`, `release_failed` and
+`run_released`. `POST /runs/:id/release` is the Pipeline's Release button.
+
+## 14. Changes since the first build
 
 - Canvas pages: Home (`/autopilot`), Pipeline (`/autopilot/runs/:id`), Inbox
   (`/inbox`) with a sidebar badge, built against the JSON in §5 and checked in a

@@ -90,6 +90,9 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
       budgetUsd: 12.5,
       budgetSource: "run",
       policyHash: policyHash(DEFAULT_POLICY), // no policy.yml: the defaults, pinned
+      releasedBy: null,
+      releasedSha: null,
+      releasedAt: null,
       createdBy: "user:tester",
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
