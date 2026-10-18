@@ -192,12 +192,12 @@ test("work-order budgets sum builder and reviewer costs, hold only that order, a
 });
 
 test("a start that reaches the run budget stops dispatch immediately and preserves the phase to resume", async () => {
-  const t = setup({ state: "building", budgetUsd: 0.25 });
+  const t = setup({ state: "building", budgetUsd: 1.25 }); // room for one $1 reservation
   try {
     writeFileSync(path.join(t.dir, ".gitignore"), "ledger.db*\nworktrees/\n");
     await ensureRepo(t.dir);
     for (const wo of t.workOrders(2)) t.ledger.updateWorkOrder(wo.id, { state: "pending" });
-    t.client.startCostUsd = 0.25;
+    t.client.startCostUsd = 1.25;
     await t.tick();
     assert.equal(t.client.starts.length, 1);
     assert.equal(t.ledger.getRun(t.run.id)?.resumeState, "building");
@@ -206,6 +206,92 @@ test("a start that reaches the run budget stops dispatch immediately and preserv
     assert.equal(t.ledger.getRun(t.run.id)?.state, "building");
     await t.tick();
     assert.equal(t.client.starts.length, 2);
+  } finally { await t.close(); }
+});
+
+/** The safety policy with these budget settings. */
+function budgetPolicy(budget: Partial<typeof DEFAULT_POLICY.budget>) {
+  const policy = structuredClone(DEFAULT_POLICY);
+  policy.repair = { sameConversation: 0, fresh: 0 };
+  policy.budget = { ...policy.budget, ...budget };
+  return policy;
+}
+
+async function pendingWork(t: ReturnType<typeof setup>, n: number) {
+  writeFileSync(path.join(t.dir, ".gitignore"), "ledger.db*\nworktrees/\n");
+  await ensureRepo(t.dir);
+  const wos = t.workOrders(n);
+  for (const wo of wos) t.ledger.updateWorkOrder(wo.id, { state: "pending" });
+  return wos;
+}
+
+test("parallel starts reserve budget: with room for two reservations, a third agent waits until one stops", async () => {
+  const t = setup({ state: "building", budgetUsd: 2.5 }); // reserveUsd 1, parallel 3
+  try {
+    const [first] = await pendingWork(t, 3);
+    await t.tick();
+    assert.equal(t.client.starts.length, 2, "0 spent + 2 held + 1 > 2.5");
+    const builders = t.ledger.listAttempts({ runId: t.run.id, role: "builder" });
+    assert.deepEqual(builders.map((a) => a.state), ["running", "running", "starting"]);
+    assert.equal(t.ledger.getRun(t.run.id)?.state, "building", "agents still running may leave room: it waits");
+    assert.equal(t.ledger.listInbox({ runId: t.run.id }).filter((i) => i.kind === "budget_reached").length, 0);
+    await t.tick();
+    assert.equal(t.client.starts.length, 2, "still no room");
+
+    // The first agent stops having spent $0.20: what it held is free again.
+    const stopped = builders.find((a) => a.workOrderId === first!.id)!;
+    t.client.conversations.get(stopped.conversationId)!.costUsd = 0.2;
+    t.ledger.updateAttempt(stopped.id, { state: "error", costUsd: 0.2, finishedAt: new Date().toISOString(), result: { error: "Stopped" } });
+    await t.tick();
+    assert.equal(t.client.starts.length, 3, "0.2 spent + 1 held + 1 <= 2.5");
+  } finally { await t.close(); }
+});
+
+test("a run without room for another reservation and nothing running pauses for a person, and Continue starts the waiting agent", async () => {
+  const t = setup({ state: "building", budgetUsd: 1.5 });
+  try {
+    const [done, next] = await pendingWork(t, 2);
+    t.ledger.updateWorkOrder(done!.id, { state: "merged" });
+    t.ledger.addAttempt({ runId: t.run.id, workOrderId: done!.id, role: "builder", conversationId: "done", state: "finished", costUsd: 0.8 });
+    await t.tick();
+    assert.equal(t.client.starts.length, 0, "0.8 spent + 1 reserved > 1.5");
+    assert.deepEqual([t.ledger.getRun(t.run.id)?.state, t.ledger.getRun(t.run.id)?.resumeState], ["paused", "building"]);
+    const item = t.ledger.listInbox({ runId: t.run.id }).find((i) => i.kind === "budget_reached")!;
+    assert.match(item.body, /\$0\.80 against a \$1\.50 limit\. The next agent needs room for a \$1\.00 reservation\./);
+    assert.equal(t.ledger.listAttempts({ runId: t.run.id, workOrderId: next!.id })[0]?.state, "starting", "the agent waits; it isn't lost");
+    await t.o.decide(item.id, { choice: "continue" }, "user:test");
+    await t.tick();
+    assert.equal(t.client.starts.length, 1);
+  } finally { await t.close(); }
+});
+
+test("the daily limit spans runs: a run that would pass it waits for a person, whose Continue raises today's limit once", async () => {
+  const policy = budgetPolicy({ perDayUsd: 1.5 });
+  const t = setup({ state: "building", budgetUsd: 100, policy });
+  try {
+    await pendingWork(t, 1);
+    // Another run spent $1 today.
+    const other = t.ledger.createRun({ goal: "Other", change: "other", autonomy: "supervised", baseBranch: "main", integrationBranch: "other", integrationDir: t.dir, policy, createdBy: "user:test", state: "done" });
+    t.ledger.addAttempt({ runId: other.id, role: "spec", conversationId: "other", state: "finished", costUsd: 1 });
+    await t.tick();
+    assert.equal(t.client.starts.length, 0, "1 spent today + 1 reserved > 1.5");
+    const item = t.ledger.listInbox({ runId: t.run.id }).find((i) => i.kind === "budget_reached")!;
+    assert.match(item.ref ?? "", /^day:\d{4}-\d{2}-\d{2}$/);
+    assert.match(item.body, /Spending reported today, across runs, is \$1\.00 against today's \$1\.50 limit/);
+    assert.equal(t.ledger.getRun(t.run.id)?.pausedReason, "Today's budget reached");
+
+    await t.o.decide(item.id, { choice: "continue" }, "user:test");
+    assert.equal(t.ledger.getKv(`budget.${item.ref}`), "1.5", "today's limit is now 3");
+    await t.tick();
+    assert.equal(t.client.starts.length, 1);
+
+    // A second Continue (another run's, say) when there's room again doesn't raise it twice.
+    t.ledger.updateRun(t.run.id, { state: "paused", resumeState: "building" });
+    const again = t.ledger.openInbox({ runId: t.run.id, kind: "budget_reached", title: "Today's budget reached", body: "", options: [{ id: "continue", label: "Continue" }, { id: "cancel", label: "Cancel run" }], ref: item.ref ?? undefined });
+    await t.o.decide(again.id, { choice: "continue" }, "user:test");
+    assert.equal(t.ledger.getKv(`budget.${item.ref}`), "1.5", "1 spent + 1 held + 1 still fits in 3");
+    await audit("test", "test.flush", "test");
+    assert.equal(listAudit().filter((e) => e.subject === t.run.id && e.action === "autopilot.budget_increased").length, 1);
   } finally { await t.close(); }
 });
 

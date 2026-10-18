@@ -10,7 +10,7 @@ const dataDir = mkdtempSync(path.join(tmpdir(), "sf-policy-data-"));
 process.env.SF_DATA_DIR = dataDir;
 process.env.SF_WORKSPACE = mkdtempSync(path.join(tmpdir(), "sf-policy-unused-"));
 delete process.env.SF_AUTONOMY_CAP;
-const { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, parsePolicy, policyHash, sensitiveMatch } = await import("../src/autopilot/policy.js");
+const { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, parsePolicy, pinnedPolicy, policyHash, sensitiveMatch } = await import("../src/autopilot/policy.js");
 const { commitAll, diffStat, ensureRepo, git } = await import("../src/autopilot/git.js");
 const { createOrchestrator } = await import("../src/autopilot/orchestrator.js");
 const { openLedger } = await import("../src/autopilot/ledger.js");
@@ -95,6 +95,8 @@ test("parsePolicy: a wrong value or an unknown key is an error naming the key", 
     ["autonomy: { default: Autonomous }", /autonomy\.default must be one of/],
     ["governance: { controlApproval: maybe }", /governance\.controlApproval must be one of: off, required$/],
     ["governance: { fourEyes: yes }", /governance\.fourEyes must be true or false$/],
+    ["budget: { reserveUsd: -1 }", /budget\.reserveUsd must be a number from 0 up$/],
+    ["budget: { perDayUsd: 0 }", /budget\.perDayUsd must be a number above 0$/],
     ["parallel: three", /parallel must be a whole number from 1 up$/],
     ["parallel: 0", /parallel must be a whole number from 1 up$/],
     ["repair: { fresh: -1 }", /repair\.fresh must be a whole number from 0 up$/],
@@ -132,7 +134,18 @@ test("policyHash: the same rules always hash the same, however the file writes t
   assert.notEqual(policyHash(a), policyHash(parsePolicy("parallel: 2\nrepair: { fresh: 0, sameConversation: 2 }\n")));
   assert.equal(policyHash(parsePolicy("parallel: 3\n")), policyHash(DEFAULT_POLICY)); // the defaults, written out
   // Pinned: changing a default changes the actor of every new run's policy approvals. Update this on purpose.
-  assert.equal(policyHash(DEFAULT_POLICY), "db9e4e131004"); // governance added
+  assert.equal(policyHash(DEFAULT_POLICY), "d716c2b781e1"); // budget reservations and the daily limit added
+});
+
+test("pinnedPolicy: a run keeps what it pinned, and a setting added since (a block, or a key in a block) has its default", () => {
+  const old = structuredClone(DEFAULT_POLICY) as Partial<typeof DEFAULT_POLICY>;
+  old.budget = { perWorkOrderUsd: 2, perChangeUsd: 9 } as typeof DEFAULT_POLICY.budget; // pinned before reservations
+  delete old.governance;
+  const pinned = pinnedPolicy({ policy: old });
+  assert.deepEqual(pinned.budget, { perWorkOrderUsd: 2, perChangeUsd: 9, reserveUsd: 1, perDayUsd: null });
+  assert.deepEqual(pinned.governance, DEFAULT_POLICY.governance);
+  assert.deepEqual(pinnedPolicy({ policy: null }), DEFAULT_POLICY);
+  assert.equal(pinnedPolicy({ policy: { ...DEFAULT_POLICY, gates: [{ name: "t", run: "x" }] } }).gates?.length, 1, "lists are kept as pinned");
 });
 
 const OK: MergeFacts = {

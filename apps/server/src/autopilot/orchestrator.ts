@@ -455,35 +455,91 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
   }
 
+  // ---- budgets: the run's, each work order's and the day's across runs ----
+
   const runBudget = (run: Run) => run.budgetUsd ?? pinnedPolicy(run).budget.perChangeUsd;
+  /** Attempts past their budget check whose runtime isn't recorded yet: the check and the reservation happen between two awaits. */
+  const reserving = new Set<number>();
+  /** Local midnight, and the key of the day's raised limit. */
+  function today() {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return { since: d.toISOString(), key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` };
+  }
+  const dayExtra = (key: string) => Number(ledger.getKv(`budget.day:${key}`) ?? 0);
+
+  type Scope = { scope: "run" | "workOrder" | "day"; spent: number; limit: number; attempts: Attempt[]; wo?: WorkOrder };
+
+  /** The limits an agent of `run` (and `wo`) spends from: what each has spent, its limit, and the agents spending from it now. */
+  function scopesOf(run: Run, wo: WorkOrder | undefined, active: Attempt[]): Scope[] {
+    const { budget } = pinnedPolicy(run);
+    const day = today();
+    // ponytail: an agent's whole cost counts on the day it started; split by event time if agents run across midnight.
+    return [
+      { scope: "run", spent: ledger.runCost(run.id), limit: runBudget(run), attempts: active.filter((x) => x.runId === run.id) },
+      ...(wo ? [{ scope: "workOrder" as const, spent: ledger.workOrderCost(wo.id), limit: budget.perWorkOrderUsd + wo.budgetExtraUsd, attempts: active.filter((x) => x.workOrderId === wo.id), wo }] : []),
+      ...(budget.perDayUsd !== null ? [{ scope: "day" as const, spent: ledger.costSince(day.since), limit: budget.perDayUsd + dayExtra(day.key), attempts: active }] : []),
+    ];
+  }
+
+  /** What an agent holds against its limits while it may be running (started, or being started): its reservation minus what it has spent. */
+  const holds = (x: Attempt, reserve: number) => (x.state === "running" || x.runtime != null || reserving.has(x.id) ? Math.max(0, reserve - x.costUsd) : 0);
+  const fits = (s: Scope, reserve: number) => s.spent < s.limit && s.spent + s.attempts.reduce((sum, x) => sum + holds(x, reserve), 0) + reserve <= s.limit;
+
+  /**
+   * Whether a new agent may start: every limit it spends from must have room
+   * for its reservation (budget.reserveUsd) beyond what's spent and what
+   * running agents still hold, so agents started together can't overrun one.
+   * Without room it waits ("starting") while agents there may finish; when
+   * none are left to, a person decides (budget_reached).
+   */
+  function roomFor(run: Run, a: Attempt): boolean {
+    if (run.state === "paused" || TERMINAL.has(run.state)) return false;
+    const reserve = pinnedPolicy(run).budget.reserveUsd;
+    const active = ledger.activeAttempts().filter((x) => x.id !== a.id);
+    for (const s of scopesOf(run, a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined, active)) {
+      if (fits(s, reserve)) continue;
+      if (s.attempts.some((x) => holds(x, reserve) > 0 || x.state === "running")) return false;
+      budgetReached(run, s, ` The next agent needs room for a $${reserve.toFixed(2)} reservation.`);
+      return false;
+    }
+    reserving.add(a.id);
+    return true;
+  }
+
+  /** A limit is reached: the work order waits (its own limit) or the run pauses (its own or the day's), with an Inbox item to raise it. */
+  function budgetReached(run: Run, s: Omit<Scope, "attempts">, why = "") {
+    const { budget } = pinnedPolicy(run);
+    const data = { scope: s.scope, costUsd: s.spent, limitUsd: s.limit };
+    const spending = `Reported spending is $${s.spent.toFixed(2)} against a $${s.limit.toFixed(2)} limit.${why}`;
+    ledger.transaction(() => {
+      if (s.wo) {
+        moveWorkOrder(s.wo, "needs_attention", { patch: { resumeState: s.wo.state }, action: "autopilot.budget_reached", data });
+        openItem(run, "budget_reached", `Budget reached for WO-${s.wo.seq} of ${run.change}`, `${spending} Continue adds $${budget.perWorkOrderUsd.toFixed(2)} to this work order's limit. Other work orders may continue.`, WO_BUDGET, s.wo.id);
+        return;
+      }
+      if (s.scope === "day") {
+        openItem(run, "budget_reached", `Today's budget reached (${run.change})`, `Spending reported today, across runs, is $${s.spent.toFixed(2)} against today's $${s.limit.toFixed(2)} limit (budget.perDayUsd).${why} Continue raises today's limit by $${(budget.perDayUsd ?? 0).toFixed(2)} for every run, unless another run's Continue already made room, and resumes this run.`, RUN_BUDGET, undefined, `day:${today().key}`);
+      } else {
+        openItem(run, "budget_reached", `Budget reached for ${run.change}`, `${spending} Continue adds $${budget.perChangeUsd.toFixed(2)} to this run's limit.`, RUN_BUDGET);
+      }
+      moveRun(run, "paused", { patch: { resumeState: run.state, pausedReason: s.scope === "day" ? "Today's budget reached" : "Run budget reached" }, action: "autopilot.budget_reached", data });
+    });
+  }
 
   /** Check reported costs before starting more work and after each conversation update. */
   function enforceBudgets(run: Run): boolean {
     if (run.state === "paused" || TERMINAL.has(run.state)) return false;
     const cost = ledger.runCost(run.id);
-    const limit = runBudget(run);
-    if (cost >= limit) {
-      ledger.transaction(() => {
-        openItem(run, "budget_reached", `Budget reached for ${run.change}`,
-          `Reported spending is $${cost.toFixed(2)} against a $${limit.toFixed(2)} limit. Continue adds $${pinnedPolicy(run).budget.perChangeUsd.toFixed(2)} to this run's limit.`, RUN_BUDGET);
-        moveRun(run, "paused", {
-          patch: { resumeState: run.state, pausedReason: "Run budget reached" },
-          action: "autopilot.budget_reached", data: { costUsd: cost, limitUsd: limit },
-        });
-      });
+    if (cost >= runBudget(run)) {
+      budgetReached(run, { scope: "run", spent: cost, limit: runBudget(run) });
       return false;
     }
     const base = pinnedPolicy(run).budget.perWorkOrderUsd;
     for (const wo of ledger.listWorkOrders(run.id)) {
       if (DONE_WO.has(wo.state) || wo.state === "cancelled" || wo.state === "needs_attention") continue;
       const woCost = ledger.workOrderCost(wo.id);
-      const woLimit = base + wo.budgetExtraUsd;
-      if (woCost < woLimit) continue;
-      ledger.transaction(() => {
-        moveWorkOrder(wo, "needs_attention", { patch: { resumeState: wo.state }, action: "autopilot.budget_reached", data: { costUsd: woCost, limitUsd: woLimit } });
-        openItem(run, "budget_reached", `Budget reached for WO-${wo.seq} of ${run.change}`,
-          `Reported spending is $${woCost.toFixed(2)} against a $${woLimit.toFixed(2)} limit. Continue adds $${base.toFixed(2)} to this work order's limit. Other work orders may continue.`, WO_BUDGET, wo.id);
-      });
+      if (woCost >= base + wo.budgetExtraUsd) budgetReached(run, { scope: "workOrder", spent: woCost, limit: base + wo.budgetExtraUsd, wo });
     }
     return true;
   }
@@ -616,6 +672,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // Builders and reviewers work in their work order's worktree, the test writer in its own.
     const dir = wo ? wo.worktree : a.role === "validator" && run ? validatorDir(run) : run?.integrationDir;
     if (!run || !dir || !a.agentProfile) throw new Error(`Attempt ${a.id} has no worktree or agent profile to start with`);
+    // A new agent starts once its limits have room for it; until then it stays "starting" and a later tick asks again.
+    if (!a.runtime && !roomFor(run, a)) return;
     const exec = executionFor(run);
     try {
       // A container's agent server needs the profile's definition, found by name on Canvas's server.
@@ -642,6 +700,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (unreachable(err)) return; // stays "starting": a later tick starts it again with the same id
       ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: errorText(err) } });
       record(SYSTEM, "autopilot.agent_finished", run.id, { role: a.role, attempt: a.id, state: "error", error: clip(errorText(err)) });
+    } finally {
+      reserving.delete(a.id); // its runtime (or its end) holds the reservation now
     }
     changed(run.id);
     enforceBudgets(ledger.getRun(run.id) ?? run);
@@ -2501,6 +2561,17 @@ export function createOrchestrator(deps: OrchestratorDeps) {
           const extra = wo.budgetExtraUsd + pinnedPolicy(run).budget.perWorkOrderUsd;
           await resumeAgents(run, actor, wo.id);
           moveWorkOrder(wo, wo.resumeState ?? "building", { actor, patch: { budgetExtraUsd: extra, resumeState: null }, action: "autopilot.budget_increased", data: { limitUsd: pinnedPolicy(run).budget.perWorkOrderUsd + extra } });
+        } else if (item.ref?.startsWith("day:")) {
+          // Raised once for every run: a second run's Continue raises it again only if there's still no room.
+          const key = item.ref.slice("day:".length);
+          const { budget } = pinnedPolicy(run);
+          const day = scopesOf(run, undefined, ledger.activeAttempts()).find((s) => s.scope === "day");
+          if (key === today().key && day && !fits(day, budget.reserveUsd)) {
+            const extra = dayExtra(key) + (budget.perDayUsd ?? 0);
+            ledger.setKv(`budget.day:${key}`, String(extra));
+            record(actor, "autopilot.budget_increased", run.id, { scope: "day", day: key, limitUsd: day.limit + (budget.perDayUsd ?? 0) });
+          }
+          await unpause(run, actor);
         } else {
           const limit = runBudget(run) + pinnedPolicy(run).budget.perChangeUsd;
           await unpause(run, actor);

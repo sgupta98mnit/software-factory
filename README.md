@@ -111,7 +111,7 @@ autonomy: { default: supervised, max: autonomous }   # the lower of max and SF_A
 agents: { spec: null, critic: null, builder: null, reviewer: null, validator: null }   # profile id or name; null = Canvas's active profile
 parallel: 3                                          # work orders building at once
 repair: { sameConversation: 2, fresh: 1 }
-budget: { perWorkOrderUsd: 5, perChangeUsd: 30 }
+budget: { perWorkOrderUsd: 5, perChangeUsd: 30, reserveUsd: 1, perDayUsd: null }   # perDayUsd: across runs, per local day; null = none
 spec: { validateTries: 3, criticRounds: 2 }
 review: { blocking: [critical, high] }
 gates: null                                          # null = npm typecheck/lint/test scripts; or [{ name, run, cwd?, timeoutSec? }]
@@ -161,6 +161,8 @@ governance:
 A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` and `notify` are accepted for features still to come; `delivery` is described under [Pull request delivery](#pull-request-delivery); `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification), `governance` under [ISSO and release approvals](#isso-and-release-approvals).
 
 Autopilot checks reported conversation costs before starting more work and after each poll. At the run limit (the amount entered in Home, or `budget.perChangeUsd`), it pauses the run's agents and opens a budget decision in the Inbox. At a work order's limit, it pauses that order while the others continue. Continue adds the policy's base budget to the relevant limit; Skip ends that work order; Cancel ends the run. Limits and decisions persist across restarts, and a normal Resume cannot bypass a run budget decision. Spending can rise between checks or while a pause request completes; enforcement depends on the agent server reporting costs.
+
+Agents started together can't overrun a limit: each new agent reserves `budget.reserveUsd` ($1 by default; 0 turns reservations off) in its run, its work order and, with `budget.perDayUsd`, the day across all runs, until it has spent that much. An agent starts only when every one of those limits has room for its reservation beyond what's spent and what running agents still hold. Otherwise it waits (Starting) for running agents to finish, and when none are left to, the run or work order waits for a person in the Inbox. Continue on a daily item raises today's limit by `perDayUsd` for every run, unless another run's Continue already made room. An agent's whole cost counts on the day it started.
 
 ## Isolated execution
 

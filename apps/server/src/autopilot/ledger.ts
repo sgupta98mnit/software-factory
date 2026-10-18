@@ -781,6 +781,11 @@ export function openLedger(file: string) {
     return count("SELECT COALESCE(SUM(cost_usd), 0) AS n FROM attempts WHERE run_id = $runId", { runId });
   }
 
+  /** What attempts started since `since` (ISO) have spent so far, across runs: a day's spending. */
+  function costSince(since: string): number {
+    return count("SELECT COALESCE(SUM(cost_usd), 0) AS n FROM attempts WHERE started_at >= $since", { since });
+  }
+
   function workOrderCost(workOrderId: string): number {
     return count("SELECT COALESCE(SUM(cost_usd), 0) AS n FROM attempts WHERE work_order_id = $workOrderId", {
       workOrderId,
@@ -814,6 +819,7 @@ export function openLedger(file: string) {
     dismissInbox,
     openInboxCount,
     runCost,
+    costSince,
     workOrderCost,
     addCommand,
     getCommand,

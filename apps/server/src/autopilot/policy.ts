@@ -48,7 +48,12 @@ export interface Policy {
   /** null = detect npm scripts (gates.ts). */
   gates: Gate[] | null;
   autoMerge: { maxChangedLines: number; sensitivePaths: string[]; dependencyAllowlist: string[] };
-  budget: { perWorkOrderUsd: number; perChangeUsd: number };
+  /**
+   * Spending limits: a run's, each work order's and, with perDayUsd, the
+   * local day's across runs. A new agent reserves reserveUsd in each until
+   * it has spent that much, so agents started together can't overrun one.
+   */
+  budget: { perWorkOrderUsd: number; perChangeUsd: number; reserveUsd: number; perDayUsd: number | null };
   /** Independent acceptance tests a validator agent writes from the spec; they run on every work order's commit. */
   hiddenTests: { enabled: boolean; run: string };
   notify: { digestHour: number };
@@ -101,7 +106,7 @@ export const DEFAULT_POLICY: Policy = {
     sensitivePaths: ["**/auth/**", "**/crypto/**", "infra/**", "**/*.tf", "Dockerfile", ".github/**", ".gitlab-ci.yml", ".factory/**", "AGENTS.md", "CLAUDE.md", "**/migrations/**"],
     dependencyAllowlist: [],
   },
-  budget: { perWorkOrderUsd: 5, perChangeUsd: 30 },
+  budget: { perWorkOrderUsd: 5, perChangeUsd: 30, reserveUsd: 1, perDayUsd: null },
   hiddenTests: { enabled: false, run: "node --test" },
   notify: { digestHour: 17 },
   execution: {
@@ -200,6 +205,8 @@ const RULES: Record<string, Rule> = {
   "autoMerge.dependencyAllowlist": listOf(text),
   "budget.perWorkOrderUsd": positive,
   "budget.perChangeUsd": positive,
+  "budget.reserveUsd": (v, key) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? null : `${key} must be a number from 0 up`),
+  "budget.perDayUsd": nullable(positive),
   "hiddenTests.enabled": flag,
   "hiddenTests.run": text,
   "notify.digestHour": whole(0, 23),
@@ -299,8 +306,12 @@ export async function loadPolicy(workspace: string, baseBranch: string): Promise
   }
 }
 
-/** The policy a run pinned when it was created; settings added since it was pinned keep their defaults. */
-export const pinnedPolicy = (run: { policy: unknown }): Policy => ({ ...DEFAULT_POLICY, ...(run.policy as Policy | null) });
+/** `over` on top of `base`, mapping by mapping: what's in `over` wins, keys it lacks come from `base`. */
+const withDefaults = (base: unknown, over: unknown): unknown =>
+  isMapping(base) && isMapping(over) ? Object.fromEntries(Object.keys({ ...base, ...over }).map((k) => [k, Object.hasOwn(over, k) ? withDefaults(base[k], over[k]) : base[k]])) : over;
+
+/** The policy a run pinned when it was created; settings added since it was pinned (a whole block or one key in a block) keep their defaults. */
+export const pinnedPolicy = (run: { policy: unknown }): Policy => withDefaults(DEFAULT_POLICY, run.policy ?? {}) as Policy;
 
 // ---- the merge decision ----
 
