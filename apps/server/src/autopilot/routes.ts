@@ -272,7 +272,9 @@ export function createAutopilotRoutes(o: Orchestrator) {
   // What the factory has learned: per policy hash, how its merge rules fared; and the AGENTS.md lessons.
   app.get("/insights", (c) => c.json(buildInsights(ledger, listAudit(Number.MAX_SAFE_INTEGER))));
   app.get("/metrics", (c) => {
-    const days = Number(c.req.query("days") ?? 30);
+    // An empty ?days= is Number("") = 0, which would read as one day: no number means the default.
+    const raw = c.req.query("days")?.trim();
+    const days = raw ? Number(raw) : 30;
     return c.json(computeMetrics(ledger, listAudit(Number.MAX_SAFE_INTEGER), { days: Number.isFinite(days) ? days : 30 }));
   });
   app.get("/lessons", (c) => c.json(ledger.listLessons()));

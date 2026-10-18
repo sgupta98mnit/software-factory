@@ -138,6 +138,22 @@ The "Plausible, not fixed yet" section has the full list with details.
 | 59 | low-medium | Found while merging #53 with the Policy page: a write to the base branch (the policy, AGENTS.md, a lesson) checked only the file for a link out of the repo, not its folder, so a merged `.factory` symlinked elsewhere took the policy file with it. The folder is checked too (`autopilot-policy-screen.test.ts`). |
 | 60 | medium | Found while writing docs/AUTOPILOT.md: `.factory/**`, `AGENTS.md` and `CLAUDE.md` were held for a person only through the default `sensitivePaths`, and a policy's list replaces the default. A team that wrote its own list without them let the policy merge a work order that loosened the next runs' policy or briefed every later agent. A person now merges those whatever the list says (`GOVERNING_PATHS`, `autopilot-policy-screen.test.ts`). |
 
+## Found by the review of Phase 5 (all fixed in "review fixes for Phase 5", tests in `autopilot-review-p5.test.ts`)
+
+| # | Severity | Issue |
+| --- | --- | --- |
+| 61 | medium | `pnpm demo --reset` deleted whatever `SF_DEMO_DIR` named, whole: a home folder set by mistake lost everything in it, and an empty `SF_DEMO_DIR=` named the folder pnpm runs in, the factory's own checkout. Without `--reset`, a `workspace` folder already there (not a repo) got the demo's README and AGENTS.md written over its own files, then all of it committed. Reset now deletes only a folder that holds nothing but `workspace` and `data`, an empty variable counts as unset, and a non-empty `workspace` that isn't the demo's repo is refused. |
+| 62 | medium-low | The demo passed the shell's `SF_NOTIFY_WEBHOOK` to its API, so scripted runs posted "Autopilot needs someone" to a team's real Slack or Teams channel, where the README says the demo reaches nothing outside the machine. The demo clears it. |
+| 63 | medium | On a detached HEAD, the Policy page, `/status` (Home's autonomy choices) and the setup checklist read the defaults ("No policy file yet") while every run and intake pinned `main`'s policy (#43's class): a stricter `autonomy.max`, or `release.auto`, on `main` didn't show. They read the policy from the branch `createRun` uses (`policyBranch()`). |
+| 64 | medium | `explainPolicy` described the file, not what runs get: "Runs start autonomous" for `default: autonomous, max: supervised` (they start supervised); `SF_AUTONOMY_CAP` was ignored, so a factory capped at suggest read "merges follow the rules below"; `release.auto` read "Autonomous runs release on their own" when no run can be autonomous; outside runs read "at most autonomous" above the max; and an empty `review.blocking` read "Reviews block on  findings" (no severity blocks). It clamps like `createRun` now, and says when the file's max or the cap holds the default back. |
+| 65 | medium | Two templates said what they don't do. Cautious ("A person approves the spec, the plan and every merge", for "a first project or a sensitive system") had `autonomy.max: supervised`, so a run anyone started as supervised, and every outside request (`intake.autonomy` supervised), merged work orders on the policy's say-so. Federal said "Hidden acceptance tests and the preview are on" and "a preview before release" with the preview off. Cautious is now suggest at most (tightened, so the sentence is true); federal says the preview is ready to turn on; recommended's summary says a person approves plans by default (anyone can start an autonomous run). |
+| 66 | medium | `POST /policy` wrote through a `.factory/policy.yml` that is a link to a file in the repo: the link's target (say `src/config.yml`) got the policy text, committed to the base branch, while the policy stayed as it was (`loadPolicy` reads the link itself) and the audit recorded the new hash. A policy write replaces a link with the file. |
+| 67 | low-medium | The setup checklist called a repo with no commit yet (`git init` only) ready ("The workspace is a git repo on main"), and its Add the policy and Add AGENTS.md buttons failed with git's raw "Needed a single revision"; nothing offered the first commit. It isn't ready now, its fix makes the first commit, and the file fixes and the Policy page say why they wait. |
+| 68 | low-medium | Metrics counted some failures per occurrence where the page says "once per work order or run": each `work_order_failed` and `budget_reached` item (a Retry or a raise opens another), each errored or watchdog-stopped attempt, each failed release. And `runsWithoutPeople` dropped a run when someone answered the lesson it proposed after it finished. |
+| 69 | low | The Metrics page's per-policy cards counted every run the policy ever had, under "Runs started in the last N days". They count the window's runs. |
+| 70 | low | `GET /metrics?days=` (empty) meant one day (`Number("")` is 0), not the default 30. |
+| 71 | low | A merged work order that a re-plan reopened kept its `mergeWhy` ("The policy merged it: …") while it was built again, and for good if it was then skipped; the Pipeline showed it. It's cleared with `mergedBy`. |
+
 ## Plausible, not fixed yet (tracked for later phases)
 
 - **A conversation paused by hand in Canvas** stays `running` in the ledger, and
@@ -228,7 +244,8 @@ The "Plausible, not fixed yet" section has the full list with details.
   before the app binds; readiness then sees that process. The app is asked to
   bind 127.0.0.1 (`HOST`) but can bind anything. Processes that leave the
   app's process group outlive it (as for gates).
-- **Lessons and releases share the base branch** without an order: a lesson
+- **Lessons, policy writes, setup fixes and releases share the base branch**
+  without an order: a lesson (or a policy committed on the Policy page)
   committed while a release is tested sends the release back to a person; a
   base checked out in another worktree moves under it (as for releases); a
   crash between the commit and recording it writes the line again on a second
@@ -238,6 +255,42 @@ The "Plausible, not fixed yet" section has the full list with details.
 - The combined Inbox's item ids repeat across workspaces. Canvas's cards key on
   the workspace and id and decide through the item's own workspace API; only
   the cards' test ids (`factory-inbox-item-<id>`) can repeat.
+- **The Policy page's Commit doesn't check the version it edited.** A policy
+  someone committed meanwhile is overwritten (the audit's `from` hash shows
+  it). Canvas would have to send the hash it edited from.
+- The setup fixes check "there's already a policy (or AGENTS.md)" before
+  `commitToBase` reads the tip, so a write landing in between is overwritten;
+  the compare-and-swap catches most interleavings. The check could move into
+  the edit callback.
+- A clean filter (`filter.<name>.clean` in `.git/config` with
+  `.git/info/attributes`) runs on the factory's own `git add` of the policy,
+  so the committed file can differ from what `writePolicy` checked and the
+  hash it audited. `commitToBase` could read the blob back and refuse. Same
+  root as the repo-config entry above (anything that can write `.git` can
+  move `main` anyway).
+- An untracked `AGENTS.md` or `.factory/policy.yml` in the base checkout: the
+  fix is refused with git's raw "untracked working tree files would be
+  overwritten" (nothing is clobbered), and the checklist says there's none.
+- **Make it a git repo commits every file but `.env` ones**: keys (`*.pem`,
+  `id_rsa`), an `.npmrc` with a token, `credentials.json` go into history, and
+  the secret scan doesn't look at that first commit. The item says so, but a
+  federal team would want the scan run first, or the files listed for a confirm.
+- Setup fixes aren't serialized with `createRun`, which can run `ensureRepo` at
+  the same moment.
+- Metrics, insights and evidence read the whole audit log (`readFileSync`,
+  every line parsed) on each request, blocking the scheduler while they do;
+  past about 512 MB the read fails outright (string length).
+- **An autonomous run's plan is approved by the policy even when the critic's
+  last verdict is revise** with serious findings (after `spec.criticRounds`).
+  The `why` names the verdict; explainPolicy's "a critic approves the plan"
+  overstates it.
+- Release failure reasons in the release decision aren't markdown-escaped
+  (`releaseBody`): a conflict's file names, which agents choose, go in as
+  markdown. From before Phase 5.
+- The demo's own `git commit` uses the person's global git config:
+  `commit.gpgsign=true` fails the first run, and a global hooks path runs.
+- `POST /policy/check` takes text of any size (`POST /policy` stops at 100,000
+  characters).
 
 ## Phase 1 UI review (fixed in "Home, Pipeline and Inbox screens")
 

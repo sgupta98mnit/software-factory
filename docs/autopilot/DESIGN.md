@@ -582,31 +582,53 @@ decision goes to its item's own workspace.
 optional?, title, detail, fix}`, all text written for a person:
 
 - `agent-server`: reachable, with profiles;
-- `workspace`: exists, and is a repo;
+- `workspace`: exists, is a repo, and has a first commit (a bare `git init`
+  isn't ready: there's nothing to branch from);
 - `policy`: a file on the base branch, valid;
 - `gates`: the policy's gates or the detected npm gates;
 - `agents-md`: AGENTS.md on the base branch;
 - `alerts`: `SF_NOTIFY_WEBHOOK` (optional).
 
+The policy and AGENTS.md are read from the branch runs take their policy
+from (`policyBranch()`: the checked-out one, `main` on a detached HEAD, as
+`createRun` and intake), and so is `/status`'s policy.
+
 `POST /setup/:fix` (`fixSetup`) runs one fix as the person:
 
-- `init-repo`: `ensureRepo`, audited `workspace_initialized`;
+- `init-repo`: `ensureRepo` (a folder becomes a repo, a repo with no commit
+  gets its first), audited `workspace_initialized`; labelled "Make the first
+  commit" for the second;
 - `policy`: a template from policy-templates.ts (default `recommended`),
   refused if the base already has a policy;
 - `agents-md`: a starter file, refused if one exists.
 
-The last two go through `commitToBase` (detached worktree, compare-and-swap,
-refused on a dirty checkout of the base) and are audited
-(`policy_written` with the template and hash, `agents_md_written`).
+The last two (and `POST /policy`) need a checked-out branch with a commit
+(`branchToWrite()`, which says so in plain words), go through `commitToBase`
+(detached worktree, compare-and-swap, refused on a dirty checkout of the base)
+and are audited (`policy_written` with the template and hash,
+`agents_md_written`). A policy write replaces a `.factory/policy.yml` that is
+a link with the file (`replaceLink`): `loadPolicy` reads the link itself, so
+writing through it would change its target and leave the policy as it was.
 Templates (recommended, cautious, federal, hands-off) each parse under
-`parsePolicy`, and every one writes `release: { auto: false }` out.
+`parsePolicy`, and every one writes `release: { auto: false }` out. Each one's
+summary holds: cautious is suggest at most (`autonomy.max: suggest`), so every
+merge in every run, outside requests included, is a person's.
+
+`pnpm demo` keeps to its own folder: `--reset` deletes `SF_DEMO_DIR` only
+when it holds nothing but `workspace` and `data`, an empty `SF_DEMO_DIR`
+counts as unset, a `workspace` folder that isn't the demo's repo is never
+written into, and its API runs without `SF_NOTIFY_WEBHOOK`.
 
 ## 23. The Policy page, and a reason for every automated decision
 
 - `explainPolicy` (explain.ts) turns a policy into one plain sentence per
   thing it decides: autonomy, merges, review, repairs, gates, hidden tests,
   budgets, parallelism and queue, preview, release, intake, watchdog, and
-  learning.
+  learning. It says what runs get, not just what the file says: the default
+  under `autonomy.max` and both under `SF_AUTONOMY_CAP` (the Policy page and
+  Check pass the cap), saying which one holds it back; `release.auto` with
+  no run that can be autonomous reads as a person releasing; outside runs
+  are at most the clamped `intake.autonomy`.
 - `GET /policy` returns the base branch's file (or null), its source, hash,
   error and explanation, plus the templates, each with its hash and
   explanation. `POST /policy/check {yaml}` parses a draft without writing.
@@ -622,11 +644,13 @@ Templates (recommended, cautious, federal, hands-off) each parse under
   `release_requested` by `release.auto`, `replanned` by the policy, and
   `intake_received`. The evidence's `automated` list is every policy (or
   intake `run`) decision with its reason; the Pipeline's work-order panel
-  shows `mergeWhy`.
+  shows `mergeWhy`. A re-plan that reopens a merged work order clears
+  `mergeWhy` with `mergedBy`.
 
 ## 24. Metrics
 
-- `GET /metrics?days=N` (1 to 365, default 30; metrics.ts) is computed on
+- `GET /metrics?days=N` (1 to 365, default 30, also for an empty or
+  non-numeric `days`; metrics.ts) is computed on
   each request from the ledger and the audit log, for the runs started in the
   window. Nothing is stored or estimated.
 - **Lead time:** creation to `releasedAt`, and creation to the first
@@ -636,10 +660,11 @@ Templates (recommended, cautious, federal, hands-off) each parse under
   person), with the rate as the policy's share. `personDecisions` counts
   Inbox items decided by a `user:` actor, leaving out `superseded`.
   `runsWithoutPeople` counts finished runs whose only person decision was the
-  release.
+  release (a lesson the run proposed, answered after it, doesn't count).
 - **Cost:** the total of every attempt's cost; per finished run (done or
   released); and per merged work order.
-- **Failures:** counted once per work order or run each happened to:
+- **Failures:** counted once per work order (or once per run, for what has
+  no work order) each happened to, however often it repeated there:
   - build-stage gate failures by name; the secret and dependency scans;
     hidden tests (one entry); no gates at all;
   - review verdicts that didn't pass;
@@ -647,8 +672,8 @@ Templates (recommended, cautious, federal, hands-off) each parse under
   - `work_order_failed`, `spec_failed` and `budget_reached` items;
   - merge conflicts, merges reverted after tests, and failed releases.
   The top ten come back, including problems the factory repaired on its own.
-- `policies` is `buildInsights` (§20), limited to policies used in the
-  window. The Metrics page (sidebar, `/autopilot/metrics`) shows four stat
+- `policies` is `buildInsights` (§20) over the window's runs only, so each
+  card counts what that policy did in the period shown. The Metrics page (sidebar, `/autopilot/metrics`) shows four stat
   cards, the failure reasons as bars, and one card per policy hash, marking
   the base branch's current one. You can choose 7, 30 or 90 days.
 

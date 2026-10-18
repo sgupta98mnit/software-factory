@@ -116,7 +116,8 @@ export interface PolicyInsight {
 /** "Changes 512 lines, over the limit of 400" -> "Changes N lines, over the limit of N"; details after a colon go. */
 export const reasonKind = (r: string) => r.split(":")[0]!.replace(/\(.*$/, "").replace(/\d+(\.\d+)?/g, "N").trim();
 
-export function buildInsights(ledger: Ledger, events: AuditEvent[]): PolicyInsight[] {
+/** `runs`: the runs to count (newest first, like listRuns); Metrics passes its window's. */
+export function buildInsights(ledger: Ledger, events: AuditEvent[], runs = ledger.listRuns()): PolicyInsight[] {
   const byRun = new Map<string, AuditEvent[]>();
   for (const e of events) {
     const list = byRun.get(e.subject);
@@ -124,7 +125,7 @@ export function buildInsights(ledger: Ledger, events: AuditEvent[]): PolicyInsig
     else byRun.set(e.subject, [e]);
   }
   const groups = new Map<string, PolicyInsight>();
-  for (const run of [...ledger.listRuns()].reverse()) {
+  for (const run of [...runs].reverse()) {
     const hash = run.policyHash ?? "default";
     const g = groups.get(hash) ?? { hash, runs: 0, released: 0, firstRun: run.createdAt, lastRun: run.createdAt, merges: { policy: 0, person: 0 }, reasons: [], releaseFailures: 0, flakyGates: 0, notes: [] };
     groups.set(hash, g);

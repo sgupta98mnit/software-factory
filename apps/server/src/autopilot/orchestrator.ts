@@ -1330,7 +1330,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
           : "The spec changed for this work order. Build it to the acceptance criteria in your brief.";
         moveWorkOrder(ledger.getWorkOrder(wo.id) ?? wo, "pending", {
           actor,
-          patch: { ...fields, worktree: null, resumeState: null, mergedBy: null, findings: [{ source: "agent", severity: "high", title: note, detail: "" }] },
+          patch: { ...fields, worktree: null, resumeState: null, mergedBy: null, mergeWhy: null, findings: [{ source: "agent", severity: "high", title: note, detail: "" }] },
           action: wo.state === "merged" ? "autopilot.work_order_reopened" : "autopilot.work_order_replanned",
         });
       }
@@ -2067,17 +2067,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * accepted): committed in a detached worktree, then the branch moves only if
    * it's still where that started, like a release.
    */
-  async function commitToBase(base: string, file: string, edit: (text: string | null) => string, message: string): Promise<string> {
+  async function commitToBase(base: string, file: string, edit: (text: string | null) => string, message: string, opts: { replaceLink?: boolean } = {}): Promise<string> {
     const ref = `refs/heads/${base}`;
     const tip = await headSha(workspace, ref);
     const dir = path.join(worktrees, `_base-${randomBytes(3).toString("hex")}`);
     await addDetachedWorktree(workspace, dir, tip);
     try {
-      const target = repoFile(dir, file);
+      // The policy is read as the file itself (a link's blob is only its target's name), so it never follows one.
+      const target = opts.replaceLink ? file : repoFile(dir, file);
       // The folder too (".factory" for the policy): one that links out of the repo would take the write with it.
       const folder = path.dirname(path.join(dir, target));
       mkdirSync(folder, { recursive: true });
       if (!`${realpathSync(folder)}${path.sep}`.startsWith(`${realpathSync(dir)}${path.sep}`)) throw new Error(`${file} is in a folder that links out of the repo, so the factory doesn't write to it.`);
+      // A link there is replaced by the file: writing through it would change its target and leave the policy as it was.
+      if (opts.replaceLink && lstatSync(path.join(dir, target), { throwIfNoEntry: false })?.isSymbolicLink()) rmSync(path.join(dir, target));
       writeFileSync(path.join(dir, target), edit(await fileAt(workspace, tip, target)));
       await git(dir, ["add", "--", target]);
       await git(dir, ["commit", "-q", "-m", message]);
@@ -2361,10 +2364,16 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   // ---- what people do ----
 
+  /** The org-wide SF_AUTONOMY_CAP, when it names a level. */
+  function autonomyCap(): Autonomy | null {
+    const env = process.env.SF_AUTONOMY_CAP as Autonomy | undefined;
+    return env && AUTONOMY.includes(env) ? env : null;
+  }
+
   /** The lowest of what was asked for, the policy's autonomy.max and the org-wide SF_AUTONOMY_CAP. */
   function clampAutonomy(requested: Autonomy, max: Autonomy): Autonomy {
-    const env = process.env.SF_AUTONOMY_CAP as Autonomy | undefined;
-    const caps = [max, ...(env && AUTONOMY.includes(env) ? [env] : [])];
+    const env = autonomyCap();
+    const caps = [max, ...(env ? [env] : [])];
     return AUTONOMY[Math.min(AUTONOMY.indexOf(requested), ...caps.map((c) => AUTONOMY.indexOf(c)))] ?? requested;
   }
 
@@ -2467,9 +2476,17 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return next;
   }
 
+  /**
+   * The branch a run started now takes its policy from: the checked-out one, or main on a detached HEAD
+   * (createRun). Everything that shows or applies "the policy" reads it here. null without a repo.
+   */
+  async function policyBranch(): Promise<string | null> {
+    return (await isRepoRoot(workspace).catch(() => false)) ? ((await currentBranch(workspace)) ?? "main") : null;
+  }
+
   async function intakeNow(input: IntakeInput, actor: string): Promise<IntakeResult> {
     // The base branch createRun will use (main on a detached HEAD), so the policy that decides is the one the run pins.
-    const branch = (await isRepoRoot(workspace).catch(() => false)) ? ((await currentBranch(workspace)) ?? "main") : null;
+    const branch = await policyBranch();
     const { policy } = branch ? await loadPolicy(workspace, branch) : { policy: DEFAULT_POLICY };
     const request: IntakeRequest | null =
       input.source === "github" ? fromGithub(input.event, input.payload, policy.intake.githubLabel) : input.source === "webhook" ? fromWebhook(input.payload) : fromBugForm(input.payload, actor.replace(/^user:/, ""));
@@ -2777,7 +2794,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const s = await status();
     const exists = existsSync(workspace);
     const branch = s.workspace.branch;
-    const loaded = branch ? await loadPolicy(workspace, branch).catch(() => null) : { policy: DEFAULT_POLICY };
+    const base = s.workspace.isRepo ? (branch ?? "main") : null; // where runs read the policy (policyBranch)
+    const loaded = base ? await loadPolicy(workspace, base).catch(() => null) : { policy: DEFAULT_POLICY };
+    // Just `git init`: there's no commit to branch from or put a file on yet; the first commit is what init-repo makes.
+    const committed = s.workspace.isRepo && (await headSha(workspace).then(() => true, () => false));
     const items: SetupItem[] = [];
     const agent = s.agentServer;
     items.push({
@@ -2789,10 +2809,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
     items.push({
       id: "workspace",
-      ok: exists && s.workspace.isRepo,
-      title: !exists ? "The workspace folder doesn't exist" : s.workspace.isRepo ? `The workspace is a git repo on ${branch ?? "a detached HEAD"}` : "The workspace isn't a git repo yet",
-      detail: !exists ? `${workspace}: create it, or set SF_WORKSPACE to your project.` : s.workspace.isRepo ? workspace : `${workspace}: the factory works on branches of its own, so the workspace must be a repo. Its first commit takes the files as they are (.env files excluded).`,
-      fix: exists && !s.workspace.isRepo ? { id: "init-repo", label: "Make it a git repo" } : null,
+      ok: exists && committed,
+      title: !exists
+        ? "The workspace folder doesn't exist"
+        : !s.workspace.isRepo
+          ? "The workspace isn't a git repo yet"
+          : committed
+            ? `The workspace is a git repo on ${branch ?? "a detached HEAD"}`
+            : "The workspace is a git repo with no commits yet",
+      detail: !exists
+        ? `${workspace}: create it, or set SF_WORKSPACE to your project.`
+        : committed
+          ? workspace
+          : `${workspace}: the factory works on branches of its own, so the workspace must be a repo with a first commit. That commit takes the files as they are (.env files excluded).`,
+      fix: exists && !committed ? { id: "init-repo", label: s.workspace.isRepo ? "Make the first commit" : "Make it a git repo" } : null,
     });
     const hasPolicy = s.policy.source !== "defaults";
     items.push({
@@ -2800,7 +2830,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       ok: hasPolicy && !s.policy.error,
       title: s.policy.error ? "The policy has an error" : hasPolicy ? `Policy ${s.policy.source} (policy@${s.policy.hash})` : "No policy file yet: the factory's defaults apply",
       detail: s.policy.error ?? (hasPolicy ? "Runs pin these rules when they start. Change them on the Policy page." : "A .factory/policy.yml on the base branch writes the rules down where everyone can see and review them."),
-      fix: !hasPolicy && s.workspace.isRepo && branch ? { id: "policy", label: `Add the recommended policy to ${branch}` } : null,
+      fix: !hasPolicy && committed && branch ? { id: "policy", label: `Add the recommended policy to ${branch}` } : null,
     });
     const gates = loaded ? (loaded.policy.gates ?? (exists ? detectGates(workspace) : [])) : [];
     items.push({
@@ -2810,13 +2840,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       detail: gates.length ? "The factory runs these on every work order before anything merges." : "Builders usually add a test script, but a repo that has one from the start gives every work order a check. Add a test script to package.json, or list gates in the policy.",
       fix: null,
     });
-    const agentsMd = branch ? (await fileAt(workspace, `refs/heads/${branch}`, "AGENTS.md").catch(() => null)) !== null : false;
+    const agentsMd = base ? (await fileAt(workspace, `refs/heads/${base}`, "AGENTS.md").catch(() => null)) !== null : false;
     items.push({
       id: "agents-md",
       ok: agentsMd,
       title: agentsMd ? "AGENTS.md tells agents how this repo works" : "No AGENTS.md",
       detail: agentsMd ? "Every agent reads it. The factory proposes lines for it when builders keep making the same mistake." : "Every agent reads AGENTS.md: a few lines on how this repo builds and tests save repair rounds.",
-      fix: !agentsMd && s.workspace.isRepo && branch ? { id: "agents-md", label: `Add a starter AGENTS.md to ${branch}` } : null,
+      fix: !agentsMd && committed && branch ? { id: "agents-md", label: `Add a starter AGENTS.md to ${branch}` } : null,
     });
     items.push({
       id: "alerts",
@@ -2830,26 +2860,29 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /** One of the checklist's fixes, as the person who clicked it. Files go onto the base branch in their name. */
+  /** The checked-out branch a person's file goes onto (the policy, AGENTS.md), or a plain reason there's none. */
+  async function branchToWrite(): Promise<string> {
+    const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
+    if (!branch) throw new Error("Make the workspace a git repo (on a branch) first.");
+    if (!(await headSha(workspace).then(() => true, () => false))) throw new Error("The workspace's repo has no commits yet. Make the first commit, then try again.");
+    return branch;
+  }
+
   async function fixSetup(id: string, actor: string, opts: { template?: unknown } = {}): Promise<SetupItem[]> {
     const who = actor.replace(/^user:/, "");
-    const branchOrThrow = async () => {
-      const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
-      if (!branch) throw new Error("Make the workspace a git repo (on a branch) first.");
-      return branch;
-    };
     if (id === "init-repo") {
       if (!existsSync(workspace)) throw new Error(`${workspace} doesn't exist.`);
       if ((await ensureRepo(workspace)).initialized) record(actor, "autopilot.workspace_initialized", path.basename(workspace), { path: workspace });
     } else if (id === "policy") {
-      const branch = await branchOrThrow();
+      const branch = await branchToWrite();
       if ((await fileAt(workspace, `refs/heads/${branch}`, POLICY_FILE)) !== null) throw new Error(`There's already a policy on ${branch}. Change it on the Policy page.`);
       const template = templateById(typeof opts.template === "string" ? opts.template : "recommended");
       if (!template) throw new Error("There's no policy template with that name.");
       const hash = policyHash(parsePolicy(template.yaml));
-      const sha = await commitToBase(branch, POLICY_FILE, () => template.yaml, `factory: the ${template.name.toLowerCase()} policy (${who})`);
+      const sha = await commitToBase(branch, POLICY_FILE, () => template.yaml, `factory: the ${template.name.toLowerCase()} policy (${who})`, { replaceLink: true });
       record(actor, "autopilot.policy_written", path.basename(workspace), { template: template.id, hash, base: branch, sha });
     } else if (id === "agents-md") {
-      const branch = await branchOrThrow();
+      const branch = await branchToWrite();
       if ((await fileAt(workspace, `refs/heads/${branch}`, "AGENTS.md")) !== null) throw new Error(`${branch} already has an AGENTS.md.`);
       const sha = await commitToBase(branch, "AGENTS.md", () => STARTER_AGENTS_MD, `agents: a starter AGENTS.md (${who})`);
       record(actor, "autopilot.agents_md_written", path.basename(workspace), { base: branch, sha });
@@ -2864,7 +2897,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** The policy file on the base branch, what it makes the factory do, and the templates to start from. */
   async function policyView() {
-    const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
+    const branch = await policyBranch();
     const yaml = branch ? await fileAt(workspace, `refs/heads/${branch}`, POLICY_FILE).catch(() => null) : null;
     let loaded: { policy: Policy; hash: string; source: string } | null = null;
     let error: string | null = null;
@@ -2880,10 +2913,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       error,
       yaml,
       policy: loaded?.policy ?? null,
-      explanation: loaded ? explainPolicy(loaded.policy) : [],
+      explanation: loaded ? explainPolicy(loaded.policy, { cap: autonomyCap() }) : [],
       templates: POLICY_TEMPLATES.map((t) => {
         const policy = parsePolicy(t.yaml);
-        return { ...t, hash: policyHash(policy), explanation: explainPolicy(policy) };
+        return { ...t, hash: policyHash(policy), explanation: explainPolicy(policy, { cap: autonomyCap() }) };
       }),
     };
   }
@@ -2893,7 +2926,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (typeof yaml !== "string") return { ok: false, error: "Send the policy as text.", hash: null, explanation: [] as string[] };
     try {
       const policy = parsePolicy(yaml);
-      return { ok: true, error: null, hash: policyHash(policy), explanation: explainPolicy(policy) };
+      return { ok: true, error: null, hash: policyHash(policy), explanation: explainPolicy(policy, { cap: autonomyCap() }) };
     } catch (err) {
       return { ok: false, error: errorText(err), hash: null, explanation: [] as string[] };
     }
@@ -2915,12 +2948,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     } catch (err) {
       throw new Error(`The policy isn't valid, so nothing was written: ${errorText(err)}`);
     }
-    const branch = (await isRepoRoot(workspace).catch(() => false)) ? await currentBranch(workspace) : null;
-    if (!branch) throw new Error("Make the workspace a git repo (on a branch) first.");
+    const branch = await branchToWrite();
     const before = await loadPolicy(workspace, branch).then((p) => p.hash, () => null);
     const hash = policyHash(policy);
     const who = actor.replace(/^user:/, "");
-    const sha = await commitToBase(branch, POLICY_FILE, () => (yaml.endsWith("\n") ? yaml : `${yaml}\n`), `factory: ${template ? `the ${template.name.toLowerCase()} policy` : "policy changed"} (${who})`);
+    const sha = await commitToBase(branch, POLICY_FILE, () => (yaml.endsWith("\n") ? yaml : `${yaml}\n`), `factory: ${template ? `the ${template.name.toLowerCase()} policy` : "policy changed"} (${who})`, { replaceLink: true });
     record(actor, "autopilot.policy_written", path.basename(workspace), { template: template?.id ?? null, hash, from: before, base: branch, sha });
     broadcast({ type: "autopilot.changed" });
     return policyView();
@@ -2933,6 +2965,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     );
     const isRepo = await isRepoRoot(workspace).catch(() => false);
     const branch = isRepo ? await currentBranch(workspace) : null;
+    const base = isRepo ? (branch ?? "main") : null; // policyBranch(): main on a detached HEAD, as createRun
     // The policy a run started now would pin; an invalid policy.yml shows here before anyone starts one.
     // `autonomy`: what Home preselects, and the most anyone can pick (the policy's max under SF_AUTONOMY_CAP).
     const autonomyOf = (p: Policy) => ({ default: clampAutonomy(p.autonomy.default, p.autonomy.max), max: clampAutonomy("autonomous", p.autonomy.max) });
@@ -2943,8 +2976,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const error = missing.length ? `${p.source}: the agent server has no profile for ${missing.join(", ")}` : null;
       return { source: p.source, hash: p.hash, error, autonomy: autonomyOf(p.policy) as ReturnType<typeof autonomyOf> | null, budget: p.policy.budget as Policy["budget"] | null };
     };
-    const policy = branch
-      ? await loadPolicy(workspace, branch).then(checked, (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err), autonomy: null, budget: null }))
+    const policy = base
+      ? await loadPolicy(workspace, base).then(checked, (err: unknown) => ({ source: `${POLICY_FILE}@${base}`, hash: "", error: errorText(err), autonomy: null, budget: null }))
       : await checked({ policy: DEFAULT_POLICY, hash: policyHash(DEFAULT_POLICY), source: "defaults" });
     const webhook = process.env.SF_NOTIFY_WEBHOOK?.trim();
     return {

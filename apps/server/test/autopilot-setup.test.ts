@@ -25,7 +25,7 @@ test("every policy template is a valid policy that leaves release to a person", 
     assert.match(t.yaml, /release: \{ auto: false \}/, `${t.id} says so in the file`);
     assert.ok(t.summary.length > 20);
   }
-  assert.equal(parsePolicy(templateById("cautious")!.yaml).autonomy.max, "supervised");
+  assert.equal(parsePolicy(templateById("cautious")!.yaml).autonomy.max, "suggest"); // every merge is a person's, as it says
   assert.equal(parsePolicy(templateById("federal")!.yaml).intake.webhook, "off");
   assert.ok(parsePolicy(templateById("federal")!.yaml).autoMerge.sensitivePaths.includes("**/*.sql"));
 });

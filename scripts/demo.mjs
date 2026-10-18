@@ -11,7 +11,7 @@
 // validator writes hidden acceptance tests. The demo's policy turns on
 // hidden tests and the preview, so every screen has something to show.
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -59,13 +59,27 @@ const git = (dir, args) => {
   return r.stdout.trim();
 };
 
+// What prepareDemo makes in its folder. --reset deletes the folder only when it holds nothing else, so
+// an SF_DEMO_DIR that names a real folder (a home folder, this repo) is never wiped.
+const DEMO_ENTRIES = new Set(["workspace", "data"]);
+
 /** The demo's folders, made once (or again after --reset). Returns where they are. */
 export function prepareDemo(dir, opts = {}) {
-  if (opts.reset) rmSync(dir, { recursive: true, force: true });
+  if (opts.reset && existsSync(dir)) {
+    const other = readdirSync(dir).filter((name) => !DEMO_ENTRIES.has(name));
+    if (other.length) {
+      throw new Error(`${dir} has more in it than the demo makes (${other.slice(0, 3).join(", ")}${other.length > 3 ? ", ..." : ""}), so --reset leaves it alone. Point SF_DEMO_DIR at a folder of its own, or delete it yourself.`);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
   const workspace = path.join(dir, "workspace");
   const data = path.join(dir, "data");
   mkdirSync(data, { recursive: true });
   if (!existsSync(path.join(workspace, ".git"))) {
+    // Never the demo's files over someone's own (and then committed): a workspace folder already there must be empty.
+    if (existsSync(workspace) && readdirSync(workspace).length) {
+      throw new Error(`${workspace} already has files and isn't the demo's repo, so the demo doesn't write into it. Point SF_DEMO_DIR at a folder of its own.`);
+    }
     mkdirSync(path.join(workspace, ".factory"), { recursive: true });
     writeFileSync(path.join(workspace, "README.md"), README);
     writeFileSync(path.join(workspace, "AGENTS.md"), AGENTS);
@@ -84,7 +98,8 @@ const isWindows = process.platform === "win32";
 
 function main() {
   const args = new Set(process.argv.slice(2));
-  const dir = path.resolve(process.env.SF_DEMO_DIR ?? path.join(root, "data", "demo"));
+  // An empty SF_DEMO_DIR is unset, not "" (which path.resolve reads as the folder pnpm runs in: this repo).
+  const dir = path.resolve(process.env.SF_DEMO_DIR?.trim() || path.join(root, "data", "demo"));
   const apiPort = Number(process.env.SF_DEMO_API_PORT) || 4417;
   const agentsPort = Number(process.env.SF_DEMO_AGENTS_PORT) || 18100;
   const canvasPort = Number(process.env.SF_DEMO_CANVAS_PORT) || 3001;
@@ -93,7 +108,14 @@ function main() {
     console.error("[demo] canvas/ isn't set up yet. Run: pnpm setup:canvas (or pnpm demo --no-canvas for the API alone)");
     process.exit(1);
   }
-  const { workspace, data } = prepareDemo(dir, { reset: args.has("--reset") });
+  let prepared;
+  try {
+    prepared = prepareDemo(dir, { reset: args.has("--reset") });
+  } catch (err) {
+    console.error(`[demo] ${err.message}`);
+    process.exit(1);
+  }
+  const { workspace, data } = prepared;
 
   const children = [];
   let stopping = false;
@@ -145,6 +167,8 @@ function main() {
     SF_AGENT_SERVER_KEY: "demo",
     SF_USER: process.env.SF_USER ?? "demo",
     SF_PUBLIC_URL: `http://127.0.0.1:${canvasPort}`,
+    // No team alerts from scripted runs: a webhook set in this shell would post the demo to a real channel.
+    SF_NOTIFY_WEBHOOK: "",
   });
   if (withCanvas) run("canvas", `npm run dev:mock -- --port ${canvasPort} --host 127.0.0.1`, path.join(root, "canvas"), {
       SF_API_URL: `http://127.0.0.1:${apiPort}`,

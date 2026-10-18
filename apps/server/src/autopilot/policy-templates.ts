@@ -18,10 +18,11 @@ export const POLICY_TEMPLATES: PolicyTemplate[] = [
   {
     id: "recommended",
     name: "Recommended",
-    summary: "A person approves the plan; small, low-risk work orders merge on their own; a person releases.",
+    summary: "Runs start supervised: a person approves the plan, small, low-risk work orders merge on their own, and a person releases.",
     yaml: `${head("Software Factory policy: recommended", [
-      "A person approves each plan. A work order merges on its own when its gates, review and",
-      "scans pass and it stays out of sensitive paths; anything else waits in the Inbox.",
+      "Runs start supervised: a person approves each plan (whoever starts a run can make it",
+      "autonomous, and then the critic does). A work order merges on its own when its gates,",
+      "review and scans pass and it stays out of sensitive paths; anything else waits in the Inbox.",
       "Releasing into the base branch is always a person's click.",
     ])}autonomy: { default: supervised, max: autonomous }
 release: { auto: false }        # a person releases (the default, written out)
@@ -32,12 +33,11 @@ release: { auto: false }        # a person releases (the default, written out)
     name: "Cautious",
     summary: "A person approves the spec, the plan and every merge, and releases. For a first project or a sensitive system.",
     yaml: `${head("Software Factory policy: cautious", [
-      "People approve the spec, the plan and every merge. Hidden acceptance tests are on, and",
-      "reviews block on medium findings too.",
-    ])}autonomy: { default: suggest, max: supervised }
+      "People approve the spec, the plan and every merge, in every run (outside requests too).",
+      "Hidden acceptance tests are on, and reviews block on medium findings too.",
+    ])}autonomy: { default: suggest, max: suggest }   # max supervised would let a run's merges follow the rules
 review: { blocking: [critical, high, medium] }
 hiddenTests: { enabled: true }
-autoMerge: { maxChangedLines: 150 }
 release: { auto: false }        # a person releases
 budget: { perWorkOrderUsd: 3, perChangeUsd: 15 }
 `,
@@ -45,11 +45,12 @@ budget: { perWorkOrderUsd: 3, perChangeUsd: 15 }
   {
     id: "federal",
     name: "Federal, strict",
-    summary: "Supervised, with hidden tests, a preview before release, wider sensitive paths and no outside requests starting runs.",
+    summary: "Supervised, with hidden tests, wider sensitive paths and no outside requests starting runs; the preview is ready to turn on.",
     yaml: `${head("Software Factory policy: federal, strict", [
-      "Runs are supervised at most. Hidden acceptance tests and the preview are on. Auth, crypto,",
-      "infrastructure, CI and data-access code always waits for a person, and so does any change",
-      "to this policy or to AGENTS.md. Outside requests wait in the Inbox; webhooks are off.",
+      "Runs are supervised at most. Hidden acceptance tests are on; turn the preview on once the",
+      "app starts with its start command. Auth, crypto, infrastructure, CI and data-access code",
+      "always waits for a person, and so does any change to this policy or to AGENTS.md.",
+      "Outside requests wait in the Inbox; webhooks are off.",
     ])}autonomy: { default: supervised, max: supervised }
 review: { blocking: [critical, high, medium] }
 hiddenTests: { enabled: true }

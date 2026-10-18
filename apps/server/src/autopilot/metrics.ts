@@ -83,7 +83,8 @@ export function computeMetrics(ledger: Ledger, events: AuditEvent[], opts: { day
     }
     const decided = ledger.listInbox({ state: "decided", runId: run.id }).filter((i) => i.decidedBy?.startsWith("user:") && i.decision !== "superseded");
     personDecisions += decided.length;
-    if ((run.state === "done" || run.state === "released") && decided.every((i) => i.kind === "release")) runsWithoutPeople++;
+    // A lesson is proposed once the run is over: answering it isn't something the run needed.
+    if ((run.state === "done" || run.state === "released") && decided.every((i) => i.kind === "release" || i.kind === "lesson")) runsWithoutPeople++;
   }
   const merged = byPolicy + byPerson;
 
@@ -106,20 +107,26 @@ export function computeMetrics(ledger: Ledger, events: AuditEvent[], opts: { day
       }
       if ([...failed].some((n) => n.startsWith("hidden:"))) count("A hidden acceptance test failed");
     }
+    // Attempts and items repeat for one work order (each repair, each Retry, each raise): count who they happened to.
+    const stopped = new Set<string>();
+    const errored = new Set<string>();
     for (const a of ledger.listAttempts({ runId: run.id })) {
       const result = (a.result ?? {}) as { watchdog?: boolean; lost?: boolean };
-      if (result.watchdog) count("An agent made no progress and was stopped");
-      else if (a.state === "error" && !result.lost) count("An agent stopped with an error");
+      if (result.watchdog) stopped.add(a.workOrderId ?? "run");
+      else if (a.state === "error" && !result.lost) errored.add(a.workOrderId ?? "run");
     }
+    count("An agent made no progress and was stopped", stopped.size);
+    count("An agent stopped with an error", errored.size);
     const items = ledger.listInbox({ state: "all", runId: run.id });
-    count("A work order ran out of repair rounds", items.filter((i) => i.kind === "work_order_failed").length);
-    count("The spec didn't validate or couldn't be planned", items.some((i) => i.kind === "spec_failed") ? 1 : 0);
-    count("A budget was reached", items.filter((i) => i.kind === "budget_reached").length);
+    const once = (kind: string) => new Set(items.filter((i) => i.kind === kind).map((i) => i.workOrderId ?? "run")).size;
+    count("A work order ran out of repair rounds", once("work_order_failed"));
+    count("The spec didn't validate or couldn't be planned", once("spec_failed"));
+    count("A budget was reached", once("budget_reached"));
     const audit = eventsOf(run);
     count("The review asked for changes", perWorkOrder(audit, "autopilot.review_verdict", (e) => e.data.passed === false));
     count("A merge conflicted with another work order", perWorkOrder(audit, "autopilot.merge_conflicted"));
     count("Tests failed after merging", perWorkOrder(audit, "autopilot.merge_reverted"));
-    count("A release didn't go through", audit.filter((e) => e.action === "autopilot.release_failed").length);
+    count("A release didn't go through", audit.some((e) => e.action === "autopilot.release_failed") ? 1 : 0);
   }
   const failures = [...counts.entries()].filter(([, n]) => n > 0).map(([reason, n]) => ({ reason, count: n })).sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)).slice(0, 10);
 
@@ -137,6 +144,7 @@ export function computeMetrics(ledger: Ledger, events: AuditEvent[], opts: { day
     autonomy: { merged, byPolicy, byPerson, rate: merged ? Math.round((byPolicy / merged) * 1000) / 1000 : null, runsWithoutPeople, personDecisions },
     cost: { totalUsd: money(total), perChangeUsd: finished.length ? money(finishedCost / finished.length) : null, perMergedWorkOrderUsd: merged ? money(mergedCost / merged) : null },
     failures,
-    policies: buildInsights(ledger, events).filter((p) => p.lastRun >= from),
+    // The window's runs only: a policy's card counts what it did in the period the page shows.
+    policies: buildInsights(ledger, events, runs),
   };
 }
