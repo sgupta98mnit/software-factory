@@ -1,8 +1,10 @@
 # Autopilot design (as built)
 
-The original design contract wasn't kept in this repo. This document records the
-contract as the code implements it, and every later change updates it. Where it
-and the code disagree, the code and its tests win; fix this file. The product
+The original design contract, written before the code for the people building
+each commit, is `CONTRACT.md` next to this file, kept as it was. This document
+records the contract as the code implements it, and every later change updates
+it; where the two differ, this one wins. Where it and the code disagree, the
+code and its tests win; fix this file. The product
 thesis behind it is `docs/research/00-claude-findings.md` §4–6.
 
 ## 1. Shape

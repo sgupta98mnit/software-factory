@@ -36,7 +36,7 @@ workspaces/benefits-portal/  Demo workspace the agents work in (OpenSpec + Backl
 scripts/                     setup-canvas, dev, demo, export-canvas-patch, setup-workspace
 docs/AUTOPILOT.md            Autopilot for the team using it: how a run goes, who decides, the pages
 docs/ARCHITECTURE.md         How it fits together, and where to extend it
-docs/autopilot/              DESIGN.md (the contract as built) and OPEN-ISSUES.md (known gaps)
+docs/autopilot/              DESIGN.md (the contract as built), CONTRACT.md (the original) and OPEN-ISSUES.md (known gaps)
 data/                        Created when you run it: audit log, Autopilot ledger, worktrees (git-ignored)
 ```
 
