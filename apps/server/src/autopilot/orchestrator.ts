@@ -17,10 +17,12 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } 
 import { hostname } from "node:os";
 import path from "node:path";
 import { audit, auditFor, sha256 } from "../audit.js";
+import { Forbidden } from "../auth.js";
 import { isolationRequired } from "../config.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
 import { exportEvidence } from "./evidence.js";
+import { evidenceRoot, storeEvidence } from "./evidence-store.js";
 import {
   createExecution,
   RuntimeGone,
@@ -189,6 +191,28 @@ const DELIVERY: InboxOption[] = [
   { id: "retry", label: "Try again", tone: "primary" },
   { id: "finish", label: "Finish here" },
   { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+
+/** A finished run's release decision (governance.releaseApproval), bound to the commit it finished with. */
+export interface Release {
+  status: "pending" | "approved" | "rejected";
+  commit: string; // the integration branch's head when the run finished (the pushed head when delivered)
+  requestedAt: string;
+  decidedBy: string | null;
+  roles: string[]; // the decider's roles when they decided
+  decidedAt: string | null;
+  evidence: { file: string; sha256: string } | null; // the evidence packet approved with it (evidence-store.ts)
+  envelope: { file: string; sha256: string } | null; // the approval envelope that names both
+}
+
+const CONTROLS: InboxOption[] = [
+  { id: "approve", label: "Approve this commit", tone: "primary" },
+  { id: "send_back", label: "Send back to the builder", needsNote: true },
+  { id: "skip", label: "Skip this work order" },
+];
+const RELEASE: InboxOption[] = [
+  { id: "approve", label: "Approve release", tone: "primary" },
+  { id: "reject", label: "Reject", tone: "danger", needsNote: true },
 ];
 
 const HIDDEN_FILE = /^wo-(\d+)-[a-z0-9][a-z0-9-]*\.test\.mjs$/;
@@ -1585,6 +1609,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     for (const wo of ledger.listWorkOrders(run.id)) {
       if (wo.state !== "ready") continue;
       try {
+        // An ISSO approves a work order's controls at a verified commit first; then the merge decision as for any other.
+        const sha = needsIsso(run, wo) ? await headSha(workspace, wo.branch as string) : null;
+        if (sha && !controlApproval(run, wo, sha)) {
+          if (verificationOf(run) && !verifiedAt(run, wo, sha)) moveWorkOrder(wo, "verifying", { action: "autopilot.verification_required", data: { sha } });
+          else await askControlApproval(run, wo, sha);
+          continue;
+        }
         const check = await mergeCheck(run, wo);
         if (!check.auto) await askMergeApproval(run, wo, check);
         else if (!queued) {
@@ -1680,6 +1711,44 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return { actor: approval.decidedBy, reasons };
   }
 
+  // ---- ISSO approval of mapped controls ----
+
+  const needsIsso = (run: Run, wo: WorkOrder) => pinnedPolicy(run).governance.controlApproval === "required" && wo.controls.length > 0;
+
+  /** The ISSO's approval of exactly commit `sha` of the work order: a merge approval never stands in for it, nor one for another commit. */
+  const controlApproval = (run: Run, wo: WorkOrder, sha: string) =>
+    ledger
+      .listInbox({ state: "decided", runId: run.id })
+      .findLast((i) => i.workOrderId === wo.id && i.kind === "control_approval" && i.decision === "approve" && i.ref === `commit:${sha}`);
+
+  /** An ISSO sees the controls a ready (so verified) work order implements, the checks at its commit and what it changes. */
+  async function askControlApproval(run: Run, wo: WorkOrder, sha: string) {
+    const { files, linesChanged } = await diffStat(workspace, wo.baseSha ?? run.integrationBranch, sha);
+    const checks = ledger.listChecks({ runId: run.id, workOrderId: wo.id }).filter((c) => c.sha === sha);
+    const list = files.slice(0, 30).map((f) => `- \`${f.path}\` (+${f.added} -${f.deleted})`);
+    if (files.length > 30) list.push(`- and ${files.length - 30} more`);
+    const body = [
+      `**WO-${wo.seq}: ${wo.title}** implements security controls ${wo.controls.join(", ")}, as the change's design.md maps them.`,
+      "",
+      `Approving accepts commit \`${short(sha)}\` of \`${wo.branch}\` and no other: if it changes, an ISSO approves again. A merge approval may still be needed after yours.`,
+      "",
+      "### Checks at this commit",
+      bullets(checks.map((c) => `${c.ok ? "Passed" : "Failed"}: ${c.name}`)),
+      "",
+      "### Acceptance criteria",
+      bullets(wo.acceptance),
+      "",
+      `### ${files.length} file(s), ${linesChanged} line(s) changed`,
+      ...list,
+      "",
+      "Send back tells its builder what to change (write it in the note). Skip lets the work orders that depend on it go ahead without it.",
+    ].join("\n");
+    ledger.transaction(() => {
+      moveWorkOrder(wo, "awaiting_control_approval");
+      openItem(run, "control_approval", `Approve controls of WO-${wo.seq} (${run.change}): ${wo.title}`, body, CONTROLS, wo.id, `commit:${sha}`);
+    });
+  }
+
   /** When the factory recorded `sha` of the work order as verified, or undefined. Only verify() writes these. */
   const verifiedAt = (run: Run, wo: WorkOrder, sha: string) =>
     ledger.listChecks({ runId: run.id, workOrderId: wo.id }).findLast((c) => c.name === "verified" && c.ok && c.sha === sha)?.at;
@@ -1702,6 +1771,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       }
     }
     const { actor, reasons } = await mergeActor(run, wo);
+    const isso = needsIsso(run, wo) ? controlApproval(run, wo, await headSha(workspace, wo.branch as string))?.decidedBy : null;
+    if (isso === undefined) throw new Error(`WO-${wo.seq} implements ${wo.controls.join(", ")} and has no ISSO approval on record for its commit.`);
     const key = `WO-${wo.seq}`;
     // Saved before merging, so a restart (or a failure) knows where the integration branch was.
     let pre = wo.preMergeSha;
@@ -1721,7 +1792,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         actor,
         patch: { mergedBy: actor },
         action: "autopilot.work_order_merged",
-        data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons },
+        data: { sha: r.sha, linesChanged: r.linesChanged, files: r.files, reasons, ...(isso ? { controlsApprovedBy: isso } : {}) },
       });
       return;
     }
@@ -1782,11 +1853,69 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     await removeWorktree(workspace, validatorDir(run)).catch(warn);
     await deleteBranch(workspace, validatorBranch(run)).catch(warn);
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir);
-    moveRun(run, merged ? "done" : "failed", {
-      patch: { integrationDir: null, resumeState: null },
-      action: merged ? "autopilot.run_completed" : "autopilot.run_failed",
-      data: { branch: run.integrationBranch, sha, costUsd: ledger.runCost(run.id), merged, skipped: wos.length - merged },
+    ledger.transaction(() => {
+      const next = moveRun(run, merged ? "done" : "failed", {
+        patch: { integrationDir: null, resumeState: null },
+        action: merged ? "autopilot.run_completed" : "autopilot.run_failed",
+        data: { branch: run.integrationBranch, sha, costUsd: ledger.runCost(run.id), merged, skipped: wos.length - merged },
+      });
+      if (merged) askRelease(next, sha);
     });
+  }
+
+  // ---- release approval ----
+
+  /** With governance.releaseApproval required, a release manager approves (or rejects) exactly the commit a run finished with. */
+  function askRelease(run: Run, commit: string) {
+    const governance = pinnedPolicy(run).governance;
+    if (governance.releaseApproval !== "required") return;
+    const release: Release = { status: "pending", commit, requestedAt: now(), decidedBy: null, roles: [], decidedAt: null, evidence: null, envelope: null };
+    ledger.updateRun(run.id, { release });
+    const d = run.delivery as Delivery | null;
+    const body = [
+      `**${run.change}** is finished: \`${run.integrationBranch}\` at \`${short(commit)}\`${d?.pr ? `, pull request [#${d.pr.number}](${d.pr.url})` : ""}.`,
+      "",
+      "Approving records your approval of this commit, with the run's evidence as it is now, in a write-once approval envelope. Nothing is merged or deployed.",
+      ...(governance.fourEyes ? ["", `Four-eyes: ${run.createdBy} started this run, so someone else approves its release.`] : []),
+      "",
+      "Reject records why (write it in the note).",
+    ].join("\n");
+    openItem(run, "release", `Release ${run.change}`, body, RELEASE, undefined, `commit:${commit}`);
+  }
+
+  /**
+   * The release manager approves the commit the run finished with, which the
+   * branch must still be at. The run's evidence is exported and stored
+   * write-once, then the approval envelope that binds commit, evidence,
+   * policy and approver.
+   */
+  async function approveRelease(run: Run, actor: string, roles: string[]) {
+    const release = run.release as Release;
+    if (pinnedPolicy(run).governance.fourEyes && actor === run.createdBy) {
+      throw new Forbidden(`Four-eyes: ${actor} started this run, so another person approves its release.`);
+    }
+    const head = await headSha(workspace, run.integrationBranch).catch(() => null);
+    if (head !== release.commit) throw new Error(`${run.integrationBranch} is no longer at ${short(release.commit)}, the commit this run finished with, so it can't be approved. Reject it, and start a new run for what changed.`);
+    const { packet } = await exportEvidence(ledger, workspace, run.id, actor);
+    if (packet.artifact.commit !== release.commit) throw new Error("The run's evidence names another commit than the one it finished with. Check the audit log.");
+    const root = evidenceRoot(deps.dataDir);
+    const evidence = storeEvidence(root, run.id, "packet", packet);
+    const decidedAt = now();
+    const d = run.delivery as Delivery | null;
+    const envelope = storeEvidence(root, run.id, "release", {
+      kind: "software-factory/release-approval",
+      schemaVersion: 1,
+      run: run.id,
+      change: run.change,
+      artifact: { branch: run.integrationBranch, commit: release.commit, repository: d?.repository ?? null, pullRequest: d?.pr ?? null },
+      evidence: { algorithm: "sha256", canonicalization: "sf-canonical-json-v1", digest: evidence.sha256, file: evidence.file },
+      policyHash: run.policyHash,
+      approver: { actor, roles },
+      approvedAt: decidedAt,
+      limitations: ["A release approval recorded by this factory for this commit and evidence. It is not an authorization to operate, and it doesn't merge or deploy anything."],
+    });
+    ledger.updateRun(run.id, { release: { ...release, status: "approved", decidedBy: actor, roles, decidedAt, evidence, envelope } satisfies Release });
+    record(actor, "autopilot.release_approved", run.id, { commit: release.commit, evidence: evidence.sha256, envelope: envelope.sha256, roles });
   }
 
   // ---- delivery: a draft pull request, checked on its exact head ----
@@ -2002,11 +2131,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** Delivered: CI passed on the head, or a person merged the pull request or finished here. The worktree goes; the pull request stays for people. */
   async function finishDelivery(run: Run, d: Delivery, how: "passed" | "merged" | "finished", actor: string) {
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir).catch(warn);
-    moveRun(run, "done", {
-      actor,
-      patch: { integrationDir: null, resumeState: null, delivery: { ...d, status: how, blocked: null } },
-      action: "autopilot.run_completed",
-      data: { branch: run.integrationBranch, sha: d.pushedSha ?? (await headSha(workspace, run.integrationBranch)), costUsd: ledger.runCost(run.id), pullRequest: d.pr?.number ?? null, delivery: how },
+    const sha = d.pushedSha ?? (await headSha(workspace, run.integrationBranch));
+    ledger.transaction(() => {
+      const next = moveRun(run, "done", {
+        actor,
+        patch: { integrationDir: null, resumeState: null, delivery: { ...d, status: how, blocked: null } },
+        action: "autopilot.run_completed",
+        data: { branch: run.integrationBranch, sha, costUsd: ledger.runCost(run.id), pullRequest: d.pr?.number ?? null, delivery: how },
+      });
+      askRelease(next, sha);
     });
     // The finished run's evidence digest goes onto the pull request too (best effort: the run is done either way).
     if (d.pr) {
@@ -2291,7 +2424,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** Carries out a person's choice on an inbox item (already validated). */
   /** Carries out a person's choice. A message it queues comes back, to be sent once the decision is recorded. */
-  async function act(run: Run, item: InboxItem, choice: string, note: string | null, actor: string): Promise<Command | void> {
+  async function act(run: Run, item: InboxItem, choice: string, note: string | null, actor: string, roles: string[]): Promise<Command | void> {
     switch (`${item.kind}:${choice}`) {
       case "spec_approval:approve":
         record(actor, "autopilot.spec_approved", run.id, { change: run.change });
@@ -2387,7 +2520,26 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       case "merge_approval:send_back":
         await repair(run, workOrderOf(item), [{ source: "review", severity: "high", title: "A person asks for changes before this merges", detail: note ?? "" }]);
         return;
+      case "control_approval:approve": {
+        // For the commit it was asked about (item.ref) only: integrateStep and integrate() look for exactly that.
+        const wo = workOrderOf(item);
+        moveWorkOrder(wo, "ready", { actor, action: "autopilot.controls_approved", data: { controls: wo.controls, sha: item.ref?.replace(/^commit:/, "") ?? null, roles } });
+        return;
+      }
+      case "control_approval:send_back":
+        await repair(run, workOrderOf(item), [{ source: "review", severity: "high", title: "The ISSO asks for changes before this merges", detail: note ?? "" }]);
+        return;
+      case "release:approve":
+        await approveRelease(run, actor, roles);
+        return;
+      case "release:reject": {
+        const release = run.release as Release;
+        ledger.updateRun(run.id, { release: { ...release, status: "rejected", decidedBy: actor, roles, decidedAt: now() } satisfies Release });
+        record(actor, "autopilot.release_rejected", run.id, { commit: release.commit, roles, note: clip(note ?? "") });
+        return;
+      }
       case "merge_approval:skip":
+      case "control_approval:skip":
       case "error:skip":
       case "budget_reached:skip":
       case "work_order_failed:skip": {
@@ -2414,7 +2566,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /** A person's decision on an inbox item. The choice must be one of its options; some need a note. */
-  async function decide(id: number, input: { choice: string; note?: string | null }, actor: string): Promise<InboxItem> {
+  async function decide(id: number, input: { choice: string; note?: string | null }, actor: string, roles: string[] = []): Promise<InboxItem> {
     const found = ledger.getInbox(id);
     if (!found) throw new Error(`No inbox item ${id}`);
     mustLead();
@@ -2442,7 +2594,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         await cancelRun(run, actor, note);
         return ledger.getInbox(id) as InboxItem;
       }
-      const ask = await act(run, item, input.choice, note, actor); // throws -> the item stays open
+      const ask = await act(run, item, input.choice, note, actor, roles); // throws -> the item stays open
       await reconcilePauses(run.id);
       const decided = close();
       if (ask) await deliver(ask).catch(warn); // queued: a later tick sends it if this can't

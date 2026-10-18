@@ -78,6 +78,12 @@ export interface Policy {
       timeoutSec: number;
     };
   };
+  /** Approvals beyond merging: an ISSO's for work orders that implement mapped controls, a release manager's for a finished run. */
+  governance: {
+    controlApproval: "off" | "required";
+    releaseApproval: "off" | "required";
+    fourEyes: boolean; // whoever started a run can't approve its release
+  };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -120,6 +126,7 @@ export const DEFAULT_POLICY: Policy = {
     protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"],
     trivy: { mode: "off", version: null, scanners: ["vuln", "secret", "misconfig"], severities: ["critical", "high"], maxDbAgeHours: 72, timeoutSec: 600 },
   },
+  governance: { controlApproval: "off", releaseApproval: "off", fourEyes: true },
 };
 
 // ---- reading and checking policy.yml ----
@@ -223,6 +230,9 @@ const RULES: Record<string, Rule> = {
   "verification.trivy.severities": listOf(oneOf(["critical", "high", "medium", "low"])),
   "verification.trivy.maxDbAgeHours": positive,
   "verification.trivy.timeoutSec": seconds,
+  "governance.controlApproval": oneOf(["off", "required"]),
+  "governance.releaseApproval": oneOf(["off", "required"]),
+  "governance.fourEyes": flag,
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */

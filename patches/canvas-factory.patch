@@ -1,9 +1,9 @@
 diff --git a/__tests__/factory/autopilot.test.tsx b/__tests__/factory/autopilot.test.tsx
 new file mode 100644
-index 0000000..b2d9ea6
+index 0000000..aa75637
 --- /dev/null
 +++ b/__tests__/factory/autopilot.test.tsx
-@@ -0,0 +1,802 @@
+@@ -0,0 +1,853 @@
 +import { screen, waitFor, within } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
 +import { http, HttpResponse } from "msw";
@@ -116,6 +116,7 @@ index 0000000..b2d9ea6
 +    scan: "required",
 +  },
 +  delivery: null,
++  release: null,
 +  createdBy: "user:tester",
 +  createdAt: "2026-10-17T03:00:00.000Z",
 +  updatedAt: "2026-10-17T03:05:00.000Z",
@@ -748,6 +749,56 @@ index 0000000..b2d9ea6
 +    expect(screen.getByText("CI fix")).toBeInTheDocument();
 +    useParamsMock.mockReset();
 +  });
++
++  it("shows who approved a finished run's release and its envelope", async () => {
++    const router =
++      await vi.importActual<typeof import("react-router")>("react-router");
++    useParamsMock.mockImplementation(() => ({
++      conversationId: "test-conversation-id",
++      ...router.useParams(),
++    }));
++    const released: RunDetail = {
++      ...runDetail,
++      state: "done",
++      release: {
++        status: "approved",
++        commit: "0123456789abcdef0123456789abcdef01234567",
++        requestedAt: "2026-10-17T04:00:00.000Z",
++        decidedBy: "oidc:rm-1@login.example.gov",
++        roles: ["release_manager"],
++        decidedAt: "2026-10-17T05:00:00.000Z",
++        evidence: { file: "ap-1a2b3c4d/packet-aa.json", sha256: "a".repeat(64) },
++        envelope: { file: "ap-1a2b3c4d/release-bb.json", sha256: "b".repeat(64) },
++      },
++      workOrders: [{ ...runDetail.workOrders[0]!, state: "merged" }],
++    };
++    server.use(
++      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () =>
++        HttpResponse.json(released),
++      ),
++      http.get("*/sf-api/autopilot/status", () =>
++        HttpResponse.json({ agentServer: { profiles: [] } }),
++      ),
++    );
++    renderWithProviders(
++      <MemoryRouter initialEntries={["/autopilot/runs/ap-1a2b3c4d"]}>
++        <Routes>
++          <Route
++            path="/autopilot/runs/:runId"
++            element={<AutopilotPipelineRoute />}
++          />
++        </Routes>
++      </MemoryRouter>,
++    );
++    expect(await screen.findByText("Approved")).toBeInTheDocument();
++    expect(
++      screen.getByText("by oidc:rm-1@login.example.gov"),
++    ).toBeInTheDocument();
++    expect(
++      screen.getByText(`Approval envelope sha256 ${"b".repeat(12)}`),
++    ).toBeInTheDocument();
++    useParamsMock.mockReset();
++  });
 +});
 +
 +describe("Factory sign-in", () => {
@@ -919,10 +970,10 @@ index 0000000..a8c56bc
 +  factory self-contained. Other Canvas languages fall back to English.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..2510715
+index 0000000..c9ef266
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,584 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -1082,6 +1133,7 @@ index 0000000..2510715
 +  | "verifying"
 +  | "reviewing"
 +  | "ready"
++  | "awaiting_control_approval"
 +  | "awaiting_merge_approval"
 +  | "merging"
 +  | "merged"
@@ -1114,7 +1166,8 @@ index 0000000..2510715
 +  | "error"
 +  | "release"
 +  | "undelivered"
-+  | "delivery";
++  | "delivery"
++  | "control_approval";
 +export type Severity = "critical" | "high" | "medium" | "low";
 +
 +export interface InboxOption {
@@ -1216,6 +1269,17 @@ index 0000000..2510715
 +    approvals: number;
 +    repairs: number;
 +    blocked: string | null;
++  } | null;
++  /** A finished run's release decision (governance.releaseApproval), bound to the commit it finished with; null unless asked for. */
++  release: {
++    status: "pending" | "approved" | "rejected";
++    commit: string;
++    requestedAt: string;
++    decidedBy: string | null;
++    roles: string[];
++    decidedAt: string | null;
++    evidence: { file: string; sha256: string } | null;
++    envelope: { file: string; sha256: string } | null;
 +  } | null;
 +  createdBy: string;
 +  createdAt: string;
@@ -1782,10 +1846,10 @@ index 0000000..d1c1ebf
 +}
 diff --git a/src/factory/components/factory-badges.tsx b/src/factory/components/factory-badges.tsx
 new file mode 100644
-index 0000000..30f16c7
+index 0000000..c6387ee
 --- /dev/null
 +++ b/src/factory/components/factory-badges.tsx
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,206 @@
 +import {
 +  Circle,
 +  CircleCheck,
@@ -1909,6 +1973,7 @@ index 0000000..30f16c7
 +  verifying: "active",
 +  reviewing: "active",
 +  ready: "active",
++  awaiting_control_approval: "attention",
 +  awaiting_merge_approval: "attention",
 +  merging: "active",
 +  merged: "done",
@@ -1937,9 +2002,10 @@ index 0000000..30f16c7
 +  budget_reached: "attention",
 +  run_paused: "stopped",
 +  error: "failed",
-+  release: "done",
++  release: "attention",
 +  undelivered: "failed",
 +  delivery: "attention",
++  control_approval: "attention",
 +};
 +
 +export function StateChip({
@@ -2526,10 +2592,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..494a356
+index 0000000..47c2bd8
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1128 @@
+@@ -0,0 +1,1156 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2661,6 +2727,7 @@ index 0000000..494a356
 +      verifying: "Running checks",
 +      reviewing: "In review",
 +      ready: "Ready to merge",
++      awaiting_control_approval: "Controls need an ISSO's approval",
 +      awaiting_merge_approval: "Merge needs your approval",
 +      merging: "Merging",
 +      merged: "Merged",
@@ -2718,8 +2785,16 @@ index 0000000..494a356
 +      execution: "Execution",
 +      verification: "Verification",
 +      pullRequest: "Pull request",
++      release: "Release",
 +    },
 +    pullRequestLink: (n: number) => `#${n} (draft)`,
++    releaseStatus: {
++      pending: "Waiting for a release manager",
++      approved: "Approved",
++      rejected: "Rejected",
++    } as Record<string, string>,
++    releaseBy: (who: string) => `by ${who}`,
++    envelope: (digest: string) => `Approval envelope sha256 ${digest}`,
 +    deliveryStatus: {
 +      pushing: "Pushing the branch",
 +      waiting: "Waiting for CI",
@@ -2847,6 +2922,7 @@ index 0000000..494a356
 +      release: "Release",
 +      undelivered: "Message not delivered",
 +      delivery: "Delivery",
++      control_approval: "Control approval",
 +    } as Record<string, string>,
 +    noteLabel: "Note",
 +    noteHelp: (labels: string) => `Needed for ${labels}.`,
@@ -3085,6 +3161,10 @@ index 0000000..494a356
 +      "autopilot.inbox_decided": "Made an Autopilot decision",
 +      "autopilot.notified": "Sent a notification",
 +      "autopilot.released": "Merged a run into the base branch",
++      "autopilot.controls_approved":
++        "Approved a work order's security controls",
++      "autopilot.release_approved": "Approved a release",
++      "autopilot.release_rejected": "Rejected a release",
 +    } as Record<string, string>,
 +  },
 +};
@@ -3214,6 +3294,7 @@ index 0000000..494a356
 +      verifying: "Ejecutando comprobaciones",
 +      reviewing: "En revisión",
 +      ready: "Lista para integrar",
++      awaiting_control_approval: "Los controles esperan la aprobación del ISSO",
 +      awaiting_merge_approval: "La integración espera su aprobación",
 +      merging: "Integrando",
 +      merged: "Integrada",
@@ -3272,8 +3353,16 @@ index 0000000..494a356
 +      execution: "Ejecución",
 +      verification: "Verificación",
 +      pullRequest: "Pull request",
++      release: "Publicación",
 +    },
 +    pullRequestLink: (n) => `#${n} (borrador)`,
++    releaseStatus: {
++      pending: "Esperando a un responsable de publicación",
++      approved: "Aprobada",
++      rejected: "Rechazada",
++    },
++    releaseBy: (who) => `por ${who}`,
++    envelope: (digest) => `Sobre de aprobación sha256 ${digest}`,
 +    deliveryStatus: {
 +      pushing: "Subiendo la rama",
 +      waiting: "Esperando la CI",
@@ -3397,6 +3486,7 @@ index 0000000..494a356
 +      error: "Error",
 +      release: "Publicación",
 +      undelivered: "Mensaje no entregado",
++      control_approval: "Aprobación de controles",
 +      delivery: "Entrega",
 +    },
 +    noteLabel: "Nota",
@@ -3646,6 +3736,10 @@ index 0000000..494a356
 +      "autopilot.inbox_decided": "Tomó una decisión del piloto automático",
 +      "autopilot.notified": "Envió una notificación",
 +      "autopilot.released": "Integró una ejecución en la rama base",
++      "autopilot.controls_approved":
++        "Aprobó los controles de seguridad de una orden de trabajo",
++      "autopilot.release_approved": "Aprobó una publicación",
++      "autopilot.release_rejected": "Rechazó una publicación",
 +    },
 +  },
 +};
@@ -4903,10 +4997,10 @@ index 0000000..6672ce1
 +}
 diff --git a/src/factory/routes/autopilot-pipeline.tsx b/src/factory/routes/autopilot-pipeline.tsx
 new file mode 100644
-index 0000000..71c1c00
+index 0000000..759d425
 --- /dev/null
 +++ b/src/factory/routes/autopilot-pipeline.tsx
-@@ -0,0 +1,958 @@
+@@ -0,0 +1,993 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useParams } from "react-router";
@@ -5200,6 +5294,14 @@ index 0000000..71c1c00
 +          },
 +        ]
 +      : []),
++    ...(run.release
++      ? [
++          {
++            label: copy.pipeline.facts.release,
++            value: <ReleaseFact release={run.release} />,
++          },
++        ]
++      : []),
 +    {
 +      label: copy.pipeline.facts.branch,
 +      value: (
@@ -5270,6 +5372,32 @@ index 0000000..71c1c00
 +  );
 +}
 +
++/** Whether a release manager approved the commit the run finished with, who, and the approval envelope's digest. */
++function ReleaseFact({
++  release,
++}: {
++  release: NonNullable<RunDetail["release"]>;
++}) {
++  const copy = useFactoryCopy();
++  return (
++    <>
++      <span className="block">
++        {labelFor(copy.pipeline.releaseStatus, release.status)}
++      </span>
++      {release.decidedBy ? (
++        <span className="block text-xs text-muted">
++          {copy.pipeline.releaseBy(release.decidedBy)}
++        </span>
++      ) : null}
++      {release.envelope ? (
++        <span className="block break-all font-mono text-xs text-muted">
++          {copy.pipeline.envelope(release.envelope.sha256.slice(0, 12))}
++        </span>
++      ) : null}
++    </>
++  );
++}
++
 +/** "Checks pinned from the base branch · 3 hidden tests · Trivy (required)". */
 +function verificationText(
 +  v: RunDetail["verification"],
@@ -5316,6 +5444,7 @@ index 0000000..71c1c00
 +  verifying: "verify",
 +  reviewing: "verify",
 +  ready: "integrate",
++  awaiting_control_approval: "integrate",
 +  awaiting_merge_approval: "integrate",
 +  merging: "integrate",
 +  merged: "done",

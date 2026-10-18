@@ -7,11 +7,11 @@ import { Forbidden, principalOf, ROLES, Unauthenticated, type Principal, type Ro
 import { LOCAL_USER } from "../config.js";
 import { EvidenceConflict } from "./evidence.js";
 import { StaleWorker, type Attempt, type Check, type InboxItem, type InboxKind, type Run, type WorkOrder } from "./ledger.js";
-import { Standby, type Delivery, type Orchestrator, type Verification } from "./orchestrator.js";
+import { Standby, type Delivery, type Orchestrator, type Release, type Verification } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
 
 // Work-order states that count as in progress.
-const ACTIVE_WO = new Set<string>(["building", "verifying", "reviewing", "ready", "awaiting_merge_approval", "merging"]);
+const ACTIVE_WO = new Set<string>(["building", "verifying", "reviewing", "ready", "awaiting_control_approval", "awaiting_merge_approval", "merging"]);
 const FINISHED_WO = new Set<string>(["merged", "skipped", "cancelled"]);
 
 /** `execution`: where the attempt ran (ExecutionFacts); null for attempts from before isolation. */
@@ -151,6 +151,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       execution: { provider: pinnedPolicy(run).execution.provider, isolated: pinnedPolicy(run).execution.provider === "container" },
       verification: verificationView(run),
       delivery: deliveryView(run),
+      release: (run.release as Release | null) ?? null,
       createdBy: run.createdBy,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -256,11 +257,11 @@ export function createAutopilotRoutes(o: Orchestrator) {
     const id = Number(c.req.param("id"));
     const item = Number.isInteger(id) ? ledger.getInbox(id) : undefined;
     if (!item) throw new HTTPException(404, { message: `No inbox item ${c.req.param("id")}` });
-    const actor = who(c, DECIDES[item.kind] ?? "engineer").actor;
+    const p = who(c, DECIDES[item.kind] ?? "engineer");
     const { choice, note } = await body<{ choice?: unknown; note?: unknown }>(c);
     if (typeof choice !== "string") throw new Error("Send a choice.");
     if (note != null && typeof note !== "string") throw new Error("The note must be text.");
-    return once(c, `POST /inbox/${id}/decide`, async () => inboxView(await o.decide(id, { choice, note: note as string | null | undefined }, actor)));
+    return once(c, `POST /inbox/${id}/decide`, async () => inboxView(await o.decide(id, { choice, note: note as string | null | undefined }, p.actor, p.roles)));
   });
 
   return app;

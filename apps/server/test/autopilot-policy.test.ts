@@ -93,6 +93,8 @@ test("parsePolicy: a wrong value or an unknown key is an error naming the key", 
   const cases: [string, RegExp][] = [
     ["autonomy: { max: yolo }", /autonomy\.max must be one of: suggest, supervised, autonomous$/],
     ["autonomy: { default: Autonomous }", /autonomy\.default must be one of/],
+    ["governance: { controlApproval: maybe }", /governance\.controlApproval must be one of: off, required$/],
+    ["governance: { fourEyes: yes }", /governance\.fourEyes must be true or false$/],
     ["parallel: three", /parallel must be a whole number from 1 up$/],
     ["parallel: 0", /parallel must be a whole number from 1 up$/],
     ["repair: { fresh: -1 }", /repair\.fresh must be a whole number from 0 up$/],
@@ -130,7 +132,7 @@ test("policyHash: the same rules always hash the same, however the file writes t
   assert.notEqual(policyHash(a), policyHash(parsePolicy("parallel: 2\nrepair: { fresh: 0, sameConversation: 2 }\n")));
   assert.equal(policyHash(parsePolicy("parallel: 3\n")), policyHash(DEFAULT_POLICY)); // the defaults, written out
   // Pinned: changing a default changes the actor of every new run's policy approvals. Update this on purpose.
-  assert.equal(policyHash(DEFAULT_POLICY), "180321321476"); // delivery added
+  assert.equal(policyHash(DEFAULT_POLICY), "db9e4e131004"); // governance added
 });
 
 const OK: MergeFacts = {

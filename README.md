@@ -152,9 +152,13 @@ verification:
     severities: [critical, high]                     # new findings at these severities send the work back
     maxDbAgeHours: 72
     timeoutSec: 600
+governance:
+  controlApproval: off                               # required: an ISSO approves each verified commit of a work order with mapped controls
+  releaseApproval: off                               # required: a release manager approves the commit a finished run ends with
+  fourEyes: true                                     # whoever started a run can't approve its release
 ```
 
-A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` and `notify` are accepted for features still to come; `delivery` is described under [Pull request delivery](#pull-request-delivery); `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification).
+A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` and `notify` are accepted for features still to come; `delivery` is described under [Pull request delivery](#pull-request-delivery); `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification), `governance` under [ISSO and release approvals](#isso-and-release-approvals).
 
 Autopilot checks reported conversation costs before starting more work and after each poll. At the run limit (the amount entered in Home, or `budget.perChangeUsd`), it pauses the run's agents and opens a budget decision in the Inbox. At a work order's limit, it pauses that order while the others continue. Continue adds the policy's base budget to the relevant limit; Skip ends that work order; Cancel ends the run. Limits and decisions persist across restarts, and a normal Resume cannot bypass a run budget decision. Spending can rise between checks or while a pause request completes; enforcement depends on the agent server reporting costs.
 
@@ -208,6 +212,12 @@ Roles come from the ID token claim `SF_OIDC_ROLES_CLAIM` (`roles` by default), m
 | isso | approve work orders that implement mapped security controls |
 | release_manager | approve or reject a finished run's release |
 | admin | make backups |
+
+## ISSO and release approvals
+
+With `governance.controlApproval: required`, a work order whose tasks map to security controls (the Controls table in the change's design.md) waits after verification and review in **Controls need an ISSO's approval**. Its Inbox item lists the controls, the checks recorded at the work order's commit, its acceptance criteria and what it changes. Only the isso role decides it, and the approval counts for that exact commit: if the work changes (a merge approval sends it back, say), it's verified again and an ISSO is asked again. A merge approval never stands in for it, and the audit log's merge event names both people.
+
+With `governance.releaseApproval: required`, a finished run opens a **Release** item for the commit it finished with (the pushed head, when it delivered a pull request). A release manager other than the person who started the run (`fourEyes`, on by default) approves or rejects it, and approving needs the integration branch still at that commit. The factory then exports the run's evidence and stores it with an approval envelope that names the commit, the evidence digest, the policy hash and the approver's identity and roles. Both go write-once into `data/evidence/<run>/` (`SF_EVIDENCE_DIR` moves it): read-only files named by their SHA-256, which the factory never overwrites. An approval records a decision made in this factory. It isn't an authorization to operate, and nothing is merged or deployed.
 
 ## Run evidence
 

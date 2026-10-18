@@ -42,8 +42,8 @@
 5. An export with a missing fact is refused, never produced with a gap.
 
 ### Tasks
-- [ ] 1. `auth.ts`, sessions (ledger v6), routes and middleware, the actor taken from the request everywhere, role checks; tests with a stand-in OIDC issuer.
-- [ ] 2. Control and release approvals, envelopes, four-eyes; tests.
+- [x] 1. `auth.ts`, sessions (ledger v6), routes and middleware, the actor taken from the request everywhere, role checks; tests with a stand-in OIDC issuer.
+- [x] 2. Control and release approvals, envelopes, four-eyes; tests.
 - [ ] 3. Reservations and the daily scope; tests.
 - [ ] 4. Evidence store, retention, backup/verify/restore with a CLI; tests.
 - [ ] 5. DSSE-signed in-toto Statement and OSCAL assessment results, gated on facts; tests.

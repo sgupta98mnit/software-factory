@@ -92,6 +92,7 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
       execution: { provider: "local", isolated: false },
       verification: { pinned: "worktree", gates: [], hiddenTests: "off", scan: "off" }, // nothing on the base to pin
       delivery: null,
+      release: null,
       createdBy: "user:tester",
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
