@@ -44,13 +44,16 @@ const BASE_ARGS = [
 // Everything but installed packages: agents run npm install in worktrees that may have no .gitignore.
 const ADD_ALL = ["add", "-A", "--", ".", ":(exclude,glob)**/node_modules/**"];
 
-/** Runs git in `cwd`. Throws on a non-zero exit unless `allowFail`. */
-export function git(cwd: string, args: string[], opts: { allowFail?: boolean } = {}): Promise<GitResult> {
+/**
+ * Runs git in `cwd`. Throws on a non-zero exit unless `allowFail`. `env` adds
+ * variables (a push's credentials go there as GIT_CONFIG_*, never in argv).
+ */
+export function git(cwd: string, args: string[], opts: { allowFail?: boolean; env?: Record<string, string> } = {}): Promise<GitResult> {
   return new Promise((resolve, reject) => {
     execFile(
       "git",
       [...BASE_ARGS, ...args],
-      { cwd, maxBuffer: 50 * 1024 * 1024, windowsHide: true },
+      { cwd, maxBuffer: 50 * 1024 * 1024, windowsHide: true, ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}) },
       (error, stdout, stderr) => {
         // A spawn failure (no git, missing cwd) has a string code; an exit status is a number.
         if (error && typeof error.code !== "number") return reject(error);

@@ -103,6 +103,21 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
       runner: check.runner ?? "not_recorded",
       meta: metaOf(check.meta),
     })),
+    // What delivery recorded: the pushed head is the artifact; checks and approvals were read on exactly that head.
+    delivery: run.delivery
+      ? (() => {
+          const d = run.delivery as { repository: string; pushedSha: string | null; pr: { number: number; url: string } | null; status: string; repairs: number; checks: { name: string; state: string }[]; approvals: number };
+          return {
+            repository: d.repository,
+            pushedCommit: d.pushedSha,
+            pullRequest: d.pr ? { number: d.pr.number, url: d.pr.url } : null,
+            status: d.status,
+            repairs: d.repairs,
+            checksAtHead: d.checks.map((c) => ({ name: c.name, state: c.state })),
+            approvalsAtHead: d.approvals,
+          };
+        })()
+      : null,
     verification: verification
       ? {
           pinned: verification.source, // policy, base (the base branch's scripts) or worktree (the branch's own: not pinned)

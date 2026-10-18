@@ -50,6 +50,7 @@ import {
   resetHard,
   restorePaths,
 } from "./git.js";
+import { GitHubClient, GitHubError, repositoryOf, transient, type CheckResult, type Review, type ReviewComment } from "./github.js";
 import { mergeAndTest } from "./integrator.js";
 import { StaleWorker } from "./ledger.js";
 import type {
@@ -168,6 +169,28 @@ const SPEC_GONE: InboxOption[] = [
   { id: "cancel", label: "Cancel run", tone: "danger" },
 ];
 
+/** Where a delivered run stands: its pushed branch, its pull request, and CI and reviews on the pushed head. */
+export interface Delivery {
+  repository: string; // "owner/name"
+  remote: string;
+  pushedSha: string | null;
+  pr: { number: number; url: string } | null;
+  status: "pushing" | "waiting" | "repairing" | "blocked" | "passed" | "merged" | "finished";
+  waitingSince: string | null; // when CI started being awaited for pushedSha
+  repairs: number; // CI or review repair work orders so far
+  extraRepairs: number; // rounds a person allowed beyond the policy's
+  checks: CheckResult[]; // on pushedSha
+  approvals: number; // approving reviews on pushedSha
+  blocked: string | null; // why it waits for a person
+  evidenceFor: string | null; // the head the evidence comment describes
+}
+
+const DELIVERY: InboxOption[] = [
+  { id: "retry", label: "Try again", tone: "primary" },
+  { id: "finish", label: "Finish here" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+
 const HIDDEN_FILE = /^wo-(\d+)-[a-z0-9][a-z0-9-]*\.test\.mjs$/;
 const HIDDEN_MAX_BYTES = 200_000;
 const HIDDEN_MAX_FILES = 300;
@@ -228,7 +251,7 @@ const WO_BUDGET: InboxOption[] = [
 const now = () => new Date().toISOString();
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 /** The agent server or the container engine is down or slow: leave everything as it is and try again on a later tick. */
-const unreachable = (err: unknown) => (err instanceof OpenHandsError && err.status === 0) || err instanceof RuntimeUnavailable;
+const unreachable = (err: unknown) => (err instanceof OpenHandsError && err.status === 0) || err instanceof RuntimeUnavailable || transient(err);
 /** One line, at most `max` chars: for audit data, which never holds full goals, notes or prompts. */
 const clip = (text: string, max = 120) => {
   const line = text.replace(/\s+/g, " ").trim();
@@ -1748,6 +1771,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function finish(run: Run) {
     const wos = ledger.listWorkOrders(run.id);
     const merged = wos.filter((w) => w.state === "merged").length;
+    if (merged && pinnedPolicy(run).delivery.mode === "github") {
+      await releaseMounted(run);
+      await removeWorktree(workspace, validatorDir(run)).catch(warn);
+      await deleteBranch(workspace, validatorBranch(run)).catch(warn);
+      return startDelivery(run);
+    }
     const sha = await headSha(workspace, run.integrationBranch);
     await releaseMounted(run);
     await removeWorktree(workspace, validatorDir(run)).catch(warn);
@@ -1758,6 +1787,236 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       action: merged ? "autopilot.run_completed" : "autopilot.run_failed",
       data: { branch: run.integrationBranch, sha, costUsd: ledger.runCost(run.id), merged, skipped: wos.length - merged },
     });
+  }
+
+  // ---- delivery: a draft pull request, checked on its exact head ----
+
+  /**
+   * With delivery.mode github, a finished run pushes its integration branch
+   * (fast-forward only, never the base) and keeps one draft pull request. CI
+   * and reviews count only for the pushed head; what they ask for becomes a
+   * work order through the usual pipeline, up to the policy's limit. Agents
+   * never push, and nothing here merges the pull request or deploys.
+   */
+  const github = (run: Run) => new GitHubClient({ apiUrl: pinnedPolicy(run).delivery.apiUrl, token: () => process.env.SF_GITHUB_TOKEN || undefined });
+  const short = (sha: string | null) => (sha ?? "").slice(0, 12);
+  const EVIDENCE_MARKER = "<!-- software-factory evidence -->";
+
+  function saveDelivery(run: Run, patch: Partial<Delivery>): Delivery {
+    const next = { ...(ledger.getRun(run.id)?.delivery as Delivery), ...patch };
+    ledger.updateRun(run.id, { delivery: next });
+    changed(run.id);
+    return next;
+  }
+
+  async function startDelivery(run: Run) {
+    const policy = pinnedPolicy(run).delivery;
+    const url = (await git(workspace, ["remote", "get-url", policy.remote], { allowFail: true })).stdout.trim();
+    const repository = policy.repository ?? repositoryOf(url);
+    if (!repository) throw new Error(`Delivery can't tell the GitHub repository from the remote "${policy.remote}" (${url || "missing"}). Set delivery.repository in .factory/policy.yml.`);
+    const delivery: Delivery = (run.delivery as Delivery | null) ?? {
+      repository,
+      remote: policy.remote,
+      pushedSha: null,
+      pr: null,
+      status: "pushing",
+      waitingSince: null,
+      repairs: 0,
+      extraRepairs: 0,
+      checks: [],
+      approvals: 0,
+      blocked: null,
+      evidenceFor: null,
+    };
+    // The integration worktree stays: CI and review fixes merge there.
+    moveRun(run, "delivering", { patch: { delivery: { ...delivery, status: "pushing", blocked: null } }, action: "autopilot.delivery_started", data: { repository, branch: run.integrationBranch } });
+  }
+
+  /** Pushes `sha` to the run's branch on the remote: a fast-forward, with the token in this push's environment only. */
+  async function push(run: Run, d: Delivery, sha: string): Promise<string | null> {
+    const branch = run.integrationBranch;
+    if (!branch.startsWith("autopilot/") || branch === run.baseBranch) return `The factory pushes only autopilot/ branches, never ${branch}.`;
+    const url = (await git(workspace, ["remote", "get-url", d.remote], { allowFail: true })).stdout.trim();
+    if (!url) return `The workspace has no git remote "${d.remote}".`;
+    const token = process.env.SF_GITHUB_TOKEN;
+    const env: Record<string, string> = { GIT_TERMINAL_PROMPT: "0" };
+    if (token && /^https:\/\//i.test(url)) {
+      Object.assign(env, { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "http.extraHeader", GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}` });
+    }
+    const r = await git(workspace, ["push", "--porcelain", d.remote, `${sha}:refs/heads/${branch}`], { allowFail: true, env });
+    if (r.code === 0) return null;
+    const out = (token ? `${r.stderr}\n${r.stdout}`.split(token).join("***") : `${r.stderr}\n${r.stdout}`).trim();
+    if (/rejected|non-fast-forward|fetch first|stale info/i.test(out)) {
+      return `The remote's ${branch} has commits the factory didn't make, so it refused the push. The factory never force-pushes: look at that branch, then try again.`;
+    }
+    if (/could not resolve host|unable to access|timed out|could not connect|connection (refused|reset)/i.test(out)) throw new GitHubError(0, "The remote is unreachable for the push.");
+    return `The push of ${branch} failed: ${clip(out, 400)}`;
+  }
+
+  /** Waits for a person: try again, finish here, or cancel. */
+  function blockDelivery(run: Run, reason: string) {
+    ledger.transaction(() => {
+      saveDelivery(run, { status: "blocked", blocked: reason });
+      openItem(
+        run,
+        "delivery",
+        `Delivery of ${run.change} needs you`,
+        `${reason}\n\nTry again once it's sorted out, finish the run here (the branch and pull request stay as they are), or cancel the run.`,
+        DELIVERY,
+      );
+    });
+    record(SYSTEM, "autopilot.delivery_blocked", run.id, { reason: clip(reason) });
+  }
+
+  /** The pull request's description: what made it, and that people merge it. */
+  function pullBody(run: Run) {
+    const rows = ledger
+      .listWorkOrders(run.id)
+      .filter((w) => w.state === "merged")
+      .map((w) => `| WO-${w.seq} | ${w.title.replaceAll("|", "\\|")} | ${w.mergedBy ?? ""} |`);
+    return [
+      `<!-- software-factory run: ${run.id} -->`,
+      `Opened by the Software Factory (run \`${run.id}\`) from \`${run.integrationBranch}\`. The specification is in \`openspec/changes/${run.change}/\`.`,
+      "",
+      "| Work order | Title | Merged by |",
+      "| --- | --- | --- |",
+      ...rows,
+      "",
+      "The factory keeps this pull request a draft and never merges it: a person marks it ready and merges it.",
+    ].join("\n");
+  }
+
+  /** The evidence comment for the pushed head; after the run finishes, it carries the evidence packet's digest. */
+  function evidenceComment(run: Run, d: Delivery, digest?: string) {
+    const lines = ledger
+      .listWorkOrders(run.id)
+      .filter((w) => w.state === "merged")
+      .map((w) => {
+        const v = ledger.listChecks({ runId: run.id, workOrderId: w.id }).findLast((c) => c.name === "verified" && c.ok);
+        const meta = (v?.meta ?? {}) as { scanStatus?: string; hiddenStatus?: string };
+        return `- WO-${w.seq}: ${v ? `verified at \`${short(v.sha)}\`` : "verified before commit binding"}${meta.scanStatus ? `, scan ${meta.scanStatus}` : ""}${meta.hiddenStatus ? `, hidden tests ${meta.hiddenStatus}` : ""}`;
+      });
+    const pinned = verificationOf(run)?.source ?? "not recorded";
+    return [
+      EVIDENCE_MARKER,
+      `**Software Factory evidence for \`${short(d.pushedSha)}\`** (run \`${run.id}\`, policy \`${run.policyHash ?? "default"}\`, checks pinned from: ${pinned})`,
+      "",
+      ...lines,
+      "",
+      digest
+        ? `Evidence packet digest (sha256, sf-canonical-json-v1): \`${digest}\`. The packet itself is kept by the factory.`
+        : "The evidence packet and its digest are available from the factory once the run finishes.",
+    ].join("\n");
+  }
+
+  /** The newest review state each person left on `sha` (a comment doesn't change it). */
+  const reviewsAt = (reviews: Review[], sha: string) => {
+    const latest = new Map<string, Review>();
+    for (const r of reviews) if (r.commit === sha && r.state !== "COMMENTED") latest.set(r.user, r);
+    return [...latest.values()];
+  };
+
+  async function deliverStep(run: Run) {
+    let d = run.delivery as Delivery;
+    if (d.status === "blocked" || d.status === "repairing") return;
+    const policy = pinnedPolicy(run).delivery;
+    const gh = github(run);
+    const sha = await headSha(workspace, run.integrationBranch);
+    if (d.pushedSha !== sha) {
+      const refused = await push(run, d, sha);
+      if (refused) return blockDelivery(run, refused);
+      d = saveDelivery(run, { pushedSha: sha, waitingSince: now(), checks: [], approvals: 0, status: "waiting" });
+      record(SYSTEM, "autopilot.branch_pushed", run.id, { remote: d.remote, branch: run.integrationBranch, sha });
+    }
+    if (!d.pr) {
+      // One pull request per branch: a restart finds the one it opened instead of opening another.
+      const found = await gh.findPull(d.repository, run.integrationBranch, run.baseBranch);
+      const pr = found ?? (await gh.createPull(d.repository, { title: `Autopilot: ${run.change}`, head: run.integrationBranch, base: run.baseBranch, body: pullBody(run) }));
+      d = saveDelivery(run, { pr: { number: pr.number, url: pr.url } });
+      record(SYSTEM, found ? "autopilot.pull_request_found" : "autopilot.pull_request_opened", run.id, { repository: d.repository, number: pr.number, url: pr.url });
+    }
+    const pr = d.pr as { number: number; url: string };
+    const pull = await gh.getPull(d.repository, pr.number);
+    if (pull.merged) return finishDelivery(run, d, "merged", SYSTEM);
+    if (pull.state === "closed") return blockDelivery(run, `Pull request #${pr.number} was closed without merging.`);
+    if (pull.headSha !== d.pushedSha) {
+      return blockDelivery(run, `The pull request's head is ${short(pull.headSha)}, not the ${short(d.pushedSha)} the factory pushed: someone else pushed to ${run.integrationBranch}. The factory doesn't overwrite it.`);
+    }
+    if (d.evidenceFor !== d.pushedSha) {
+      await gh.upsertComment(d.repository, pr.number, EVIDENCE_MARKER, evidenceComment(run, d));
+      d = saveDelivery(run, { evidenceFor: d.pushedSha });
+    }
+    // CI and reviews on exactly the pushed head: results for older commits don't count.
+    const reported = await gh.checks(d.repository, sha);
+    const checks = policy.requiredChecks.length
+      ? policy.requiredChecks.map((name) => reported.find((c) => c.name === name) ?? { name, state: "pending" as const, summary: "Not reported yet." })
+      : reported;
+    const reviews = reviewsAt(await gh.reviews(d.repository, pr.number), sha);
+    const changes = reviews.filter((r) => r.state === "CHANGES_REQUESTED");
+    const failing = checks.filter((c) => c.state === "failure");
+    d = saveDelivery(run, { checks, approvals: reviews.filter((r) => r.state === "APPROVED").length });
+    if (failing.length || changes.length) {
+      const comments = changes.length ? (await gh.reviewComments(d.repository, pr.number)).filter((c) => c.commit === sha) : [];
+      return repairDelivery(run, d, failing, changes, comments);
+    }
+    if (checks.length && checks.every((c) => c.state === "success")) return finishDelivery(run, d, "passed", SYSTEM);
+    if (Date.now() - Date.parse(d.waitingSince ?? now()) > policy.ciTimeoutMinutes * 60_000) {
+      const missing = checks.filter((c) => c.state === "pending").map((c) => c.name);
+      return blockDelivery(run, missing.length ? `CI hasn't finished on ${short(sha)} after ${policy.ciTimeoutMinutes} minutes: ${missing.join(", ")}.` : `No CI reported on ${short(sha)} within ${policy.ciTimeoutMinutes} minutes.`);
+    }
+  }
+
+  /** What CI or a reviewer asks for becomes one more work order, built, verified and merged like the others. */
+  function repairDelivery(run: Run, d: Delivery, failing: CheckResult[], changes: Review[], comments: ReviewComment[]) {
+    const allowed = pinnedPolicy(run).delivery.maxCiRepairs + d.extraRepairs;
+    if (d.repairs >= allowed) {
+      return blockDelivery(run, `The pull request still has ${failing.length ? `failing checks (${failing.map((c) => c.name).join(", ")})` : "requested changes"} after ${d.repairs} repair round(s), the policy's limit.`);
+    }
+    const findings: Finding[] = [
+      ...failing.map((c): Finding => ({ source: "integration", severity: "high", title: `CI check "${c.name}" fails on the pull request`, detail: c.summary })),
+      ...changes.map((r): Finding => ({ source: "review", severity: "high", title: `${r.user || "A reviewer"} requested changes on the pull request`, detail: r.body })),
+      ...comments.map((c): Finding => ({ source: "review", severity: "medium", title: c.body, detail: "", file: c.line ? `${c.path}:${c.line}` : c.path })),
+    ];
+    const wos = ledger.listWorkOrders(run.id);
+    const seq = Math.max(...wos.map((w) => w.seq)) + 1;
+    const source = failing.length ? "ci" : "review";
+    ledger.transaction(() => {
+      ledger.addWorkOrders(run.id, [
+        {
+          seq,
+          title: source === "ci" ? `Fix the pull request's CI: ${failing.map((c) => c.name).join(", ")}` : "Address the pull request's review",
+          acceptance: [...failing.map((c) => `CI check "${c.name}" passes`), ...(changes.length ? ["The changes the reviewers requested are made"] : [])],
+          controls: [],
+          dependsOn: [],
+          wave: Math.max(...wos.map((w) => w.wave)) + 1,
+          risk: "medium",
+          findings,
+          source,
+        },
+      ]);
+      saveDelivery(run, { repairs: d.repairs + 1, status: "repairing" });
+      moveRun(run, "building", { action: "autopilot.delivery_repair", data: { workOrder: `WO-${seq}`, source, checks: failing.map((c) => c.name), reviews: changes.length } });
+    });
+  }
+
+  /** Delivered: CI passed on the head, or a person merged the pull request or finished here. The worktree goes; the pull request stays for people. */
+  async function finishDelivery(run: Run, d: Delivery, how: "passed" | "merged" | "finished", actor: string) {
+    if (run.integrationDir) await removeWorktree(workspace, run.integrationDir).catch(warn);
+    moveRun(run, "done", {
+      actor,
+      patch: { integrationDir: null, resumeState: null, delivery: { ...d, status: how, blocked: null } },
+      action: "autopilot.run_completed",
+      data: { branch: run.integrationBranch, sha: d.pushedSha ?? (await headSha(workspace, run.integrationBranch)), costUsd: ledger.runCost(run.id), pullRequest: d.pr?.number ?? null, delivery: how },
+    });
+    // The finished run's evidence digest goes onto the pull request too (best effort: the run is done either way).
+    if (d.pr) {
+      try {
+        const evidence = await exportEvidence(ledger, workspace, run.id, actor);
+        await github(run).upsertComment(d.repository, d.pr.number, EVIDENCE_MARKER, evidenceComment(run, d, evidence.digest.value));
+      } catch (err) {
+        warn(err);
+      }
+    }
   }
 
   // ---- the scheduler ----
@@ -1781,6 +2040,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (run?.state === "spec") await specStep(run);
     else if (run?.state === "critic") await criticStep(run);
     else if (run?.state === "building") await buildStep(run);
+    else if (run?.state === "delivering") await deliverStep(run);
   }
 
   /** Cheap: hands each live run to advance(), skipping runs that are still busy, and removes containers no attempt needs. */
@@ -2051,6 +2311,17 @@ export function createOrchestrator(deps: OrchestratorDeps) {
           moveRun(run, "spec", { actor });
           return queueFollowUp(specAttempt(run), answerFollowUp(note ?? ""), "answer");
         });
+      case "delivery:retry": {
+        // Back to work: past the repair limit that's one more round; after a CI timeout, another wait.
+        const d = run.delivery as Delivery;
+        const atLimit = d.repairs >= pinnedPolicy(run).delivery.maxCiRepairs + d.extraRepairs;
+        saveDelivery(run, { status: d.pushedSha ? "waiting" : "pushing", blocked: null, waitingSince: now(), extraRepairs: d.extraRepairs + (atLimit ? 1 : 0) });
+        record(actor, "autopilot.delivery_retried_by_person", run.id, { extraRepairs: d.extraRepairs + (atLimit ? 1 : 0) });
+        return;
+      }
+      case "delivery:finish":
+        await finishDelivery(run, run.delivery as Delivery, "finished", actor);
+        return;
       case "undelivered:resend": {
         // The same message (and marker) goes again; if the first did arrive, the agent sees it twice, as the person chose.
         const cmd = commandOf(item);
@@ -2223,6 +2494,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       },
       verification: await verificationStatus(policy ?? DEFAULT_POLICY),
       scheduler: schedulerStatus(),
+      // Whether a run started now would deliver, and whether the token it needs is there (never the token).
+      delivery: { mode: (policy ?? DEFAULT_POLICY).delivery.mode, repository: (policy ?? DEFAULT_POLICY).delivery.repository, tokenSet: !!process.env.SF_GITHUB_TOKEN },
       openInbox: ledger.openInboxCount(),
       activeRuns: ledger.listRuns().filter((r) => !TERMINAL.has(r.state)).length,
     };

@@ -6,7 +6,7 @@ import { HTTPException } from "hono/http-exception";
 import { LOCAL_USER } from "../config.js";
 import { EvidenceConflict } from "./evidence.js";
 import { StaleWorker, type Attempt, type Check, type InboxItem, type Run, type WorkOrder } from "./ledger.js";
-import { Standby, type Orchestrator, type Verification } from "./orchestrator.js";
+import { Standby, type Delivery, type Orchestrator, type Verification } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
 
 // Work-order states that count as in progress.
@@ -53,6 +53,13 @@ function verificationView(run: Run) {
     hiddenTests: !v || !policy.hiddenTests.enabled ? "off" : (v.hiddenTests?.files.length ?? "pending"),
     scan: v ? policy.verification.trivy.mode : "off",
   };
+}
+
+/** The delivered pull request and CI on its pushed head; null unless the run delivers. */
+function deliveryView(run: Run) {
+  const d = run.delivery as Delivery | null;
+  if (!d) return null;
+  return { repository: d.repository, status: d.status, pushedSha: d.pushedSha, pr: d.pr, checks: d.checks, approvals: d.approvals, repairs: d.repairs, blocked: d.blocked };
 }
 
 export function createAutopilotRoutes(o: Orchestrator) {
@@ -113,6 +120,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       policyHash: run.policyHash,
       execution: { provider: pinnedPolicy(run).execution.provider, isolated: pinnedPolicy(run).execution.provider === "container" },
       verification: verificationView(run),
+      delivery: deliveryView(run),
       createdBy: run.createdBy,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -148,6 +156,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       round: last?.turns ?? 0,
       conversationId: last?.conversationId ?? null,
       findings: wo.findings,
+      source: wo.source,
       mergedBy: wo.mergedBy,
       updatedAt: wo.updatedAt,
     };

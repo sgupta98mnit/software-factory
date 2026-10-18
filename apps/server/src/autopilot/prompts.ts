@@ -74,23 +74,31 @@ export function criticBrief(o: { change: string }): string {
  */
 export function builderBrief(o: {
   change: string;
-  wo: Pick<WorkOrder, "seq" | "title" | "acceptance" | "controls" | "branch" | "findings">;
+  wo: Pick<WorkOrder, "seq" | "title" | "acceptance" | "controls" | "branch" | "findings"> & Partial<Pick<WorkOrder, "source">>;
   gates?: Gate[] | null;
   isolated?: boolean;
 }): string {
   const { wo } = o;
+  // A fix the delivered pull request needs has no task group: what to fix is its findings.
+  const fix = wo.source === "ci" || wo.source === "review";
   const checks = o.gates?.length
     ? `When you finish, the factory runs these checks itself, in this order: ${o.gates.map((g) => `${g.name} (\`${g.run}\`${g.cwd ? ` in \`${g.cwd}/\`` : ""})`).join(", ")}. Make them pass.`
     : "When you finish, the factory runs these checks itself: `npm run typecheck`, `npm run lint` and `npm run test` in every package (this folder and one folder down) that has those scripts, after installing dependencies where node_modules is missing. Make them pass. There must be at least one `test` script.";
   return [
     `You are a builder in a Software Factory Autopilot run. Build work order WO-${wo.seq}: ${wo.title}.`,
     "",
-    `It comes from the OpenSpec change in \`openspec/changes/${o.change}/\`. Read proposal.md, design.md, the scenarios in specs/ and task group ${wo.seq} in tasks.md before you start.`,
+    fix
+      ? `It fixes the pull request delivered for the OpenSpec change in \`openspec/changes/${o.change}/\`: ${wo.source === "ci" ? "its CI fails" : "a reviewer asked for changes"}. The change's proposal, design and scenarios still apply.`
+      : `It comes from the OpenSpec change in \`openspec/changes/${o.change}/\`. Read proposal.md, design.md, the scenarios in specs/ and task group ${wo.seq} in tasks.md before you start.`,
     "",
     "Acceptance criteria (write tests for each one):",
     ...wo.acceptance.map((a, i) => `${i + 1}. ${a}`),
     ...(wo.controls.length ? ["", `Security controls this work order must meet, as design.md describes them: ${wo.controls.join(", ")}.`] : []),
-    ...(wo.findings?.length ? ["", "A previous attempt at this work order failed:", "", clusterFindings(wo.findings), "", "Start from the code as it is now and avoid those problems."] : []),
+    ...(wo.findings?.length
+      ? fix
+        ? ["", "What to fix:", "", clusterFindings(wo.findings)]
+        : ["", "A previous attempt at this work order failed:", "", clusterFindings(wo.findings), "", "Start from the code as it is now and avoid those problems."]
+      : []),
     "",
     `${checks} Then a reviewer reads your diff against the acceptance criteria and the scenarios.`,
     "",

@@ -91,6 +91,7 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
       policyHash: policyHash(DEFAULT_POLICY), // no policy.yml: the defaults, pinned
       execution: { provider: "local", isolated: false },
       verification: { pinned: "worktree", gates: [], hiddenTests: "off", scan: "off" }, // nothing on the base to pin
+      delivery: null,
       createdBy: "user:tester",
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -229,6 +230,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
       execution: { provider: "local", isolated: false, required: false, image: null, network: null, preflight: null },
       verification: { hiddenTests: false, protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"], scanner: { mode: "off", ok: null, version: null, dbUpdatedAt: null, problem: null } },
       scheduler: { active: true, heldBy: null },
+      delivery: { mode: "none", repository: null, tokenSet: !!process.env.SF_GITHUB_TOKEN },
       openInbox: 0,
       activeRuns: 0,
     });

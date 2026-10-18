@@ -53,6 +53,16 @@ export interface Policy {
   hiddenTests: { enabled: boolean; run: string };
   notify: { digestHour: number };
   execution: { provider: "local" | "container"; container: ContainerPolicy };
+  /** Where a finished run goes: nowhere (the integration branch stays local) or a draft pull request on GitHub. */
+  delivery: {
+    mode: "none" | "github";
+    remote: string; // the workspace's git remote to push to
+    repository: string | null; // "owner/name"; null = read from the remote's URL
+    apiUrl: string; // GitHub Enterprise Server: https://<host>/api/v3
+    requiredChecks: string[]; // check names that must pass on the pull request's head; [] = every check that reports
+    ciTimeoutMinutes: number;
+    maxCiRepairs: number; // rounds of CI or review fixes before a person is asked
+  };
   /** An agent with no new conversation event or cost for this long is stopped and handled as failed; 0: never. */
   watchdog: { idleMinutes: number };
   verification: {
@@ -104,6 +114,7 @@ export const DEFAULT_POLICY: Policy = {
       startTimeoutSec: 120,
     },
   },
+  delivery: { mode: "none", remote: "origin", repository: null, apiUrl: "https://api.github.com", requiredChecks: [], ciTimeoutMinutes: 120, maxCiRepairs: 2 },
   watchdog: { idleMinutes: 90 },
   verification: {
     protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"],
@@ -198,6 +209,13 @@ const RULES: Record<string, Rule> = {
   ...Object.fromEntries(Object.keys(DEFAULT_POLICY.agents).map((role) => [`execution.container.credentials.${role}`, listOf(credential)])),
   "execution.container.startTimeoutSec": seconds,
   "watchdog.idleMinutes": whole(0, 1440),
+  "delivery.mode": oneOf(["none", "github"]),
+  "delivery.remote": matching(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, "a git remote name"),
+  "delivery.repository": nullable(matching(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'a GitHub repository like "owner/name"')),
+  "delivery.apiUrl": matching(/^(https:\/\/\S+|http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/\S*)?)$/, "an https URL (http only on this machine)"),
+  "delivery.requiredChecks": listOf(text),
+  "delivery.ciTimeoutMinutes": whole(1, 10080),
+  "delivery.maxCiRepairs": whole(0, 20),
   "verification.protectedPaths": listOf(text),
   "verification.trivy.mode": oneOf(["off", "advisory", "required"]),
   "verification.trivy.version": nullable(matching(/^\d+\.\d+\.\d+$/, 'a version like "0.58.1"')),

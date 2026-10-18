@@ -19,6 +19,7 @@ export type RunState =
   | "awaiting_answers"
   | "awaiting_plan_approval"
   | "building"
+  | "delivering"
   | "done"
   | "paused"
   | "failed"
@@ -48,7 +49,8 @@ export type InboxKind =
   | "run_paused"
   | "error"
   | "release"
-  | "undelivered";
+  | "undelivered"
+  | "delivery";
 export type Risk = "low" | "medium" | "high";
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -85,6 +87,7 @@ export interface Run {
   policyHash: string | null;
   policy: unknown; // the effective policy pinned for the run, null until set
   verification: unknown; // Verification (orchestrator.ts): the pinned checks and hidden tests; null for runs from before it
+  delivery: unknown; // Delivery (orchestrator.ts): the pushed branch, pull request and CI; null unless the policy delivers
   specConversation: string | null;
   createdBy: string;
   createdAt: string;
@@ -111,6 +114,7 @@ export interface WorkOrder {
   findings: Finding[] | null; // what triggered the latest repair
   budgetExtraUsd: number;
   mergedBy: string | null; // "policy@<hash>" or "user:<name>"
+  source: "plan" | "ci" | "review"; // tasks.md, or a fix the delivered pull request needs
   updatedAt: string;
 }
 
@@ -348,8 +352,14 @@ ALTER TABLE attempts ADD COLUMN last_event TEXT;
 ALTER TABLE inbox ADD COLUMN ref TEXT;
 `;
 
+// v5: delivery: the run's pull request and CI, and work orders that fix them.
+const SCHEMA_V5 = `
+ALTER TABLE runs ADD COLUMN delivery TEXT;
+ALTER TABLE work_orders ADD COLUMN source TEXT NOT NULL DEFAULT 'plan';
+`;
+
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
-const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "runtime", "meta", "verification"]);
+const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "runtime", "meta", "verification", "delivery"]);
 const FLAG_COLUMNS = new Set(["seen_running", "ok"]);
 const toColumn = (field: string) => field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toField = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -403,6 +413,7 @@ export function openLedger(file: string) {
   if (version < 2) transaction(() => db.exec(`${SCHEMA_V2}\nPRAGMA user_version = 2;`));
   if (version < 3) transaction(() => db.exec(`${SCHEMA_V3}\nPRAGMA user_version = 3;`));
   if (version < 4) transaction(() => db.exec(`${SCHEMA_V4}\nPRAGMA user_version = 4;`));
+  if (version < 5) transaction(() => db.exec(`${SCHEMA_V5}\nPRAGMA user_version = 5;`));
 
   // Fencing: once a process holds the scheduler lease, every write checks it still does.
   let fenceToken: { name: string; owner: string; generation: number } | null = null;

@@ -93,6 +93,7 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 | `SF_REQUIRE_ISOLATION` | none | `1` refuses to run agents or their code on this machine: runs need `execution.provider: container` and a passing isolation check, whatever the workspace policy says |
 | `SF_DOCKER` | `docker` | The Docker CLI Autopilot uses for isolated execution |
 | `SF_TRIVY` | `trivy` | The Trivy binary Autopilot's security scan runs |
+| `SF_GITHUB_TOKEN` | none | Token for pull request delivery: fine-grained, one repository, Contents read/write, Pull requests read/write, Checks and Commit statuses read |
 | `SF_TRIVY_SHA256` | none | The Trivy binary's sha256; with it set, `SF_TRIVY` must be the binary's full path and any other binary is refused |
 
 ## Autopilot policy
@@ -129,6 +130,14 @@ execution:
     startTimeoutSec: 120
 hiddenTests: { enabled: false, run: "node --test" }  # a test writer's independent tests run on every work order
 watchdog: { idleMinutes: 90 }                        # stop an agent with no new event or cost for this long; 0 = never
+delivery:
+  mode: none                                         # none (the branch stays local) or github (push it and open a draft pull request)
+  remote: origin
+  repository: null                                   # "owner/name"; null = from the remote's URL
+  apiUrl: "https://api.github.com"                   # GitHub Enterprise Server: https://<host>/api/v3
+  requiredChecks: []                                 # checks that must pass on the pushed head; [] = every reported check
+  ciTimeoutMinutes: 120
+  maxCiRepairs: 2                                    # CI or review fix rounds before a person decides
 verification:
   protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"]   # put back when a work order changes them
   trivy:
@@ -140,7 +149,7 @@ verification:
     timeoutSec: 600
 ```
 
-A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` and `notify` are accepted for features still to come; `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification).
+A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` and `notify` are accepted for features still to come; `delivery` is described under [Pull request delivery](#pull-request-delivery); `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification).
 
 Autopilot checks reported conversation costs before starting more work and after each poll. At the run limit (the amount entered in Home, or `budget.perChangeUsd`), it pauses the run's agents and opens a budget decision in the Inbox. At a work order's limit, it pauses that order while the others continue. Continue adds the policy's base budget to the relevant limit; Skip ends that work order; Cancel ends the run. Limits and decisions persist across restarts, and a normal Resume cannot bypass a run budget decision. Spending can rise between checks or while a pause request completes; enforcement depends on the agent server reporting costs.
 
@@ -172,6 +181,12 @@ Every follow-up message to an agent (a repair, a validation fix, your answers or
 One factory process acts on a data folder at a time. The running process renews a lease every few seconds. A second process stands by (Home says so) and takes over when the first stops, at once if the first process is gone, otherwise when its lease expires. After a takeover the old process's writes are refused, and it stops.
 
 The watchdog stops an agent that has produced no new conversation event and no new cost for `watchdog.idleMinutes` (90 by default; 0 turns it off), and the run handles it like any agent that stopped with an error. API clients can send an `Idempotency-Key` header (8–200 letters, digits, `-` or `_`) with `POST /runs`, the pause, resume and cancel actions, and Inbox decisions: a repeated key returns the first answer for a day.
+
+## Pull request delivery
+
+With `delivery.mode: github`, a run whose work orders are merged pushes its integration branch, `autopilot/<change>`, to `delivery.remote` and opens a draft pull request into the base branch. The factory only fast-forwards `autopilot/` branches: it never pushes the base branch, never force-pushes, and never marks the pull request ready, merges it or deploys. People do that. Give it a fine-grained token in `SF_GITHUB_TOKEN`, limited to the one repository, with Contents read and write (to push), Pull requests read and write, and Checks and Commit statuses read. The token goes only into request headers and the push's own environment, never into arguments, the ledger, the audit log or a comment.
+
+The pull request's description names the run, and its evidence comment is updated for each pushed head; when the run finishes, the comment shows the evidence packet's digest. A restart finds the run's pull request again instead of opening a second one. CI and reviews count only on the exact pushed head: `delivery.requiredChecks` must all pass there (with an empty list, every reported check must). A failing check, or changes a reviewer requested on that head, becomes a new work order marked as a CI or review fix, built, verified, reviewed and merged like the others. The new head is then pushed and checked again. After `delivery.maxCiRepairs` rounds, when CI takes longer than `delivery.ciTimeoutMinutes`, or when someone else pushed to the branch or closed the pull request, the run waits in the Inbox, where you try again, finish the run there, or cancel it. A pull request a person merges ends the run. Delivery has been tested against a stand-in GitHub API with a local repository as the remote, not yet against github.com.
 
 ## Run evidence
 
