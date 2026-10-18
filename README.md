@@ -84,7 +84,12 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 | --- | --- | --- |
 | `SF_WORKSPACE` | `workspaces/benefits-portal` | The repo agents work in |
 | `SF_AGENT_WORKSPACE` | same as `SF_WORKSPACE` | That repo's path as the agent server sees it (set it when agents run in Docker) |
-| `SF_USER` | your Windows user name | Name recorded in the audit log |
+| `SF_USER` | your Windows user name | Name recorded in the audit log when nobody signs in |
+| `SF_AUTH` | `local` | `oidc` signs people in with the agency's identity provider (see [Sign-in and roles](#sign-in-and-roles)) |
+| `SF_OIDC_ISSUER`, `SF_OIDC_CLIENT_ID` | none | The OpenID Connect issuer and this factory's client id; `SF_OIDC_CLIENT_SECRET` only for a confidential client |
+| `SF_OIDC_REDIRECT_URI` | `http://localhost:8000/sf-api/auth/callback` | Where the identity provider sends people back |
+| `SF_OIDC_ROLES_CLAIM`, `SF_OIDC_ROLE_MAP` | `roles`, none | Which claim holds roles, and how its values map to factory roles |
+| `SF_LOCAL_ROLES` | every role | The roles this machine's user has when nobody signs in |
 | `SF_PORT` | `4317` | Factory API port. If you change it, change `SF_API_URL` in `canvas\.env` too |
 | `SF_DATA_DIR` | `data` | Where the audit log, the Autopilot ledger (`autopilot.db`) and its worktrees are kept |
 | `SF_AGENT_SERVER_URL` | `http://127.0.0.1:8000` | Where Autopilot reaches the OpenHands agent server (Canvas's address) |
@@ -187,6 +192,22 @@ The watchdog stops an agent that has produced no new conversation event and no n
 With `delivery.mode: github`, a run whose work orders are merged pushes its integration branch, `autopilot/<change>`, to `delivery.remote` and opens a draft pull request into the base branch. The factory only fast-forwards `autopilot/` branches: it never pushes the base branch, never force-pushes, and never marks the pull request ready, merges it or deploys. People do that. Give it a fine-grained token in `SF_GITHUB_TOKEN`, limited to the one repository, with Contents read and write (to push), Pull requests read and write, and Checks and Commit statuses read. The token goes only into request headers and the push's own environment, never into arguments, the ledger, the audit log or a comment.
 
 The pull request's description names the run, and its evidence comment is updated for each pushed head; when the run finishes, the comment shows the evidence packet's digest. A restart finds the run's pull request again instead of opening a second one. CI and reviews count only on the exact pushed head: `delivery.requiredChecks` must all pass there (with an empty list, every reported check must). A failing check, or changes a reviewer requested on that head, becomes a new work order marked as a CI or review fix, built, verified, reviewed and merged like the others. The new head is then pushed and checked again. After `delivery.maxCiRepairs` rounds, when CI takes longer than `delivery.ciTimeoutMinutes`, or when someone else pushed to the branch or closed the pull request, the run waits in the Inbox, where you try again, finish the run there, or cancel it. A pull request a person merges ends the run. Delivery has been tested against a stand-in GitHub API with a local repository as the remote, not yet against github.com.
+
+## Sign-in and roles
+
+By default (`SF_AUTH=local`) the factory acts as this machine's user, with every role; `SF_LOCAL_ROLES` (for example `engineer`) narrows them. Home says which mode it's in.
+
+With `SF_AUTH=oidc`, people sign in with the agency's identity provider (Entra ID, Okta or another OpenID Connect issuer) through Authorization Code with PKCE. Register a public client whose redirect URI is `SF_OIDC_REDIRECT_URI` (default `http://localhost:8000/sf-api/auth/callback`), then set `SF_OIDC_ISSUER` and `SF_OIDC_CLIENT_ID`. The factory checks the ID token's signature against the issuer's published keys (RS256 or ES256), its issuer, audience, expiry and nonce, and keeps only a hash of the session cookie (HttpOnly, SameSite=Strict, `SF_SESSION_HOURS`, 8 by default). Every request then needs a session, so an agent that reaches the API without a person's session changes nothing. The audit log names people by issuer and subject (`oidc:<sub>@<issuer host>`), not by display name.
+
+Roles come from the ID token claim `SF_OIDC_ROLES_CLAIM` (`roles` by default), mapped with `SF_OIDC_ROLE_MAP` (JSON such as `{"Factory-Approvers":"approver"}`; without it, claim values that are role names are used).
+
+| Role | May |
+| --- | --- |
+| engineer | start, pause, resume and cancel runs; answer questions; decide errors, failed work orders, undelivered messages and delivery problems; create and move work orders |
+| approver | approve specs, plans and merges; raise budgets; approve work orders |
+| isso | approve work orders that implement mapped security controls |
+| release_manager | approve or reject a finished run's release |
+| admin | make backups |
 
 ## Run evidence
 

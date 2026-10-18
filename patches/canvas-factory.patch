@@ -1,9 +1,9 @@
 diff --git a/__tests__/factory/autopilot.test.tsx b/__tests__/factory/autopilot.test.tsx
 new file mode 100644
-index 0000000..c0d2964
+index 0000000..b2d9ea6
 --- /dev/null
 +++ b/__tests__/factory/autopilot.test.tsx
-@@ -0,0 +1,745 @@
+@@ -0,0 +1,802 @@
 +import { screen, waitFor, within } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
 +import { http, HttpResponse } from "msw";
@@ -749,6 +749,63 @@ index 0000000..c0d2964
 +    useParamsMock.mockReset();
 +  });
 +});
++
++describe("Factory sign-in", () => {
++  it("offers sign-in when the API wants a signed-in person", async () => {
++    server.use(
++      http.get("*/sf-api/autopilot/runs", () =>
++        HttpResponse.json({ error: "Sign in first." }, { status: 401 }),
++      ),
++      http.get("*/sf-api/autopilot/status", () =>
++        HttpResponse.json({ error: "Sign in first." }, { status: 401 }),
++      ),
++      http.get("*/sf-api/health", () =>
++        HttpResponse.json({ error: "Sign in first." }, { status: 401 }),
++      ),
++      http.get("*/sf-api/auth/me", () =>
++        HttpResponse.json({ mode: "oidc", user: null }),
++      ),
++    );
++    renderWithProviders(
++      <MemoryRouter initialEntries={["/autopilot"]}>
++        <AutopilotHomeRoute />
++      </MemoryRouter>,
++    );
++    const card = await screen.findByTestId("factory-sign-in");
++    expect(within(card).getByRole("link", { name: "Sign in" })).toHaveAttribute(
++      "href",
++      expect.stringContaining("/sf-api/auth/login?return="),
++    );
++  });
++
++  it("says who is signed in and with which roles", async () => {
++    server.use(
++      http.get("*/sf-api/auth/me", () =>
++        HttpResponse.json({
++          mode: "oidc",
++          user: {
++            actor: "oidc:a1@idp",
++            name: "Ana Approver",
++            roles: ["approver"],
++          },
++        }),
++      ),
++    );
++    renderHome(
++      statusWith({
++        provider: "local",
++        isolated: false,
++        required: false,
++        image: null,
++        network: null,
++        preflight: null,
++      }),
++    );
++    expect(await screen.findByTestId("autopilot-who")).toHaveTextContent(
++      "Signed in as Ana Approver (approver)",
++    );
++  });
++});
 diff --git a/src/components/features/sidebar/sidebar-nav-link.tsx b/src/components/features/sidebar/sidebar-nav-link.tsx
 index 5c8f24d..bf98e67 100644
 --- a/src/components/features/sidebar/sidebar-nav-link.tsx
@@ -862,10 +919,10 @@ index 0000000..a8c56bc
 +  factory self-contained. Other Canvas languages fall back to English.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..879a6e8
+index 0000000..2510715
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,554 @@
+@@ -0,0 +1,571 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -1317,6 +1374,20 @@ index 0000000..879a6e8
 +  };
 +}
 +
++/** Who is acting: this machine's user (local mode) or the person signed in with the agency's identity provider. */
++export interface FactoryMe {
++  mode: "local" | "oidc";
++  user: { actor: string; name: string; roles: string[] } | null;
++}
++
++/** The factory API wants a signed-in person (SF_AUTH=oidc). */
++export class FactoryAuthError extends Error {
++  constructor() {
++    super("Sign in first.");
++    this.name = "FactoryAuthError";
++  }
++}
++
 +/** Thrown when the factory API can't be reached at all (server not running). */
 +export class FactoryOfflineError extends Error {
 +  constructor() {
@@ -1345,6 +1416,7 @@ index 0000000..879a6e8
 +    throw new FactoryOfflineError();
 +  }
 +  const data = isJson ? await response.json() : null;
++  if (response.status === 401 && isJson) throw new FactoryAuthError();
 +  if (!response.ok) {
 +    throw new Error(
 +      (data as { error?: string } | null)?.error ??
@@ -1359,6 +1431,8 @@ index 0000000..879a6e8
 +
 +export const FactoryApi = {
 +  health: () => request<FactoryHealth>("/health"),
++  me: () => request<FactoryMe>("/auth/me"),
++  signOut: () => post<{ ok: true }>("/auth/logout"),
 +  specs: () => request<SpecsOverview>("/specs"),
 +  change: (id: string) =>
 +    request<ChangeDetail>(`/specs/changes/${encodeURIComponent(id)}`),
@@ -1966,15 +2040,19 @@ index 0000000..8fbbd26
 +}
 diff --git a/src/factory/components/factory-page.tsx b/src/factory/components/factory-page.tsx
 new file mode 100644
-index 0000000..52cfa9a
+index 0000000..9fe2a85
 --- /dev/null
 +++ b/src/factory/components/factory-page.tsx
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,136 @@
 +import React from "react";
-+import { PlugZap } from "lucide-react";
++import { LogIn, PlugZap } from "lucide-react";
 +import { BrandButton } from "#/components/features/settings/brand-button";
 +import { cn } from "#/utils/utils";
-+import { FactoryOfflineError } from "../api";
++import {
++  FACTORY_API_BASE,
++  FactoryAuthError,
++  FactoryOfflineError,
++} from "../api";
 +import { useFactoryCopy } from "../copy";
 +import { useFactoryLiveUpdates } from "../hooks";
 +
@@ -2004,6 +2082,7 @@ index 0000000..52cfa9a
 +}: FactoryPageProps) {
 +  useFactoryLiveUpdates();
 +  const offline = error instanceof FactoryOfflineError;
++  const signIn = error instanceof FactoryAuthError;
 +
 +  return (
 +    <div data-testid={testId} className="flex h-full min-h-0 flex-col">
@@ -2014,7 +2093,7 @@ index 0000000..52cfa9a
 +            <p className="mt-1 text-sm text-muted">{subtitle}</p>
 +          ) : null}
 +        </div>
-+        {actions && !offline ? (
++        {actions && !offline && !signIn ? (
 +          <div className="flex shrink-0 flex-wrap items-center gap-2">
 +            {actions}
 +          </div>
@@ -2026,8 +2105,34 @@ index 0000000..52cfa9a
 +          fill ? "flex" : "overflow-y-auto custom-scrollbar-always",
 +        )}
 +      >
-+        {offline ? <FactoryOffline onRetry={onRetry} /> : children}
++        {offline ? <FactoryOffline onRetry={onRetry} /> : null}
++        {signIn ? <FactorySignIn /> : null}
++        {!offline && !signIn ? children : null}
 +      </div>
++    </div>
++  );
++}
++
++/** The factory signs people in with the agency's identity provider; this sends the browser there and back. */
++export function FactorySignIn() {
++  const copy = useFactoryCopy();
++  const back = `${window.location.pathname}${window.location.search}`;
++  return (
++    <div
++      data-testid="factory-sign-in"
++      className="mx-auto flex max-w-xl flex-col items-start gap-3 px-6 py-16"
++    >
++      <LogIn className="size-8 text-muted" aria-hidden />
++      <h2 className="text-base font-semibold text-foreground">
++        {copy.auth.title}
++      </h2>
++      <p className="text-sm text-muted">{copy.auth.body}</p>
++      <a
++        href={`${FACTORY_API_BASE}/auth/login?return=${encodeURIComponent(back)}`}
++        className="inline-flex h-9 items-center rounded-lg bg-primary px-3 text-sm font-medium text-on-primary hover:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-focus"
++      >
++        {copy.auth.signIn}
++      </a>
 +    </div>
 +  );
 +}
@@ -2421,10 +2526,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..d2f80f1
+index 0000000..494a356
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1107 @@
+@@ -0,0 +1,1128 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2452,6 +2557,17 @@ index 0000000..d2f80f1
 +    close: "Close",
 +    none: "None",
 +    workspace: "Workspace",
++  },
++  auth: {
++    title: "Sign in to use the factory",
++    body: "This factory signs people in with your agency's identity provider, and what you can approve depends on your roles.",
++    signIn: "Sign in",
++    signOut: "Sign out",
++    signedInAs: (name: string, roles: string) =>
++      `Signed in as ${name} (${roles})`,
++    localUser: (name: string, roles: string) =>
++      `Acting as this machine's user, ${name} (${roles}). Nobody signs in.`,
++    noRoles: "no roles",
 +  },
 +  offline: {
 +    title: "The Software Factory API isn't running",
@@ -2992,6 +3108,16 @@ index 0000000..d2f80f1
 +    close: "Cerrar",
 +    none: "Ninguno",
 +    workspace: "Espacio de trabajo",
++  },
++  auth: {
++    title: "Inicie sesión para usar la fábrica",
++    body: "Esta fábrica inicia sesión con el proveedor de identidad de su agencia, y lo que puede aprobar depende de sus funciones.",
++    signIn: "Iniciar sesión",
++    signOut: "Cerrar sesión",
++    signedInAs: (name, roles) => `Sesión iniciada como ${name} (${roles})`,
++    localUser: (name, roles) =>
++      `Actúa como el usuario de este equipo, ${name} (${roles}). Nadie inicia sesión.`,
++    noRoles: "sin funciones",
 +  },
 +  offline: {
 +    title: "La API de Software Factory no está en ejecución",
@@ -3614,10 +3740,10 @@ index 0000000..a6d27d9
 +}
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..332b6c0
+index 0000000..ad0e73b
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,284 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -3628,6 +3754,7 @@ index 0000000..332b6c0
 +import {
 +  FACTORY_API_BASE,
 +  FactoryApi,
++  FactoryAuthError,
 +  FactoryOfflineError,
 +  type Autonomy,
 +  type InboxFilter,
@@ -3652,14 +3779,25 @@ index 0000000..332b6c0
 +  inboxCount: ["factory", "autopilot", "inbox-count"] as const,
 +};
 +
-+// Don't hammer a server that isn't running; the offline card has a retry button.
++// Don't hammer a server that isn't running, or one that wants a sign-in; their cards have the next step.
 +const retry = (count: number, error: unknown) =>
-+  !(error instanceof FactoryOfflineError) && count < 2;
++  !(error instanceof FactoryOfflineError) &&
++  !(error instanceof FactoryAuthError) &&
++  count < 2;
 +
 +export const useFactoryHealth = () =>
 +  useQuery({
 +    queryKey: FACTORY_QUERY_KEYS.health,
 +    queryFn: FactoryApi.health,
++    retry,
++    staleTime: 60_000,
++    meta: { disableToast: true },
++  });
++
++export const useFactoryMe = () =>
++  useQuery({
++    queryKey: ["factory", "me"],
++    queryFn: FactoryApi.me,
 +    retry,
 +    staleTime: 60_000,
 +    meta: { disableToast: true },
@@ -4148,10 +4286,10 @@ index 0000000..aa8eaad
 +}
 diff --git a/src/factory/routes/autopilot-home.tsx b/src/factory/routes/autopilot-home.tsx
 new file mode 100644
-index 0000000..4074914
+index 0000000..6672ce1
 --- /dev/null
 +++ b/src/factory/routes/autopilot-home.tsx
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,611 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
@@ -4159,6 +4297,7 @@ index 0000000..4074914
 +  CircleCheck,
 +  FileCheck2,
 +  FolderGit2,
++  UserRound,
 +  Play,
 +  ShieldAlert,
 +  ShieldCheck,
@@ -4166,6 +4305,7 @@ index 0000000..4074914
 +} from "lucide-react";
 +import { BrandButton } from "#/components/features/settings/brand-button";
 +import { cn } from "#/utils/utils";
++import { FactoryApi } from "../api";
 +import type {
 +  AutopilotStatus,
 +  Autonomy,
@@ -4179,6 +4319,7 @@ index 0000000..4074914
 +  useCheckExecution,
 +  useCreateRun,
 +  useFactoryHealth,
++  useFactoryMe,
 +} from "../hooks";
 +import {
 +  FactoryError,
@@ -4491,6 +4632,7 @@ index 0000000..4074914
 +        </p>
 +      ) : null}
 +
++      <WhoLine />
 +      {status.data?.execution ? (
 +        <ExecutionLine execution={status.data.execution} />
 +      ) : null}
@@ -4558,6 +4700,37 @@ index 0000000..4074914
 +        </p>
 +      ) : null}
 +    </div>
++  );
++}
++
++/** Who the factory takes you for: this machine's user, or the person signed in, with their roles. */
++function WhoLine() {
++  const copy = useFactoryCopy();
++  const me = useFactoryMe().data;
++  if (!me?.user) return null;
++  const roles = me.user.roles.length
++    ? me.user.roles.join(", ")
++    : copy.auth.noRoles;
++  return (
++    <p data-testid="autopilot-who" className="flex items-start gap-2">
++      <UserRound className="mt-0.5 size-4 shrink-0 text-muted" aria-hidden />
++      <span className="min-w-0 break-words text-foreground">
++        {me.mode === "oidc"
++          ? copy.auth.signedInAs(me.user.name, roles)
++          : copy.auth.localUser(me.user.name, roles)}
++      </span>
++      {me.mode === "oidc" ? (
++        <button
++          type="button"
++          className="ml-auto shrink-0 rounded-md text-sm text-link hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-focus"
++          onClick={() => {
++            void FactoryApi.signOut().finally(() => window.location.reload());
++          }}
++        >
++          {copy.auth.signOut}
++        </button>
++      ) : null}
++    </p>
 +  );
 +}
 +

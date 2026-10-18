@@ -31,6 +31,7 @@ export type WorkOrderState =
   | "reviewing"
   | "ready"
   | "awaiting_merge_approval"
+  | "awaiting_control_approval"
   | "merging"
   | "merged"
   | "needs_attention"
@@ -50,7 +51,8 @@ export type InboxKind =
   | "error"
   | "release"
   | "undelivered"
-  | "delivery";
+  | "delivery"
+  | "control_approval";
 export type Risk = "low" | "medium" | "high";
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -88,6 +90,7 @@ export interface Run {
   policy: unknown; // the effective policy pinned for the run, null until set
   verification: unknown; // Verification (orchestrator.ts): the pinned checks and hidden tests; null for runs from before it
   delivery: unknown; // Delivery (orchestrator.ts): the pushed branch, pull request and CI; null unless the policy delivers
+  release: unknown; // Release (orchestrator.ts): the release decision and its envelope; null until one is asked for
   specConversation: string | null;
   createdBy: string;
   createdAt: string;
@@ -358,8 +361,27 @@ ALTER TABLE runs ADD COLUMN delivery TEXT;
 ALTER TABLE work_orders ADD COLUMN source TEXT NOT NULL DEFAULT 'plan';
 `;
 
+// v6: governance: signed-in sessions, small settings (a day's raised budget, a sent digest) and a run's release.
+const SCHEMA_V6 = `
+CREATE TABLE sessions (
+  id_hash TEXT PRIMARY KEY,
+  subject TEXT NOT NULL,
+  issuer TEXT NOT NULL,
+  name TEXT NOT NULL,
+  roles TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE kv (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+ALTER TABLE runs ADD COLUMN release TEXT;
+`;
+
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
-const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "runtime", "meta", "verification", "delivery"]);
+const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "runtime", "meta", "verification", "delivery", "release"]);
 const FLAG_COLUMNS = new Set(["seen_running", "ok"]);
 const toColumn = (field: string) => field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toField = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -414,6 +436,7 @@ export function openLedger(file: string) {
   if (version < 3) transaction(() => db.exec(`${SCHEMA_V3}\nPRAGMA user_version = 3;`));
   if (version < 4) transaction(() => db.exec(`${SCHEMA_V4}\nPRAGMA user_version = 4;`));
   if (version < 5) transaction(() => db.exec(`${SCHEMA_V5}\nPRAGMA user_version = 5;`));
+  if (version < 6) transaction(() => db.exec(`${SCHEMA_V6}\nPRAGMA user_version = 6;`));
 
   // Fencing: once a process holds the scheduler lease, every write checks it still does.
   let fenceToken: { name: string; owner: string; generation: number } | null = null;
@@ -719,6 +742,39 @@ export function openLedger(file: string) {
     db.prepare("INSERT OR IGNORE INTO requests (key, route, response, created_at) VALUES ($key, $route, $response, $at)").run({ key, route, response: JSON.stringify(response), at: now() });
   }
 
+  // Signed-in sessions (auth.ts): the cookie's sha256 is the key; sign-in isn't scheduler work, so no fencing
+
+  function createSession(x: { idHash: string; subject: string; issuer: string; name: string; roles: string[]; expiresAt: string }) {
+    db.prepare("DELETE FROM sessions WHERE expires_at < $now").run({ now: now() });
+    db.prepare("INSERT INTO sessions (id_hash, subject, issuer, name, roles, expires_at, created_at) VALUES ($idHash, $subject, $issuer, $name, $roles, $expiresAt, $at)").run({ ...x, roles: JSON.stringify(x.roles), at: now() });
+  }
+
+  function getSession(idHash: string): { subject: string; issuer: string; name: string; roles: string[]; expiresAt: string } | undefined {
+    const row = db.prepare("SELECT subject, issuer, name, roles, expires_at FROM sessions WHERE id_hash = $idHash").get({ idHash });
+    return row ? { subject: String(row.subject), issuer: String(row.issuer), name: String(row.name), roles: JSON.parse(String(row.roles)), expiresAt: String(row.expires_at) } : undefined;
+  }
+
+  function deleteSession(idHash: string) {
+    db.prepare("DELETE FROM sessions WHERE id_hash = $idHash").run({ idHash });
+  }
+
+  // Small settings: a day's raised budget, the last digest sent
+
+  function getKv(key: string): string | undefined {
+    const row = db.prepare("SELECT value FROM kv WHERE key = $key").get({ key });
+    return row ? String(row.value) : undefined;
+  }
+
+  function setKv(key: string, value: string) {
+    guard();
+    db.prepare("INSERT INTO kv (key, value, updated_at) VALUES ($key, $value, $at) ON CONFLICT(key) DO UPDATE SET value = $value, updated_at = $at").run({ key, value, at: now() });
+  }
+
+  /** A consistent copy of the whole ledger, for a backup. */
+  function snapshot(file: string) {
+    db.prepare("VACUUM INTO $file").run({ file });
+  }
+
   // Costs, summed from attempts
 
   function runCost(runId: string): number {
@@ -769,6 +825,12 @@ export function openLedger(file: string) {
     fence,
     recallRequest,
     rememberRequest,
+    createSession,
+    getSession,
+    deleteSession,
+    getKv,
+    setKv,
+    snapshot,
     transaction,
     close: () => db.close(),
   };

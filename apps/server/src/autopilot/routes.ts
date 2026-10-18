@@ -3,9 +3,10 @@
 // JSON, costs summed from attempts, nothing about prompts or keys.
 import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
+import { Forbidden, principalOf, ROLES, Unauthenticated, type Principal, type Role } from "../auth.js";
 import { LOCAL_USER } from "../config.js";
 import { EvidenceConflict } from "./evidence.js";
-import { StaleWorker, type Attempt, type Check, type InboxItem, type Run, type WorkOrder } from "./ledger.js";
+import { StaleWorker, type Attempt, type Check, type InboxItem, type InboxKind, type Run, type WorkOrder } from "./ledger.js";
 import { Standby, type Delivery, type Orchestrator, type Verification } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
 
@@ -62,13 +63,42 @@ function deliveryView(run: Run) {
   return { repository: d.repository, status: d.status, pushedSha: d.pushedSha, pr: d.pr, checks: d.checks, approvals: d.approvals, repairs: d.repairs, blocked: d.blocked };
 }
 
+/** Who decides each kind of Inbox item. Merge approvals can't stand in for an ISSO's, nor a person's for release. */
+export const DECIDES: Record<InboxKind, Role> = {
+  spec_approval: "approver",
+  plan_approval: "approver",
+  merge_approval: "approver",
+  budget_reached: "approver",
+  control_approval: "isso",
+  release: "release_manager",
+  questions: "engineer",
+  spec_failed: "engineer",
+  work_order_failed: "engineer",
+  run_paused: "engineer",
+  error: "engineer",
+  undelivered: "engineer",
+  delivery: "engineer",
+};
+
+// Mounted without the sign-in middleware (tests), the routes act for this machine's user with every role.
+const LOCAL: Principal = { actor: LOCAL_USER, name: LOCAL_USER.replace(/^user:/, ""), roles: [...ROLES], mode: "local" };
+
 export function createAutopilotRoutes(o: Orchestrator) {
   const { ledger } = o;
   const app = new Hono();
 
   // Errors: 404 for missing records, 409 for unavailable evidence or another process running Autopilot, otherwise 400.
   const conflict = (err: Error) => err instanceof EvidenceConflict || err instanceof Standby || err instanceof StaleWorker;
-  app.onError((err, c) => c.json({ error: err.message }, err instanceof HTTPException ? err.status : conflict(err) ? 409 : 400));
+  const status = (err: Error) =>
+    err instanceof HTTPException ? err.status : err instanceof Unauthenticated ? 401 : err instanceof Forbidden ? 403 : conflict(err) ? 409 : 400;
+  app.onError((err, c) => c.json({ error: err.message }, status(err)));
+
+  /** The person acting; with `role`, they must hold it. */
+  const who = (c: Context, role?: Role): Principal => {
+    const p = principalOf(c) ?? LOCAL;
+    if (role && !p.roles.includes(role)) throw new Forbidden(`This needs the ${role} role; ${p.name} has ${p.roles.length ? p.roles.join(", ") : "none"}.`);
+    return p;
+  };
 
   const body = async <T>(c: { req: { json: () => Promise<unknown> } }) => (await c.req.json().catch(() => ({}))) as T;
 
@@ -165,11 +195,12 @@ export function createAutopilotRoutes(o: Orchestrator) {
   app.get("/status", async (c) => c.json(await o.status()));
 
   // The checks a run started now would face, including a probe container when the policy isolates execution.
-  app.post("/execution/preflight", async (c) => c.json(await o.checkExecution(LOCAL_USER)));
+  app.post("/execution/preflight", async (c) => c.json(await o.checkExecution(who(c, "engineer").actor)));
 
   app.get("/runs", (c) => c.json(ledger.listRuns().map(summary)));
 
   app.post("/runs", async (c) => {
+    const actor = who(c, "engineer").actor;
     const b = await body<{ goal?: unknown; autonomy?: unknown; budgetUsd?: unknown }>(c);
     // createRun checks the values; these casts only satisfy the types.
     return once(c, "POST /runs", async () =>
@@ -178,7 +209,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
           goal: b.goal as string,
           autonomy: (b.autonomy ?? undefined) as Run["autonomy"] | undefined,
           budgetUsd: b.budgetUsd as number | null | undefined,
-          actor: LOCAL_USER,
+          actor,
         }),
       ),
     );
@@ -201,14 +232,15 @@ export function createAutopilotRoutes(o: Orchestrator) {
   app.post("/runs/:id/evidence", async (c) => {
     const run = mustRun(c.req.param("id"));
     c.header("Cache-Control", "no-store");
-    return c.json(await o.evidence(run.id, LOCAL_USER));
+    return c.json(await o.evidence(run.id, who(c).actor));
   });
 
   for (const action of ["pause", "resume", "cancel"] as const) {
     app.post(`/runs/:id/${action}`, async (c) => {
       const run = mustRun(c.req.param("id"));
+      const actor = who(c, "engineer").actor;
       const { note } = await body<{ note?: unknown }>(c);
-      return once(c, `POST /runs/${run.id}/${action}`, async () => summary(await o[action](run.id, { note: typeof note === "string" ? note : null, actor: LOCAL_USER })));
+      return once(c, `POST /runs/${run.id}/${action}`, async () => summary(await o[action](run.id, { note: typeof note === "string" ? note : null, actor })));
     });
   }
 
@@ -222,11 +254,13 @@ export function createAutopilotRoutes(o: Orchestrator) {
 
   app.post("/inbox/:id/decide", async (c) => {
     const id = Number(c.req.param("id"));
-    if (!Number.isInteger(id) || !ledger.getInbox(id)) throw new HTTPException(404, { message: `No inbox item ${c.req.param("id")}` });
+    const item = Number.isInteger(id) ? ledger.getInbox(id) : undefined;
+    if (!item) throw new HTTPException(404, { message: `No inbox item ${c.req.param("id")}` });
+    const actor = who(c, DECIDES[item.kind] ?? "engineer").actor;
     const { choice, note } = await body<{ choice?: unknown; note?: unknown }>(c);
     if (typeof choice !== "string") throw new Error("Send a choice.");
     if (note != null && typeof note !== "string") throw new Error("The note must be text.");
-    return once(c, `POST /inbox/${id}/decide`, async () => inboxView(await o.decide(id, { choice, note: note as string | null | undefined }, LOCAL_USER)));
+    return once(c, `POST /inbox/${id}/decide`, async () => inboxView(await o.decide(id, { choice, note: note as string | null | undefined }, actor)));
   });
 
   return app;
