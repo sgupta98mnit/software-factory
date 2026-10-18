@@ -14,6 +14,7 @@
 // a person's decision, pause or cancel, which wait for that step to finish.
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import path from "node:path";
 import { audit, auditFor, sha256 } from "../audit.js";
 import { isolationRequired } from "../config.js";
@@ -50,10 +51,13 @@ import {
   restorePaths,
 } from "./git.js";
 import { mergeAndTest } from "./integrator.js";
+import { StaleWorker } from "./ledger.js";
 import type {
   Attempt,
   AttemptRole,
   Autonomy,
+  Command,
+  CommandState,
   Finding,
   InboxItem,
   InboxKind,
@@ -109,6 +113,9 @@ import {
 } from "./spec.js";
 import { planWorkOrders } from "./waves.js";
 
+/** This process isn't the one running Autopilot on its ledger (another holds the scheduler lease). */
+export class Standby extends Error {}
+
 export interface OrchestratorDeps {
   ledger: Ledger;
   client: OpenHandsClient;
@@ -124,6 +131,15 @@ export interface OrchestratorDeps {
   controlPorts?: number[];
   /** The Trivy CLI, for policies that scan. Tests pass a fake. */
   trivy?: ScannerRunner;
+  /** This process in the scheduler lease: "<host>:<pid>:<random>". Tests play other processes with it. */
+  owner?: string;
+  /** Whether a process on this machine is alive (a dead lease holder is taken over at once). */
+  pidAlive?: (pid: number) => boolean;
+  leaseTtlMs?: number;
+  /** First retry delay of a message the agent server refused (doubles each time, at most 5 minutes). Tests use 0. */
+  commandRetryMs?: number;
+  /** How long a message that may have arrived is given to show up in its conversation before it's sent again. Tests use 0. */
+  reconcileMs?: number;
 }
 
 /** What a run pinned to verify its work, at creation: the checks, where they came from, and the test writer's hidden tests. */
@@ -133,6 +149,24 @@ export interface Verification {
   baseSha: string;
   hiddenTests: { files: { name: string; seq: number; sha256: string }[]; digest: string } | null;
 }
+
+const LEASE = "scheduler";
+const COMMAND_TRIES = 10; // refused sends before a person hears about it
+const OPEN_COMMANDS: CommandState[] = ["pending", "sending", "ambiguous", "quarantined"];
+const UNDELIVERED: InboxOption[] = [
+  { id: "resend", label: "Send it again", tone: "primary" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const UNCONFIRMED: InboxOption[] = [
+  { id: "resend", label: "Send it again", tone: "primary" },
+  { id: "delivered", label: "It arrived: don't send it again" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const SPEC_GONE: InboxOption[] = [
+  { id: "restart", label: "Start a new spec agent with this message", tone: "primary" },
+  { id: "resend", label: "Send it again" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
 
 const HIDDEN_FILE = /^wo-(\d+)-[a-z0-9][a-z0-9-]*\.test\.mjs$/;
 const HIDDEN_MAX_BYTES = 200_000;
@@ -241,7 +275,56 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** The scheduler's step for a run, skipped while something else is being done for it. */
   function launch(runId: string, fn: () => Promise<void>) {
     if (inflight.has(runId)) return;
-    track(runId, fn().catch((err) => failed(runId, err)).finally(() => reconcilePauses(runId)));
+    track(runId, fn().catch((err) => (err instanceof StaleWorker ? demote(err) : failed(runId, err))).finally(() => reconcilePauses(runId)));
+  }
+
+  // ---- one process acts on the ledger: the scheduler lease ----
+
+  const owner = deps.owner ?? `${hostname()}:${process.pid}:${randomBytes(4).toString("hex")}`;
+  const pidAlive =
+    deps.pidAlive ??
+    ((pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM"; // alive, just not ours
+      }
+    });
+  let generation: number | null = null;
+  let stale = false;
+
+  /** An earlier orchestrator of this process, or a process on this machine that's gone, is replaced at once; others when the lease expires. */
+  function canTakeOver(holder: string) {
+    const [host, pid] = holder.split(":");
+    if (host !== hostname()) return false;
+    return Number(pid) === process.pid || !pidAlive(Number(pid));
+  }
+
+  /** Takes or renews the lease; false while another live process holds it (this one stands by). */
+  function lead(): boolean {
+    if (stale) return false;
+    const gen = ledger.acquireLease(LEASE, owner, deps.leaseTtlMs ?? 30_000, canTakeOver);
+    if (gen === null) return false;
+    if (gen !== generation) {
+      generation = gen;
+      ledger.fence({ name: LEASE, owner, generation: gen });
+      record(SYSTEM, "autopilot.scheduler_lease", "scheduler", { owner, generation: gen });
+    }
+    return true;
+  }
+
+  function mustLead() {
+    if (!lead()) throw new Standby("Another factory process is running Autopilot on this data folder. Use that one, or stop it first.");
+  }
+
+  /** Another process took over: this one stops acting and lets its writes go. */
+  function demote(err: unknown) {
+    if (stale) return;
+    stale = true;
+    clearInterval(timer);
+    timer = undefined;
+    console.warn(`[autopilot] standing down: ${errorText(err)}`);
   }
 
   /** A person's action: waits for the run's current step, then holds the run until it's done. */
@@ -278,8 +361,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return next;
   }
 
-  function openItem(run: Run, kind: InboxKind, title: string, body: string, options: InboxOption[], workOrderId?: string): InboxItem {
-    const item = ledger.openInbox({ runId: run.id, workOrderId, kind, title, body, options });
+  function openItem(run: Run, kind: InboxKind, title: string, body: string, options: InboxOption[], workOrderId?: string, ref?: string): InboxItem {
+    const item = ledger.openInbox({ runId: run.id, workOrderId, kind, title, body, options, ref });
     record(SYSTEM, "autopilot.inbox_opened", run.id, { item: item.id, kind, ...(workOrderId ? { workOrder: workOrderId } : {}) });
     return item;
   }
@@ -287,6 +370,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** A step failed: pause the run and ask a person (retry or cancel). */
   function failed(runId: string, err: unknown) {
     if (unreachable(err)) return;
+    if (err instanceof StaleWorker) return demote(err);
     console.error(`[autopilot] ${runId}:`, err);
     const run = ledger.getRun(runId);
     if (!run || TERMINAL.has(run.state) || run.state === "paused") return;
@@ -494,16 +578,19 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const ready = await exec.prepare(a, dir, profile, inputs);
       if (exec.kind === "container") agents.set(a.id, ready.client);
       ledger.updateAttempt(a.id, { runtime: ready.facts });
-      const snap = await ready.client.start({
-        conversationId: a.conversationId,
-        profileId: ready.profileId,
-        workingDir: ready.workingDir,
-        text: briefFor(run, a, wo),
-        runId: run.id,
-        role: a.role,
-        seq: wo?.seq,
-      });
-      ledger.updateAttempt(a.id, { state: "running", seenRunning: snap.status === "running", costUsd: snap.costUsd, lastSentAt: now() });
+      // A start whose answer was lost (a timeout) may have created it: look before creating it again.
+      const snap =
+        (await ready.client.get(a.conversationId)) ??
+        (await ready.client.start({
+          conversationId: a.conversationId,
+          profileId: ready.profileId,
+          workingDir: ready.workingDir,
+          text: briefFor(run, a, wo),
+          runId: run.id,
+          role: a.role,
+          seq: wo?.seq,
+        }));
+      ledger.updateAttempt(a.id, { state: "running", seenRunning: snap.status === "running", costUsd: snap.costUsd, lastSentAt: now(), progressAt: now() });
     } catch (err) {
       if (unreachable(err)) return; // stays "starting": a later tick starts it again with the same id
       ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: errorText(err) } });
@@ -520,6 +607,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (unreachable(err)) agents.delete(a.id); // look its container up again next time
       throw err;
     });
+    // A message it hasn't got (or that nobody can confirm) is its next turn: its end state now is the
+    // previous turn's. Its cost still counts, though: a message that did arrive is being worked on.
+    if (snap && ledger.listCommands({ attemptId: a.id, states: OPEN_COMMANDS }).length) {
+      if (snap.costUsd !== a.costUsd) {
+        ledger.updateAttempt(a.id, { costUsd: snap.costUsd });
+        changed(a.runId);
+      }
+      return;
+    }
     if (!snap) {
       ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: "The conversation is gone from the agent server." } });
       record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state: "error" });
@@ -528,25 +624,180 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const seenRunning = a.seenRunning || snap.status === "running";
     const outcome = classify(snap, { seenRunning, lastSentAt: a.lastSentAt }, new Date(), graceMs);
     // "paused" means someone paused it in Canvas: keep polling until they resume it there.
-    const state = outcome === "done" ? "finished" : outcome === "failed" ? (snap.status === "stuck" ? "stuck" : "error") : "running";
-    ledger.updateAttempt(a.id, { state, seenRunning, costUsd: snap.costUsd, finishedAt: state === "running" ? null : now() });
+    let state: Attempt["state"] = outcome === "done" ? "finished" : outcome === "failed" ? (snap.status === "stuck" ? "stuck" : "error") : "running";
+    let result = a.result;
+    const watched = state === "running" && outcome !== "paused" ? await watchdog(a, agent, snap.costUsd) : { progressAt: a.progressAt, lastEvent: a.lastEvent, stalled: false };
+    if (watched.stalled) {
+      const idle = pinnedPolicy(mustRun(a.runId)).watchdog.idleMinutes;
+      await agent.pause(a.conversationId).catch(warn);
+      state = "error";
+      result = { ...(a.result as object | null), error: `No new event or cost from the agent for ${idle} minutes: the watchdog stopped it.` };
+      record(SYSTEM, "autopilot.watchdog_stopped", a.runId, { role: a.role, attempt: a.id, conversationId: a.conversationId, idleMinutes: idle });
+    }
+    ledger.updateAttempt(a.id, { state, seenRunning, costUsd: snap.costUsd, finishedAt: state === "running" ? null : now(), progressAt: watched.progressAt, lastEvent: watched.lastEvent, result });
     if (state !== "running") record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state, costUsd: snap.costUsd });
     if (state !== a.state || snap.costUsd !== a.costUsd) changed(a.runId);
   }
 
-  /** A follow-up message to an existing conversation; the agent starts on it right away. */
-  async function sendFollowUp(a: Attempt, text: string, reason: string) {
-    const agent = await agentFor(a);
-    try {
-      await agent.send(a.conversationId, text);
-    } catch (err) {
-      // 429: the message is saved but the agent didn't start on it; nudge it.
-      if (!(err instanceof OpenHandsError && err.status === 429)) throw err;
-      await agent.resume(a.conversationId).catch(warn);
+  /**
+   * Whether a running agent shows signs of life: its cost moved, or (asked at
+   * most once a minute) its conversation has a newer event. Event ids, not
+   * timestamps: a container's clock may not be this machine's.
+   */
+  async function watchdog(a: Attempt, agent: OpenHandsClient, costUsd: number) {
+    const idle = pinnedPolicy(mustRun(a.runId)).watchdog.idleMinutes;
+    let progressAt = a.progressAt ?? a.lastSentAt;
+    let lastEvent = a.lastEvent;
+    if (costUsd !== a.costUsd) progressAt = now();
+    else if (Date.now() - Date.parse(progressAt) > 60_000) {
+      const latest = await agent.latestEvent(a.conversationId).catch(() => undefined); // an engine without event search: costs only
+      if (latest && latest !== lastEvent) {
+        lastEvent = latest;
+        progressAt = now();
+      }
     }
-    ledger.updateAttempt(a.id, { state: "running", turns: a.turns + 1, seenRunning: false, lastSentAt: now(), finishedAt: null });
-    record(SYSTEM, "autopilot.followup_sent", a.runId, { role: a.role, attempt: a.id, conversationId: a.conversationId, turn: a.turns + 1, reason });
+    const stalled = idle > 0 && Date.now() - Date.parse(progressAt) > idle * 60_000;
+    return { progressAt, lastEvent, stalled };
+  }
+
+  // ---- follow-up messages: the outbox ----
+
+  const markerOf = (c: Command) => `sf-msg-${c.id}`;
+
+  /**
+   * Write-ahead: the message and the attempt's next turn, in the caller's
+   * transaction with the state change that caused them. Nothing is sent until
+   * that commits; deliver() sends it, and a later tick does if it can't now.
+   */
+  function queueFollowUp(a: Attempt, text: string, reason: string): Command {
+    const at = now();
+    const cmd = ledger.addCommand({ runId: a.runId, attemptId: a.id, reason, text, state: "pending", nextAt: at, generation });
+    ledger.updateAttempt(a.id, { state: "running", turns: a.turns + 1, seenRunning: false, lastSentAt: at, finishedAt: null, progressAt: at });
+    record(SYSTEM, "autopilot.followup_queued", a.runId, { role: a.role, attempt: a.id, command: cmd.id, turn: a.turns + 1, reason });
+    return cmd;
+  }
+
+  /** A follow-up with no other state change: queued, then delivered. */
+  async function sendFollowUp(a: Attempt, text: string, reason: string) {
+    await deliver(ledger.transaction(() => queueFollowUp(a, text, reason)));
+  }
+
+  /**
+   * Sends a queued message, tagged with its marker. Refused connections retry
+   * with backoff and go to a person after COMMAND_TRIES; a send that may have
+   * arrived waits for reconcile(); a definite refusal goes to a person.
+   */
+  async function deliver(cmd: Command) {
+    const a = ledger.getAttempt(cmd.attemptId) as Attempt;
+    const agent = await remote(a);
+    if (!agent) {
+      ledger.updateCommand(cmd.id, { state: "failed", error: "Its conversation is gone." }); // the attempt now says so, and its step deals with it
+      return changed(cmd.runId);
+    }
+    ledger.updateCommand(cmd.id, { state: "sending", tries: cmd.tries + 1 }); // a crash from here on leaves it for reconcile()
+    try {
+      await agent.send(a.conversationId, `${cmd.text}\n\n(${markerOf(cmd)})`);
+    } catch (err) {
+      if (err instanceof OpenHandsError && err.status === 429) {
+        await agent.resume(a.conversationId).catch(warn); // saved, but the agent didn't start on it: nudge it
+      } else if ((err instanceof OpenHandsError && err.status === 0 && err.delivery === "not_sent") || err instanceof RuntimeUnavailable) {
+        return retryLater(ledger.getCommand(cmd.id) as Command, err);
+      } else if (err instanceof OpenHandsError && err.status === 0) {
+        ledger.updateCommand(cmd.id, { state: "ambiguous", nextAt: later(deps.commandRetryMs ?? 3000), error: clip(err.message) });
+        return changed(cmd.runId);
+      } else {
+        return undeliverable(cmd, a, err);
+      }
+    }
+    delivered(cmd, a);
+  }
+
+  const later = (ms: number) => new Date(Date.now() + ms).toISOString();
+
+  function retryLater(cmd: Command, err: unknown) {
+    if (cmd.tries >= COMMAND_TRIES) return undeliverable(cmd, ledger.getAttempt(cmd.attemptId) as Attempt, err);
+    const delay = Math.min(300_000, (deps.commandRetryMs ?? 3000) * 2 ** (cmd.tries - 1));
+    ledger.updateCommand(cmd.id, { state: "pending", nextAt: later(delay), error: clip(errorText(err)) });
+    changed(cmd.runId);
+  }
+
+  function delivered(cmd: Command, a: Attempt, by = SYSTEM) {
+    ledger.transaction(() => {
+      ledger.updateCommand(cmd.id, { state: "delivered", error: null });
+      // Its next end state counts from now.
+      ledger.updateAttempt(a.id, { seenRunning: false, lastSentAt: now(), progressAt: now() });
+    });
+    record(by, "autopilot.followup_sent", a.runId, { role: a.role, attempt: a.id, conversationId: a.conversationId, command: cmd.id, turn: a.turns, reason: cmd.reason });
     changed(a.runId);
+  }
+
+  /** The agent server refused the message, or kept refusing connections: a person decides. */
+  function undeliverable(cmd: Command, a: Attempt, err: unknown) {
+    const run = mustRun(a.runId);
+    const gone = err instanceof OpenHandsError && err.status === 404;
+    ledger.transaction(() => {
+      ledger.updateCommand(cmd.id, { state: "failed", error: clip(errorText(err), 500) });
+      openItem(
+        run,
+        "undelivered",
+        `A message to the ${a.role} of ${run.change} wasn't delivered`,
+        `The ${cmd.reason} message to this ${a.role} couldn't be delivered: ${errorText(err)}\n\n${gone && a.role === "spec" ? "Its conversation is gone. A new spec agent can start from the files already there, with this message." : "Send it again once the agent server can take it, or cancel the run."}`,
+        gone && a.role === "spec" ? SPEC_GONE : UNDELIVERED,
+        a.workOrderId ?? undefined,
+        `command:${cmd.id}`,
+      );
+    });
+    record(SYSTEM, "autopilot.delivery_failed", run.id, { attempt: a.id, command: cmd.id, reason: cmd.reason, error: clip(errorText(err)) });
+    changed(run.id);
+  }
+
+  /**
+   * A message that may or may not have arrived (its answer was lost, or the
+   * factory stopped mid-send): found by its marker means delivered; missing
+   * after reconcileMs means it never arrived, so it's sent again; an engine
+   * that can't search goes to a person.
+   */
+  async function reconcile(cmd: Command) {
+    const a = ledger.getAttempt(cmd.attemptId) as Attempt;
+    const agent = await remote(a);
+    if (!agent) {
+      ledger.updateCommand(cmd.id, { state: "failed", error: "Its conversation is gone." });
+      return changed(cmd.runId);
+    }
+    let found: boolean;
+    try {
+      found = await agent.findUserMessage(a.conversationId, markerOf(cmd));
+    } catch (err) {
+      if (unreachable(err)) return; // ask again later
+      ledger.transaction(() => {
+        ledger.updateCommand(cmd.id, { state: "quarantined", error: clip(errorText(err)) });
+        const run = mustRun(a.runId);
+        openItem(
+          run,
+          "undelivered",
+          `Did a message reach the ${a.role} of ${run.change}?`,
+          `The ${cmd.reason} message may or may not have reached this ${a.role}: the answer was lost, and the agent server can't be searched for it (${errorText(err)}). Check the conversation, then send it again or confirm that it arrived.`,
+          UNCONFIRMED,
+          a.workOrderId ?? undefined,
+          `command:${cmd.id}`,
+        );
+      });
+      record(SYSTEM, "autopilot.delivery_quarantined", a.runId, { attempt: a.id, command: cmd.id, reason: cmd.reason });
+      return changed(a.runId);
+    }
+    if (found) return delivered(cmd, a);
+    if (Date.now() - Date.parse(cmd.updatedAt) < (deps.reconcileMs ?? 60_000)) return; // it may still be on its way
+    ledger.updateCommand(cmd.id, { state: "pending", nextAt: now() }); // it never arrived: send it again
+    record(SYSTEM, "autopilot.delivery_retried", a.runId, { attempt: a.id, command: cmd.id, reason: cmd.reason });
+  }
+
+  /** The run's messages that are due: sent, or looked for. */
+  async function processCommands(runId: string) {
+    for (const cmd of ledger.listCommands({ runId, states: ["pending", "sending", "ambiguous"] })) {
+      if (cmd.nextAt > now() && cmd.state !== "sending") continue;
+      if (cmd.state === "pending") await deliver(cmd);
+      else await reconcile(cmd); // "sending" left by a stop mid-send is as uncertain as a lost answer
+    }
   }
 
   // ---- spec stage ----
@@ -585,11 +836,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
     const check = await checkChange(run.change, dir);
     const tries = check.ok ? 0 : invalidStreak(run, a) + 1;
-    // Sent before the check is recorded: if sending fails, the next tick validates and sends again.
+    // The check and the message that asks for a fix are written together; then the message goes.
     const { validateTries } = pinnedPolicy(run).spec;
-    if (!check.ok && tries < validateTries) await sendFollowUp(a, validateFollowUp(run.change, check.output), "validate");
-    ledger.addCheck({ runId: run.id, stage: "spec", name: "openspec-validate", ok: check.ok, exitCode: check.ok ? 0 : 1, durationMs: check.durationMs, output: check.output });
+    const ask = ledger.transaction(() => {
+      ledger.addCheck({ runId: run.id, stage: "spec", name: "openspec-validate", ok: check.ok, exitCode: check.ok ? 0 : 1, durationMs: check.durationMs, output: check.output });
+      return !check.ok && tries < validateTries ? queueFollowUp(a, validateFollowUp(run.change, check.output), "validate") : null;
+    });
     changed(run.id);
+    if (ask) await deliver(ask);
     if (!check.ok) {
       if (tries >= validateTries) specFailed(run, a, `\`openspec validate ${run.change} --strict\` still fails after ${tries} tries:\n\n${check.output}`);
       return;
@@ -645,12 +899,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const rounds = 1 + ledger.listAttempts({ runId: run.id, role: "critic" }).filter((x) => x.id !== c.id && reviewed(x)).length;
     const serious = verdict.findings.some((f) => f.severity !== "low");
     if (verdict.verdict === "revise" && serious && rounds < pinnedPolicy(run).spec.criticRounds) {
-      await sendFollowUp(specAttempt(run), criticFollowUp(verdict.findings), "critic");
-      ledger.transaction(() => {
+      const ask = ledger.transaction(() => {
         markHandled(c, verdict);
         moveRun(run, "spec");
+        return queueFollowUp(specAttempt(run), criticFollowUp(verdict.findings), "critic");
       });
-      return;
+      return deliver(ask);
     }
     // Findings that remain travel into the approval.
     ledger.transaction(() => {
@@ -1204,8 +1458,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       throw new Error("The reviewer's reply had no readable verdict, even when asked again.");
     }
     if (!ok) {
-      await repair(run, wo, verdict.findings);
-      markHandled(r, verdict);
+      await repair(run, wo, verdict.findings, () => markHandled(r, verdict));
+      if (!handled(ledger.getAttempt(r.id) ?? r)) markHandled(r, verdict); // a fresh builder or a person took it: still handled
       return;
     }
     ledger.transaction(() => {
@@ -1219,16 +1473,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * back to the same builder twice, then to one fresh builder in a new
    * worktree, then to a person, whose retry allows one more fresh builder.
    */
-  async function repair(run: Run, wo: WorkOrder, findings: Finding[]) {
+  async function repair(run: Run, wo: WorkOrder, findings: Finding[], also?: () => void) {
     const all = builders(wo);
     const last = all.at(-1);
     const data = { workOrder: `WO-${wo.seq}`, findings: findings.length };
     const limits = pinnedPolicy(run).repair;
     // A conversation that never started, or is gone from the agent server, can't take a follow-up.
     if (last && !(last.result as { error?: string } | null)?.error && last.turns < 1 + limits.sameConversation) {
-      await sendFollowUp(last, repairMessage(findings, executionFor(run).kind === "container"), "repair");
-      moveWorkOrder(wo, "building", { patch: { findings }, action: "autopilot.repair_requested", data: { ...data, builder: all.length, turn: last.turns + 1 } });
-      return;
+      // The work order's move, the message and `also` (the reviewer marked handled) commit together; then the message goes.
+      const ask = ledger.transaction(() => {
+        also?.();
+        moveWorkOrder(wo, "building", { patch: { findings }, action: "autopilot.repair_requested", data: { ...data, builder: all.length, turn: last.turns + 1 } });
+        return queueFollowUp(last, repairMessage(findings, executionFor(run).kind === "container"), "repair");
+      });
+      return deliver(ask);
     }
     const retries = ledger
       .listInbox({ state: "decided", runId: run.id })
@@ -1512,6 +1770,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       throw new Error("This factory now requires isolated execution (SF_REQUIRE_ISOLATION), but this run's pinned policy runs agents on this machine. Cancel it and start a new run with execution.provider: container.");
     }
     if (!enforceBudgets(mustRun(runId))) return;
+    await processCommands(runId);
     for (const a of ledger.listAttempts({ runId }).filter((x) => ACTIVE.has(x.state))) {
       if (a.workOrderId && ledger.getWorkOrder(a.workOrderId)?.state === "needs_attention") continue;
       await (a.state === "starting" ? startConversation(a) : poll(a));
@@ -1526,6 +1785,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** Cheap: hands each live run to advance(), skipping runs that are still busy, and removes containers no attempt needs. */
   async function tick() {
+    if (!lead()) return; // another process acts on this ledger; this one stands by
     for (const run of ledger.listRuns()) {
       if (TERMINAL.has(run.state)) continue;
       launch(run.id, async () => {
@@ -1568,7 +1828,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   // One run is created at a time: two at once (a double-click) would both init the repo or pick the same change name.
   let creating: Promise<unknown> = Promise.resolve();
   function createRun(input: { goal: string; autonomy?: Autonomy; budgetUsd?: number | null; actor: string }): Promise<Run> {
-    const next = creating.then(() => createRunNow(input));
+    const next = creating.then(() => {
+      mustLead();
+      return createRunNow(input);
+    });
     creating = next.catch(() => undefined);
     return next;
   }
@@ -1671,6 +1934,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       await remote(a).then((agent) => agent?.pause(a.conversationId)).catch(warn);
       ledger.updateAttempt(a.id, { state: "cancelled", finishedAt: now() });
     }
+    for (const cmd of ledger.listCommands({ runId: run.id, states: OPEN_COMMANDS })) ledger.updateCommand(cmd.id, { state: "cancelled" });
     await releaseMounted(run); // before the worktrees they mount go; one that fails is removed by a later tick
     // A merge a restart interrupted before its gates ran doesn't stay on the deliverable.
     const merging = ledger.listWorkOrders(run.id).find((w) => w.state === "merging" && w.preMergeSha);
@@ -1719,6 +1983,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   async function pause(runId: string, opts: { note?: string | null; actor: string }): Promise<Run> {
+    mustLead();
     return locked(runId, async () => {
       const run = mustRun(runId);
       if (TERMINAL.has(run.state) || run.state === "paused") throw new Error(`The run is already ${run.state}.`);
@@ -1735,6 +2000,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   async function resume(runId: string, opts: { note?: string | null; actor: string }): Promise<Run> {
+    mustLead();
     return locked(runId, async () => {
       const run = mustRun(runId);
       if (run.state !== "paused") throw new Error(`The run isn't paused (it's ${run.state}).`);
@@ -1753,6 +2019,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   async function cancel(runId: string, opts: { note?: string | null; actor: string }): Promise<Run> {
+    mustLead();
     return locked(runId, async () => cancelRun(mustRun(runId), opts.actor, opts.note?.trim() || null));
   }
 
@@ -1763,7 +2030,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   /** Carries out a person's choice on an inbox item (already validated). */
-  async function act(run: Run, item: InboxItem, choice: string, note: string | null, actor: string) {
+  /** Carries out a person's choice. A message it queues comes back, to be sent once the decision is recorded. */
+  async function act(run: Run, item: InboxItem, choice: string, note: string | null, actor: string): Promise<Command | void> {
     switch (`${item.kind}:${choice}`) {
       case "spec_approval:approve":
         record(actor, "autopilot.spec_approved", run.id, { change: run.change });
@@ -1774,13 +2042,39 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         return;
       case "spec_approval:revise":
       case "plan_approval:revise":
-        await sendFollowUp(specAttempt(run), reviseFollowUp(note ?? ""), "revise");
-        moveRun(run, "spec", { actor });
-        return;
+        return ledger.transaction(() => {
+          moveRun(run, "spec", { actor });
+          return queueFollowUp(specAttempt(run), reviseFollowUp(note ?? ""), "revise");
+        });
       case "questions:answer":
-        await sendFollowUp(specAttempt(run), answerFollowUp(note ?? ""), "answer");
-        moveRun(run, "spec", { actor });
+        return ledger.transaction(() => {
+          moveRun(run, "spec", { actor });
+          return queueFollowUp(specAttempt(run), answerFollowUp(note ?? ""), "answer");
+        });
+      case "undelivered:resend": {
+        // The same message (and marker) goes again; if the first did arrive, the agent sees it twice, as the person chose.
+        const cmd = commandOf(item);
+        ledger.updateCommand(cmd.id, { state: "pending", nextAt: now(), tries: 0, error: null });
+        record(actor, "autopilot.delivery_resend", run.id, { command: cmd.id, attempt: cmd.attemptId });
+        return ledger.getCommand(cmd.id) as Command;
+      }
+      case "undelivered:delivered": {
+        const cmd = commandOf(item);
+        delivered(cmd, ledger.getAttempt(cmd.attemptId) as Attempt, actor);
         return;
+      }
+      case "undelivered:restart": {
+        // Its conversation is gone: a new spec agent starts from the files, told what the lost message said.
+        const cmd = commandOf(item);
+        const old = ledger.getAttempt(cmd.attemptId) as Attempt;
+        ledger.transaction(() => {
+          ledger.updateCommand(cmd.id, { state: "cancelled" });
+          ledger.updateAttempt(old.id, { state: "error", finishedAt: old.finishedAt ?? now(), result: { outcome: "failed", turn: old.turns, reason: `The previous spec agent's conversation was gone, so this message never reached it:\n\n${cmd.text}` } });
+        });
+        if (run.state !== "spec") moveRun(run, "spec", { actor });
+        await startAgent(mustRun(run.id), "spec");
+        return;
+      }
       case "questions:proceed":
         ledger.transaction(() => toPlan(run));
         return;
@@ -1841,10 +2135,18 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
   }
 
+  function commandOf(item: InboxItem): Command {
+    const id = Number(/^command:(\d+)$/.exec(item.ref ?? "")?.[1]);
+    const cmd = Number.isInteger(id) ? ledger.getCommand(id) : undefined;
+    if (!cmd) throw new Error(`Inbox item ${item.id} has no message on record.`);
+    return cmd;
+  }
+
   /** A person's decision on an inbox item. The choice must be one of its options; some need a note. */
   async function decide(id: number, input: { choice: string; note?: string | null }, actor: string): Promise<InboxItem> {
     const found = ledger.getInbox(id);
     if (!found) throw new Error(`No inbox item ${id}`);
+    mustLead();
     return locked(found.runId, async () => {
       const item = ledger.getInbox(id) as InboxItem;
       if (item.state !== "open") throw new Error(`Inbox item ${id} is already ${item.state}.`);
@@ -1869,9 +2171,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         await cancelRun(run, actor, note);
         return ledger.getInbox(id) as InboxItem;
       }
-      await act(run, item, input.choice, note, actor); // throws -> the item stays open
+      const ask = await act(run, item, input.choice, note, actor); // throws -> the item stays open
       await reconcilePauses(run.id);
-      return close();
+      const decided = close();
+      if (ask) await deliver(ask).catch(warn); // queued: a later tick sends it if this can't
+      return decided;
     });
   }
 
@@ -1886,6 +2190,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
             (err: unknown) => ({ mode: tp.mode, ok: false, version: null, dbUpdatedAt: null, problem: errorText(err) }),
           );
     return { hiddenTests: policy.hiddenTests.enabled, protectedPaths: policy.verification.protectedPaths, scanner };
+  }
+
+  /** heldBy: another live process that holds the lease, so this one only answers. */
+  function schedulerStatus() {
+    const lease = ledger.getLease(LEASE);
+    const other = lease && lease.owner !== owner && Date.parse(lease.expiresAt) > Date.now() ? lease.owner : null;
+    return { active: !stale && !other, heldBy: other };
   }
 
   async function status() {
@@ -1911,6 +2222,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         preflight: lastPreflight?.provider === provider ? lastPreflight : null,
       },
       verification: await verificationStatus(policy ?? DEFAULT_POLICY),
+      scheduler: schedulerStatus(),
       openInbox: ledger.openInboxCount(),
       activeRuns: ledger.listRuns().filter((r) => !TERMINAL.has(r.state)).length,
     };
@@ -1939,6 +2251,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     stop() {
       clearInterval(timer);
       timer = undefined;
+      if (generation !== null && !stale) {
+        try {
+          ledger.releaseLease(LEASE, owner);
+        } catch {
+          /* the ledger is closed already */
+        }
+      }
     },
   };
 }

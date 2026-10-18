@@ -47,7 +47,8 @@ export type InboxKind =
   | "budget_reached"
   | "run_paused"
   | "error"
-  | "release";
+  | "release"
+  | "undelivered";
 export type Risk = "low" | "medium" | "high";
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -127,6 +128,8 @@ export interface Attempt {
   costUsd: number; // the conversation's latest accumulated cost
   result: unknown;
   runtime: unknown; // ExecutionFacts (execution.ts): where it ran; null for attempts from before isolation
+  progressAt: string | null; // the last time its cost, state or conversation events moved (the watchdog)
+  lastEvent: string | null; // the newest event id seen in its conversation
   startedAt: string;
   finishedAt: string | null;
 }
@@ -162,7 +165,35 @@ export interface InboxItem {
   decidedAt: string | null;
   createdAt: string;
   notifiedAt: string | null;
+  ref: string | null; // what the item is about beyond its run and work order, like "command:12"
 }
+
+/**
+ * pending: waiting to be sent (or to retry); sending: handed to the agent server, answer not yet recorded;
+ * ambiguous: it may or may not have arrived; delivered; quarantined: nobody can tell, a person decides;
+ * failed: the agent server refused it; cancelled.
+ */
+export type CommandState = "pending" | "sending" | "ambiguous" | "delivered" | "quarantined" | "failed" | "cancelled";
+
+/** A follow-up message to an agent, written before it is sent (the outbox). */
+export interface Command {
+  id: number;
+  runId: string;
+  attemptId: number;
+  kind: "send";
+  reason: string; // repair, validate, critic, answer, revise, unreadable_verdict, no_tests
+  text: string; // kept to deliver it; never audited
+  state: CommandState;
+  tries: number;
+  nextAt: string; // not before then (backoff)
+  generation: number | null; // the scheduler lease generation that wrote it
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A write by a process that has lost the scheduler lease to another one. */
+export class StaleWorker extends Error {}
 
 export type NewRun = Pick<Run, "goal" | "change" | "autonomy" | "baseBranch" | "integrationBranch" | "createdBy"> &
   Partial<Omit<Run, "createdAt" | "updatedAt">>;
@@ -172,7 +203,8 @@ export type NewAttempt = Pick<Attempt, "runId" | "role" | "conversationId"> & Pa
 export type NewCheck = Pick<Check, "runId" | "stage" | "name" | "ok"> &
   Partial<Pick<Check, "workOrderId" | "exitCode" | "durationMs" | "output" | "runner" | "sha" | "meta">>;
 export type NewInboxItem = Pick<InboxItem, "runId" | "kind" | "title" | "body" | "options"> &
-  Partial<Pick<InboxItem, "workOrderId">>;
+  Partial<Pick<InboxItem, "workOrderId" | "ref">>;
+export type NewCommand = Pick<Command, "runId" | "attemptId" | "reason" | "text"> & Partial<Pick<Command, "state" | "nextAt" | "generation">>;
 
 export const OUTPUT_LIMIT = 8000;
 
@@ -265,8 +297,8 @@ CREATE TABLE inbox (
 );
 `;
 
-type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox";
-const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox"];
+type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox" | "commands";
+const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox", "commands"];
 
 // v2: where each attempt and gate ran (isolated execution).
 const SCHEMA_V2 = `
@@ -279,6 +311,41 @@ const SCHEMA_V3 = `
 ALTER TABLE checks ADD COLUMN sha TEXT;
 ALTER TABLE checks ADD COLUMN meta TEXT;
 ALTER TABLE runs ADD COLUMN verification TEXT;
+`;
+
+// v4: durable commands: the outbox, the scheduler lease, remembered requests, and what the watchdog watches.
+const SCHEMA_V4 = `
+CREATE TABLE commands (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  attempt_id INTEGER NOT NULL REFERENCES attempts(id),
+  kind TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  text TEXT NOT NULL,
+  state TEXT NOT NULL,
+  tries INTEGER NOT NULL DEFAULT 0,
+  next_at TEXT NOT NULL,
+  generation INTEGER,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX commands_by_run ON commands (run_id, state);
+CREATE TABLE leases (
+  name TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  expires_at TEXT NOT NULL
+);
+CREATE TABLE requests (
+  key TEXT PRIMARY KEY,
+  route TEXT NOT NULL,
+  response TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+ALTER TABLE attempts ADD COLUMN progress_at TEXT;
+ALTER TABLE attempts ADD COLUMN last_event TEXT;
+ALTER TABLE inbox ADD COLUMN ref TEXT;
 `;
 
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
@@ -335,6 +402,17 @@ export function openLedger(file: string) {
   if (version < 1) transaction(() => db.exec(`${SCHEMA_V1}\nPRAGMA user_version = 1;`));
   if (version < 2) transaction(() => db.exec(`${SCHEMA_V2}\nPRAGMA user_version = 2;`));
   if (version < 3) transaction(() => db.exec(`${SCHEMA_V3}\nPRAGMA user_version = 3;`));
+  if (version < 4) transaction(() => db.exec(`${SCHEMA_V4}\nPRAGMA user_version = 4;`));
+
+  // Fencing: once a process holds the scheduler lease, every write checks it still does.
+  let fenceToken: { name: string; owner: string; generation: number } | null = null;
+  function guard() {
+    if (!fenceToken) return;
+    const row = db.prepare("SELECT owner, generation FROM leases WHERE name = $name").get({ name: fenceToken.name });
+    if (!row || row.owner !== fenceToken.owner || Number(row.generation) !== fenceToken.generation) {
+      throw new StaleWorker(`Another factory process (${String(row?.owner ?? "unknown")}) took over this ledger.`);
+    }
+  }
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),
@@ -353,6 +431,7 @@ export function openLedger(file: string) {
   }
 
   function insert(table: Table, fields: Record<string, unknown>): number {
+    guard();
     const p = params(table, fields);
     const cols = Object.keys(p);
     const sql = `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${cols.map((c) => `$${c}`).join(", ")})`;
@@ -360,6 +439,7 @@ export function openLedger(file: string) {
   }
 
   function update(table: Table, id: string | number, fields: Record<string, unknown>) {
+    guard();
     const p = params(table, fields);
     const sets = Object.keys(p).map((c) => `${c} = $${c}`);
     if (sets.length === 0) return;
@@ -430,6 +510,7 @@ export function openLedger(file: string) {
 
   /** Drops a run's work orders to plan again after the spec changed. Refused (foreign key) once any has an attempt. */
   function deleteWorkOrders(runId: string): number {
+    guard();
     return Number(db.prepare("DELETE FROM work_orders WHERE run_id = $runId").run({ runId }).changes);
   }
 
@@ -524,6 +605,7 @@ export function openLedger(file: string) {
 
   /** Records a person's decision. Throws when the item isn't open, so nothing is decided twice. */
   function decideInbox(id: number, d: { decision: string; note?: string | null; by: string }): InboxItem {
+    guard();
     const { changes } = db
       .prepare(
         `UPDATE inbox SET state = 'decided', decision = $decision, note = $note, decided_by = $by, decided_at = $at
@@ -536,6 +618,7 @@ export function openLedger(file: string) {
 
   /** Closes every open item of a run (when it's cancelled). Returns how many. */
   function dismissInbox(filter: { runId: string }): number {
+    guard();
     const { changes } = db
       .prepare("UPDATE inbox SET state = 'dismissed', decided_at = $at WHERE run_id = $runId AND state = 'open'")
       .run({ runId: filter.runId, at: now() });
@@ -544,6 +627,85 @@ export function openLedger(file: string) {
 
   function openInboxCount(): number {
     return count("SELECT COUNT(*) AS n FROM inbox WHERE state = 'open'", {});
+  }
+
+  // Commands (the outbox of follow-up messages)
+
+  function addCommand(c: NewCommand): Command {
+    const at = now();
+    return getCommand(insert("commands", { kind: "send", state: "pending", nextAt: at, createdAt: at, updatedAt: at, ...defined(c) })) as Command;
+  }
+
+  function getCommand(id: number): Command | undefined {
+    return one<Command>("SELECT * FROM commands WHERE id = $id", { id });
+  }
+
+  function updateCommand(id: number, patch: Partial<Omit<Command, "id" | "runId" | "attemptId" | "createdAt" | "updatedAt">>): Command {
+    update("commands", id, { ...patch, updatedAt: now() });
+    return getCommand(id) as Command;
+  }
+
+  /** Oldest first. */
+  function listCommands(filter: { runId?: string; attemptId?: number; states?: CommandState[] }): Command[] {
+    const states = filter.states ? JSON.stringify(filter.states) : null;
+    return all<Command>(
+      `SELECT * FROM commands WHERE ($runId IS NULL OR run_id = $runId) AND ($attemptId IS NULL OR attempt_id = $attemptId)
+         AND ($states IS NULL OR state IN (SELECT value FROM json_each($states))) ORDER BY id`,
+      { runId: filter.runId ?? null, attemptId: filter.attemptId ?? null, states },
+    );
+  }
+
+  // The scheduler lease: one process acts on this ledger at a time
+
+  /**
+   * Takes or renews the lease `name` for `owner` until ttlMs from now, and
+   * returns its generation; null while another owner holds an unexpired lease
+   * that `canTakeOver` doesn't release. A new owner gets the next generation.
+   */
+  function acquireLease(name: string, owner: string, ttlMs: number, canTakeOver: (holder: string) => boolean): number | null {
+    return transaction(() => {
+      const row = db.prepare("SELECT owner, generation, expires_at FROM leases WHERE name = $name").get({ name });
+      const expires = new Date(Date.now() + ttlMs).toISOString();
+      if (!row) {
+        db.prepare("INSERT INTO leases (name, owner, generation, expires_at) VALUES ($name, $owner, 1, $expires)").run({ name, owner, expires });
+        return 1;
+      }
+      const generation = Number(row.generation);
+      if (row.owner === owner) {
+        db.prepare("UPDATE leases SET expires_at = $expires WHERE name = $name").run({ name, expires });
+        return generation;
+      }
+      if (Date.parse(String(row.expires_at)) > Date.now() && !canTakeOver(String(row.owner))) return null;
+      db.prepare("UPDATE leases SET owner = $owner, generation = $generation, expires_at = $expires WHERE name = $name").run({ name, owner, generation: generation + 1, expires });
+      return generation + 1;
+    });
+  }
+
+  /** Lets another process take over at once (a clean stop). */
+  function releaseLease(name: string, owner: string) {
+    db.prepare("UPDATE leases SET expires_at = $at WHERE name = $name AND owner = $owner").run({ name, owner, at: new Date(0).toISOString() });
+  }
+
+  function getLease(name: string): { owner: string; generation: number; expiresAt: string } | undefined {
+    return one("SELECT owner, generation, expires_at FROM leases WHERE name = $name", { name });
+  }
+
+  /** From now on every write checks that `token` still holds the lease (null: no checks). */
+  function fence(token: { name: string; owner: string; generation: number } | null) {
+    fenceToken = token;
+  }
+
+  // Remembered requests (Idempotency-Key): a repeated key gets the first answer
+
+  function recallRequest(key: string): { route: string; response: unknown } | undefined {
+    const row = db.prepare("SELECT route, response FROM requests WHERE key = $key").get({ key });
+    return row ? { route: String(row.route), response: JSON.parse(String(row.response)) } : undefined;
+  }
+
+  function rememberRequest(key: string, route: string, response: unknown) {
+    guard();
+    db.prepare("DELETE FROM requests WHERE created_at < $cutoff").run({ cutoff: new Date(Date.now() - 86_400_000).toISOString() });
+    db.prepare("INSERT OR IGNORE INTO requests (key, route, response, created_at) VALUES ($key, $route, $response, $at)").run({ key, route, response: JSON.stringify(response), at: now() });
   }
 
   // Costs, summed from attempts
@@ -586,6 +748,16 @@ export function openLedger(file: string) {
     openInboxCount,
     runCost,
     workOrderCost,
+    addCommand,
+    getCommand,
+    updateCommand,
+    listCommands,
+    acquireLease,
+    releaseLease,
+    getLease,
+    fence,
+    recallRequest,
+    rememberRequest,
     transaction,
     close: () => db.close(),
   };

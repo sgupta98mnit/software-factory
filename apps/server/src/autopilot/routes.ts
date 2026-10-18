@@ -1,12 +1,12 @@
 // Autopilot's HTTP API, mounted at /sf-api/autopilot. The response shapes are
 // a contract with the Canvas pages (canvas/src/factory/api.ts): camelCase
 // JSON, costs summed from attempts, nothing about prompts or keys.
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { LOCAL_USER } from "../config.js";
 import { EvidenceConflict } from "./evidence.js";
-import type { Attempt, Check, InboxItem, Run, WorkOrder } from "./ledger.js";
-import type { Orchestrator, Verification } from "./orchestrator.js";
+import { StaleWorker, type Attempt, type Check, type InboxItem, type Run, type WorkOrder } from "./ledger.js";
+import { Standby, type Orchestrator, type Verification } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
 
 // Work-order states that count as in progress.
@@ -59,10 +59,37 @@ export function createAutopilotRoutes(o: Orchestrator) {
   const { ledger } = o;
   const app = new Hono();
 
-  // Errors: 404 for missing records, 409 for unavailable evidence, otherwise 400.
-  app.onError((err, c) => c.json({ error: err.message }, err instanceof HTTPException ? err.status : err instanceof EvidenceConflict ? 409 : 400));
+  // Errors: 404 for missing records, 409 for unavailable evidence or another process running Autopilot, otherwise 400.
+  const conflict = (err: Error) => err instanceof EvidenceConflict || err instanceof Standby || err instanceof StaleWorker;
+  app.onError((err, c) => c.json({ error: err.message }, err instanceof HTTPException ? err.status : conflict(err) ? 409 : 400));
 
   const body = async <T>(c: { req: { json: () => Promise<unknown> } }) => (await c.req.json().catch(() => ({}))) as T;
+
+  // A repeated Idempotency-Key gets the first answer, so a client that retries after a lost response
+  // doesn't start a second run or decide twice. Kept a day in the ledger.
+  const keyed = new Map<string, { route: string; answer: Promise<unknown> }>();
+  async function once(c: Context, route: string, fn: () => Promise<unknown>) {
+    const key = c.req.header("idempotency-key");
+    if (!key) return c.json(await fn());
+    if (!/^[A-Za-z0-9_-]{8,200}$/.test(key)) throw new Error("Idempotency-Key must be 8 to 200 letters, digits, - or _.");
+    const stored = ledger.recallRequest(key);
+    const inflight = keyed.get(key);
+    const usedFor = stored?.route ?? inflight?.route;
+    if (usedFor && usedFor !== route) throw new Error("This Idempotency-Key was already used for another request.");
+    if (stored) return c.json(stored.response);
+    if (inflight) return c.json(await inflight.answer);
+    const answer = fn().then((response) => {
+      ledger.rememberRequest(key, route, response);
+      return response;
+    });
+    keyed.set(key, { route, answer });
+    try {
+      return c.json(await answer);
+    } finally {
+      keyed.delete(key);
+    }
+  }
+
   const mustRun = (id: string) => {
     const run = ledger.getRun(id);
     if (!run) throw new HTTPException(404, { message: `No run ${id}` });
@@ -136,13 +163,16 @@ export function createAutopilotRoutes(o: Orchestrator) {
   app.post("/runs", async (c) => {
     const b = await body<{ goal?: unknown; autonomy?: unknown; budgetUsd?: unknown }>(c);
     // createRun checks the values; these casts only satisfy the types.
-    const run = await o.createRun({
-      goal: b.goal as string,
-      autonomy: (b.autonomy ?? undefined) as Run["autonomy"] | undefined,
-      budgetUsd: b.budgetUsd as number | null | undefined,
-      actor: LOCAL_USER,
-    });
-    return c.json(summary(run));
+    return once(c, "POST /runs", async () =>
+      summary(
+        await o.createRun({
+          goal: b.goal as string,
+          autonomy: (b.autonomy ?? undefined) as Run["autonomy"] | undefined,
+          budgetUsd: b.budgetUsd as number | null | undefined,
+          actor: LOCAL_USER,
+        }),
+      ),
+    );
   });
 
   app.get("/runs/:id", (c) => {
@@ -169,8 +199,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
     app.post(`/runs/:id/${action}`, async (c) => {
       const run = mustRun(c.req.param("id"));
       const { note } = await body<{ note?: unknown }>(c);
-      const updated = await o[action](run.id, { note: typeof note === "string" ? note : null, actor: LOCAL_USER });
-      return c.json(summary(updated));
+      return once(c, `POST /runs/${run.id}/${action}`, async () => summary(await o[action](run.id, { note: typeof note === "string" ? note : null, actor: LOCAL_USER })));
     });
   }
 
@@ -188,7 +217,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
     const { choice, note } = await body<{ choice?: unknown; note?: unknown }>(c);
     if (typeof choice !== "string") throw new Error("Send a choice.");
     if (note != null && typeof note !== "string") throw new Error("The note must be text.");
-    return c.json(inboxView(await o.decide(id, { choice, note: note as string | null | undefined }, LOCAL_USER)));
+    return once(c, `POST /inbox/${id}/decide`, async () => inboxView(await o.decide(id, { choice, note: note as string | null | undefined }, LOCAL_USER)));
   });
 
   return app;

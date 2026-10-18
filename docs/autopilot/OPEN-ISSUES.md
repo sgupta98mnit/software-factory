@@ -7,6 +7,8 @@ Automatic run pauses now reach live agents and retry failed pause requests after
 budgets are enforced through Inbox decisions; startup dispatch and lost resume responses have regression coverage.
 Historical reviewer notes remain below for context.
 
+Durable commands update (milestone 4): follow-ups are now outbox commands written with their state change and reconciled by marker, so the duplicate-follow-up windows noted for C2 (429 and start timeouts), C5 (repair) and C6 (repair after a merge) are closed; a start whose answer was lost is looked up before it is retried. The C3 gap (a spec conversation gone) now offers a new spec agent that is told the lost message.
+
 ## review:C1-ledger
 - [low] Schema-creation race: openLedger reads PRAGMA user_version outside the BEGIN IMMEDIATE transaction. If two processes open a brand-new DB file at the same moment, both see version 0, and the second fails with 'table runs already exists'. This only matters when two servers start together against a fresh data dir, and the second would fail to bind the port anyway. Not fixed. If it ever matters, re-read user_version inside the transaction.
 - [low] transaction() calls ROLLBACK unconditionally in its catch. If SQLite has already rolled back the transaction itself (for example on SQLITE_FULL or an I/O error), ROLLBACK throws 'no transaction is active' and hides the original error. I could not reproduce it cheaply, so it is not fixed. The fix would be to guard it with `if (db.isTransaction)`.

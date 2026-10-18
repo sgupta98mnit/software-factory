@@ -53,6 +53,8 @@ export interface Policy {
   hiddenTests: { enabled: boolean; run: string };
   notify: { digestHour: number };
   execution: { provider: "local" | "container"; container: ContainerPolicy };
+  /** An agent with no new conversation event or cost for this long is stopped and handled as failed; 0: never. */
+  watchdog: { idleMinutes: number };
   verification: {
     /** What a work order may not change; the factory puts these back as they were on its base. */
     protectedPaths: string[];
@@ -102,6 +104,7 @@ export const DEFAULT_POLICY: Policy = {
       startTimeoutSec: 120,
     },
   },
+  watchdog: { idleMinutes: 90 },
   verification: {
     protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"],
     trivy: { mode: "off", version: null, scanners: ["vuln", "secret", "misconfig"], severities: ["critical", "high"], maxDbAgeHours: 72, timeoutSec: 600 },
@@ -194,6 +197,7 @@ const RULES: Record<string, Rule> = {
   "execution.container.hostPathStyle": oneOf(["native", "wsl"]),
   ...Object.fromEntries(Object.keys(DEFAULT_POLICY.agents).map((role) => [`execution.container.credentials.${role}`, listOf(credential)])),
   "execution.container.startTimeoutSec": seconds,
+  "watchdog.idleMinutes": whole(0, 1440),
   "verification.protectedPaths": listOf(text),
   "verification.trivy.mode": oneOf(["off", "advisory", "required"]),
   "verification.trivy.version": nullable(matching(/^\d+\.\d+\.\d+$/, 'a version like "0.58.1"')),

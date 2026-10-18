@@ -1,9 +1,9 @@
 diff --git a/__tests__/factory/autopilot.test.tsx b/__tests__/factory/autopilot.test.tsx
 new file mode 100644
-index 0000000..48cf648
+index 0000000..953826f
 --- /dev/null
 +++ b/__tests__/factory/autopilot.test.tsx
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,674 @@
 +import { screen, waitFor, within } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
 +import { http, HttpResponse } from "msw";
@@ -35,6 +35,7 @@ index 0000000..48cf648
 +  decidedBy: null,
 +  decidedAt: null,
 +  createdAt: "2026-10-17T03:00:00.000Z",
++  ref: null,
 +};
 +
 +function serveInbox() {
@@ -382,6 +383,7 @@ index 0000000..48cf648
 +  },
 +  execution,
 +  verification,
++  scheduler: { active: true, heldBy: null },
 +  openInbox: 0,
 +  activeRuns: 0,
 +});
@@ -619,6 +621,63 @@ index 0000000..48cf648
 +    useParamsMock.mockReset();
 +  });
 +});
++
++describe("Autopilot durable commands", () => {
++  it("says on Home when another factory process runs Autopilot", async () => {
++    renderHome({
++      ...statusWith({
++        provider: "local",
++        isolated: false,
++        required: false,
++        image: null,
++        network: null,
++        preflight: null,
++      }),
++      scheduler: { active: false, heldBy: "LAPTOP:4242:ab12cd34" },
++    });
++    expect(
++      await screen.findByText(
++        /Another factory process \(LAPTOP:4242:ab12cd34\) is running Autopilot/,
++      ),
++    ).toBeInTheDocument();
++  });
++
++  it("labels an undelivered message in the Inbox and offers its choices", async () => {
++    const undelivered: InboxItemView = {
++      ...item,
++      id: 8,
++      kind: "undelivered",
++      title: "Did a message reach the builder of claim-status?",
++      options: [
++        { id: "resend", label: "Send it again", tone: "primary" },
++        { id: "delivered", label: "It arrived: don't send it again" },
++        { id: "cancel", label: "Cancel run", tone: "danger" },
++      ],
++      ref: "command:3",
++    };
++    server.use(
++      http.get("*/sf-api/autopilot/inbox/count", () =>
++        HttpResponse.json({ open: 1 }),
++      ),
++      http.get("*/sf-api/autopilot/inbox", () =>
++        HttpResponse.json([undelivered]),
++      ),
++      http.get("*/sf-api/autopilot/runs", () => HttpResponse.json([])),
++    );
++    renderWithProviders(
++      <MemoryRouter initialEntries={["/inbox"]}>
++        <AutopilotInboxRoute />
++      </MemoryRouter>,
++    );
++    const card = await screen.findByTestId("inbox-item-8");
++    expect(within(card).getByText("Message not delivered")).toBeInTheDocument();
++    expect(
++      within(card).getByRole("button", {
++        name: "It arrived: don't send it again",
++      }),
++    ).toBeInTheDocument();
++  });
++});
 diff --git a/src/components/features/sidebar/sidebar-nav-link.tsx b/src/components/features/sidebar/sidebar-nav-link.tsx
 index 5c8f24d..bf98e67 100644
 --- a/src/components/features/sidebar/sidebar-nav-link.tsx
@@ -732,10 +791,10 @@ index 0000000..a8c56bc
 +  factory self-contained. Other Canvas languages fall back to English.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..4697ada
+index 0000000..f10c453
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,523 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -924,7 +983,8 @@ index 0000000..4697ada
 +  | "budget_reached"
 +  | "run_paused"
 +  | "error"
-+  | "release";
++  | "release"
++  | "undelivered";
 +export type Severity = "critical" | "high" | "medium" | "low";
 +
 +export interface InboxOption {
@@ -1088,6 +1148,8 @@ index 0000000..4697ada
 +  decidedBy: string | null;
 +  decidedAt: string | null;
 +  createdAt: string;
++  /** What the item is about beyond its run and work order, like "command:12". */
++  ref: string | null;
 +}
 +
 +export interface RunDetail extends RunSummary {
@@ -1134,6 +1196,8 @@ index 0000000..4697ada
 +      problem: string | null;
 +    };
 +  };
++  /** heldBy: another live factory process runs Autopilot on this data folder; this one only answers. */
++  scheduler: { active: boolean; heldBy: string | null };
 +  openInbox: number;
 +  activeRuns: number;
 +}
@@ -1542,10 +1606,10 @@ index 0000000..d1c1ebf
 +}
 diff --git a/src/factory/components/factory-badges.tsx b/src/factory/components/factory-badges.tsx
 new file mode 100644
-index 0000000..2c291de
+index 0000000..768355e
 --- /dev/null
 +++ b/src/factory/components/factory-badges.tsx
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,202 @@
 +import {
 +  Circle,
 +  CircleCheck,
@@ -1697,6 +1761,7 @@ index 0000000..2c291de
 +  run_paused: "stopped",
 +  error: "failed",
 +  release: "done",
++  undelivered: "failed",
 +};
 +
 +export function StateChip({
@@ -2252,10 +2317,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..61b4757
+index 0000000..62c7f40
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1004 @@
+@@ -0,0 +1,1050 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2339,6 +2404,8 @@ index 0000000..61b4757
 +    executionReady: "Isolation check passed.",
 +    executionProblems: "Runs can't start until these are fixed:",
 +    executionNotes: "Not checked:",
++    standby: (owner: string) =>
++      `Another factory process (${owner}) is running Autopilot on this data folder. This one only shows its runs: start and decide there, or stop it.`,
 +    scannerReady: (version: string, db: string) =>
 +      `Security scan: Trivy ${version}, database from ${db}.`,
 +    scannerProblem: (required: boolean, problem: string) =>
@@ -2539,6 +2606,7 @@ index 0000000..61b4757
 +      run_paused: "Run paused",
 +      error: "Error",
 +      release: "Release",
++      undelivered: "Message not delivered",
 +    } as Record<string, string>,
 +    noteLabel: "Note",
 +    noteHelp: (labels: string) => `Needed for ${labels}.`,
@@ -2742,6 +2810,25 @@ index 0000000..61b4757
 +      "autopilot.budget_reached": "Reached a spending limit",
 +      "autopilot.budget_increased": "Increased a spending limit",
 +      "autopilot.followup_sent": "Sent an agent a follow-up",
++      "autopilot.followup_queued": "Wrote a follow-up for an agent",
++      "autopilot.delivery_failed": "Couldn't deliver a message to an agent",
++      "autopilot.delivery_quarantined":
++        "Couldn't confirm a message reached an agent",
++      "autopilot.delivery_retried": "Sent a message again that never arrived",
++      "autopilot.delivery_resend": "Asked to send a message again",
++      "autopilot.watchdog_stopped": "Stopped an agent that made no progress",
++      "autopilot.scheduler_lease": "Took over running Autopilot",
++      "autopilot.execution_checked": "Checked how agents would run",
++      "autopilot.runtime_removed": "Removed an agent's container",
++      "autopilot.verification_pinned": "Pinned the run's checks",
++      "autopilot.protected_paths_restored":
++        "Put back files a work order may not change",
++      "autopilot.commit_verified": "Verified a commit",
++      "autopilot.scanned": "Ran the security scan",
++      "autopilot.scan_unavailable": "The security scan couldn't run",
++      "autopilot.hidden_tests_recorded": "Kept the hidden tests",
++      "autopilot.verification_required":
++        "Verified a work order again before merging",
 +      "autopilot.edits_discarded":
 +        "Threw away edits an agent shouldn't have made",
 +      "autopilot.gates_run": "Ran the checks",
@@ -2831,6 +2918,8 @@ index 0000000..61b4757
 +    executionReady: "La comprobación de aislamiento es correcta.",
 +    executionProblems: "No se pueden iniciar ejecuciones hasta corregir esto:",
 +    executionNotes: "Sin comprobar:",
++    standby: (owner) =>
++      `Otro proceso de la fábrica (${owner}) ejecuta Autopilot con esta carpeta de datos. Este solo muestra sus ejecuciones: inicie y decida allí, o deténgalo.`,
 +    scannerReady: (version, db) =>
 +      `Análisis de seguridad: Trivy ${version}, base de datos del ${db}.`,
 +    scannerProblem: (required, problem) =>
@@ -3030,6 +3119,7 @@ index 0000000..61b4757
 +      run_paused: "Ejecución en pausa",
 +      error: "Error",
 +      release: "Publicación",
++      undelivered: "Mensaje no entregado",
 +    },
 +    noteLabel: "Nota",
 +    noteHelp: (labels) => `Necesaria para ${labels}.`,
@@ -3240,6 +3330,27 @@ index 0000000..61b4757
 +      "autopilot.budget_reached": "Alcanzó un límite de gasto",
 +      "autopilot.budget_increased": "Aumentó un límite de gasto",
 +      "autopilot.followup_sent": "Envió un seguimiento a un agente",
++      "autopilot.followup_queued": "Preparó un seguimiento para un agente",
++      "autopilot.delivery_failed": "No pudo entregar un mensaje a un agente",
++      "autopilot.delivery_quarantined":
++        "No pudo confirmar que un mensaje llegó a un agente",
++      "autopilot.delivery_retried": "Volvió a enviar un mensaje que no llegó",
++      "autopilot.delivery_resend": "Pidió enviar de nuevo un mensaje",
++      "autopilot.watchdog_stopped": "Detuvo un agente que no avanzaba",
++      "autopilot.scheduler_lease": "Pasó a ejecutar Autopilot",
++      "autopilot.execution_checked": "Comprobó cómo se ejecutarían los agentes",
++      "autopilot.runtime_removed": "Eliminó el contenedor de un agente",
++      "autopilot.verification_pinned":
++        "Fijó las comprobaciones de la ejecución",
++      "autopilot.protected_paths_restored":
++        "Restauró archivos que una orden no puede cambiar",
++      "autopilot.commit_verified": "Verificó un commit",
++      "autopilot.scanned": "Ejecutó el análisis de seguridad",
++      "autopilot.scan_unavailable":
++        "El análisis de seguridad no pudo ejecutarse",
++      "autopilot.hidden_tests_recorded": "Guardó las pruebas ocultas",
++      "autopilot.verification_required":
++        "Volvió a verificar una orden antes de integrarla",
 +      "autopilot.edits_discarded":
 +        "Descartó cambios que un agente no debía hacer",
 +      "autopilot.gates_run": "Ejecutó las comprobaciones",
@@ -3876,10 +3987,10 @@ index 0000000..aa8eaad
 +}
 diff --git a/src/factory/routes/autopilot-home.tsx b/src/factory/routes/autopilot-home.tsx
 new file mode 100644
-index 0000000..fde6a82
+index 0000000..4074914
 --- /dev/null
 +++ b/src/factory/routes/autopilot-home.tsx
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,576 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
@@ -4224,6 +4335,17 @@ index 0000000..fde6a82
 +      ) : null}
 +      {status.data?.verification ? (
 +        <VerificationLines verification={status.data.verification} />
++      ) : null}
++      {status.data?.scheduler?.heldBy ? (
++        <p role="status" className="flex items-start gap-2 text-foreground">
++          <TriangleAlert
++            className="mt-0.5 size-4 shrink-0 text-warning"
++            aria-hidden
++          />
++          <span className="min-w-0 break-words">
++            {copy.autopilot.standby(status.data.scheduler.heldBy)}
++          </span>
++        </p>
 +      ) : null}
 +    </div>
 +  );

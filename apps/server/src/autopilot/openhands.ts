@@ -35,16 +35,24 @@ export interface StartInput {
   seq?: number | null; // work order, for the tag
 }
 
-/** `status` is the HTTP status, or 0 when the agent server couldn't be reached. */
+/**
+ * `status` is the HTTP status, or 0 when the agent server couldn't be reached.
+ * `delivery` says whether a request that got no answer may still have arrived:
+ * "not_sent" (the connection was refused) or "unknown" (it timed out, the
+ * connection dropped, or the proxy timed out waiting for the server).
+ */
 export class OpenHandsError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly delivery: "not_sent" | "unknown" = "not_sent",
   ) {
     super(message);
     this.name = "OpenHandsError";
   }
 }
+
+const REFUSED = new Set(["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"]);
 
 interface RawMetrics {
   accumulated_cost?: unknown;
@@ -126,14 +134,16 @@ export class OpenHandsClient {
       text = await res.text();
     } catch (err) {
       const timedOut = err instanceof Error && err.name === "TimeoutError";
+      const code = (err as { cause?: { code?: string } } | null)?.cause?.code ?? "";
       throw new OpenHandsError(
         0,
         timedOut ? `Agent server at ${this.baseUrl} did not answer within ${this.timeoutMs} ms` : `Agent server unreachable at ${this.baseUrl}`,
+        !timedOut && REFUSED.has(code) ? "not_sent" : "unknown",
       );
     }
-    // Canvas's ingress answers 502/503/504 when the agent server behind it is down.
+    // Canvas's ingress answers 502/503/504 when the agent server behind it is down; a 504 may have reached it.
     if (res.status === 502 || res.status === 503 || res.status === 504) {
-      throw new OpenHandsError(0, `Agent server unreachable at ${this.baseUrl} (HTTP ${res.status} from the proxy)`);
+      throw new OpenHandsError(0, `Agent server unreachable at ${this.baseUrl} (HTTP ${res.status} from the proxy)`, res.status === 504 ? "unknown" : "not_sent");
     }
     let data: unknown;
     try {
@@ -241,6 +251,21 @@ export class OpenHandsClient {
     } catch (err) {
       if (!(err instanceof OpenHandsError && err.status === 409)) throw err;
     }
+  }
+
+  /** Whether a user message containing `marker` is in the conversation (the factory tags each message it sends). */
+  async findUserMessage(id: string, marker: string): Promise<boolean> {
+    const q = new URLSearchParams({ source: "user", body: marker, limit: "1" });
+    const page = await this.request<{ items?: unknown[] }>("GET", `/conversations/${encodeURIComponent(id)}/events/search?${q}`);
+    return (page.items?.length ?? 0) > 0;
+  }
+
+  /** The id of the conversation's newest event, or null when it has none: the watchdog's sign of life. */
+  async latestEvent(id: string): Promise<string | null> {
+    const q = new URLSearchParams({ sort_order: "TIMESTAMP_DESC", limit: "1" });
+    const page = await this.request<{ items?: { id?: unknown }[] }>("GET", `/conversations/${encodeURIComponent(id)}/events/search?${q}`);
+    const latest = page.items?.[0]?.id;
+    return typeof latest === "string" ? latest : null;
   }
 
   /** The agent's last finish message or reply; "" when there is none yet. */

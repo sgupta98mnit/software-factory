@@ -128,6 +128,7 @@ execution:
     credentials: { spec: [], critic: [], builder: [], reviewer: [], validator: [] }   # environment variable names each role gets
     startTimeoutSec: 120
 hiddenTests: { enabled: false, run: "node --test" }  # a test writer's independent tests run on every work order
+watchdog: { idleMinutes: 90 }                        # stop an agent with no new event or cost for this long; 0 = never
 verification:
   protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"]   # put back when a work order changes them
   trivy:
@@ -163,6 +164,14 @@ Every check records the commit it checked. When the gates pass, the factory chec
 - **Trivy** (`verification.trivy.mode`). The factory runs the binary in `SF_TRIVY` without updating its database (keep it current with `trivy image --download-db-only`). It refuses a version other than `version`, a database older than `maxDbAgeHours`, and a binary that doesn't match `SF_TRIVY_SHA256`. Findings the work order's base already has don't count; new ones at the policy's `severities` go back to the builder as rule, package, file and line, never a secret's text. In `required` mode a scanner that can't answer stops the work order with a Retry in the Inbox; in `advisory` mode the run goes on and the check records why the scan didn't run.
 
 When everything passes, the factory records a `verified` check for that commit. Merging needs one for the branch's current head: if the branch moved after verification it is verified again, and a merge approval given before that doesn't count. Evidence reports security scanning and independent validation as `recorded` only when every merged work order has them. The Trivy integration has been tested with a stand-in CLI, not yet with a real Trivy binary and database.
+
+## Recovery and duplicates
+
+Every follow-up message to an agent (a repair, a validation fix, your answers or revisions) is written to the ledger in the same transaction as the state change behind it, then sent; nothing is sent before that change is saved. Each message ends with a marker like `(sf-msg-12)`. If the agent server's answer is lost (a timeout, or the factory stopped mid-send), the factory searches the conversation for the marker: found means delivered, still missing a minute later means it is sent again. An agent server that can't be searched puts the message in the Inbox, where you send it again or confirm it arrived. Refused connections retry with growing delays; after ten tries, or when the agent server refuses a message outright, it goes to the Inbox. If a spec agent's conversation is gone, the Inbox offers a new spec agent that is told what the lost message said. A conversation whose start was lost is looked up before it is created again.
+
+One factory process acts on a data folder at a time. The running process renews a lease every few seconds. A second process stands by (Home says so) and takes over when the first stops, at once if the first process is gone, otherwise when its lease expires. After a takeover the old process's writes are refused, and it stops.
+
+The watchdog stops an agent that has produced no new conversation event and no new cost for `watchdog.idleMinutes` (90 by default; 0 turns it off), and the run handles it like any agent that stopped with an error. API clients can send an `Idempotency-Key` header (8–200 letters, digits, `-` or `_`) with `POST /runs`, the pause, resume and cancel actions, and Inbox decisions: a repeated key returns the first answer for a day.
 
 ## Run evidence
 
