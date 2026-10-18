@@ -38,6 +38,14 @@ Workspace repo (workspaces/benefits-portal, or SF_WORKSPACE)
 4. **You approve.** Approve moves it to the last status (Done) through the CLI and records `work_order.approved` with your name and note.
 5. **If anything else marks it Done** (an agent, a hand edit), the watcher records `work_order.done_without_approval` and the board shows **Not approved** until a person approves it or moves it back.
 
+## Autopilot
+
+`apps/server/src/autopilot/` adds a SQLite-backed orchestrator around OpenHands conversations: goal → specification/critic → plan → builders in isolated Git worktrees → gates/reviewer/repair → serialized merge and integration gates. The resulting integration branch remains available after worktree cleanup. Worktrees separate Git changes; they do not sandbox processes or credentials. Budget holds and human decisions persist in the ledger, with actions recorded in the audit log.
+
+Canvas's Autopilot run page can download evidence for terminal runs through `POST /sf-api/autopilot/runs/:id/evidence`. The orchestrator serializes generation with run actions; `evidence.ts` combines a ledger snapshot with a verified, queued audit snapshot. It identifies the artifact using a recorded terminal commit, excludes raw prompts/results/output/notes, and audits the exported packet's digest. Historical checks lack commit binding, and the unsigned packet marks security scanning and independent validation as unrecorded.
+
+The [roadmap](autopilot/ROADMAP.md) describes the selected open-source approaches and the remaining isolation, trusted verification, recovery, PR and governance work. It supersedes the older milestone list below for Autopilot development.
+
 ## The audit log
 
 `data/audit.jsonl` has one JSON record per line. Each record's `hash` is SHA-256 over the previous record's hash plus its own contents (keys sorted). Editing, deleting or reordering any line breaks every hash after it. **Audit log → Verify chain** recomputes them. Work order files are recorded by content hash each time they change. Agent transcripts stay in OpenHands; the audit log stores the conversation id.

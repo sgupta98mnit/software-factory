@@ -4,6 +4,7 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { LOCAL_USER } from "../config.js";
+import { EvidenceConflict } from "./evidence.js";
 import type { Attempt, InboxItem, Run, WorkOrder } from "./ledger.js";
 import type { Orchestrator } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
@@ -36,8 +37,8 @@ export function createAutopilotRoutes(o: Orchestrator) {
   const { ledger } = o;
   const app = new Hono();
 
-  // Errors come back as { error }: 404 for a missing run or item, 400 for everything else.
-  app.onError((err, c) => c.json({ error: err.message }, err instanceof HTTPException ? err.status : 400));
+  // Errors: 404 for missing records, 409 for unavailable evidence, otherwise 400.
+  app.onError((err, c) => c.json({ error: err.message }, err instanceof HTTPException ? err.status : err instanceof EvidenceConflict ? 409 : 400));
 
   const body = async <T>(c: { req: { json: () => Promise<unknown> } }) => (await c.req.json().catch(() => ({}))) as T;
   const mustRun = (id: string) => {
@@ -129,6 +130,12 @@ export function createAutopilotRoutes(o: Orchestrator) {
       inbox: ledger.listInbox({ state: "all", runId: run.id }).map(inboxView),
       etaMs: etaMs(workOrders, attempts, pinnedPolicy(run).parallel),
     });
+  });
+
+  app.post("/runs/:id/evidence", async (c) => {
+    const run = mustRun(c.req.param("id"));
+    c.header("Cache-Control", "no-store");
+    return c.json(await o.evidence(run.id, LOCAL_USER));
   });
 
   for (const action of ["pause", "resume", "cancel"] as const) {

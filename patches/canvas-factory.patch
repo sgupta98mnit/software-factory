@@ -1,9 +1,9 @@
 diff --git a/__tests__/factory/autopilot.test.tsx b/__tests__/factory/autopilot.test.tsx
 new file mode 100644
-index 0000000..42287db
+index 0000000..eb982c8
 --- /dev/null
 +++ b/__tests__/factory/autopilot.test.tsx
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,285 @@
 +import { screen, waitFor, within } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
 +import { http, HttpResponse } from "msw";
@@ -181,6 +181,8 @@ index 0000000..42287db
 +
 +  afterEach(() => {
 +    useParamsMock.mockReset();
++    vi.restoreAllMocks();
++    vi.unstubAllGlobals();
 +  });
 +
 +  it("shows the critic's findings with their fix, and keeps a stuck run in Build", async () => {
@@ -203,6 +205,7 @@ index 0000000..42287db
 +      </MemoryRouter>,
 +    );
 +    expect(await screen.findByText("Group 3 is big")).toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: "Download evidence" })).not.toBeInTheDocument();
 +    expect(screen.getByText("Split it in two")).toBeInTheDocument();
 +    const stages = screen.getByRole("list", { name: /stages/i });
 +    expect(
@@ -210,6 +213,80 @@ index 0000000..42287db
 +        .getAllByRole("listitem")
 +        .find((li) => li.hasAttribute("aria-current")),
 +    ).toHaveTextContent("Build");
++  });
++
++  it("downloads terminal run evidence, prevents duplicate clicks and releases the object URL", async () => {
++    const user = userEvent.setup();
++    let release!: () => void;
++    const pending = new Promise<void>((resolve) => { release = resolve; });
++    const exported = { packet: { schemaVersion: 1, run: { id: runDetail.id } }, digest: { algorithm: "sha256", canonicalization: "sf-canonical-json-v1", value: "digest" } };
++    let requests = 0;
++    server.use(
++      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () => HttpResponse.json({ ...runDetail, state: "done" })),
++      http.get("*/sf-api/autopilot/status", () => HttpResponse.json({ agentServer: { profiles: [] } })),
++      http.post("*/sf-api/autopilot/runs/ap-1a2b3c4d/evidence", async () => {
++        requests += 1;
++        await pending;
++        return HttpResponse.json(exported);
++      }),
++    );
++    const createObjectURL = vi.fn((_blob: Blob) => "blob:evidence");
++    const revokeObjectURL = vi.fn();
++    // Keep URL's constructor and existing statics for router/fetch consumers.
++    class DownloadURL extends URL {
++      static createObjectURL = createObjectURL;
++      static revokeObjectURL = revokeObjectURL;
++    }
++    vi.stubGlobal("URL", DownloadURL);
++    const downloads: { href: string; filename: string }[] = [];
++    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
++      downloads.push({ href: this.href, filename: this.download });
++    });
++    renderWithProviders(
++      <MemoryRouter initialEntries={["/autopilot/runs/ap-1a2b3c4d"]}>
++        <Routes><Route path="/autopilot/runs/:runId" element={<AutopilotPipelineRoute />} /></Routes>
++      </MemoryRouter>,
++    );
++    await user.click(await screen.findByRole("button", { name: "Download evidence" }));
++    const preparing = screen.getByRole("button", { name: "Preparing evidence…" });
++    expect(preparing).toBeDisabled();
++    await user.click(preparing);
++    release();
++    await waitFor(() => expect(downloads).toEqual([{ href: "blob:evidence", filename: "ap-1a2b3c4d-evidence.json" }]));
++    expect(requests).toBe(1);
++    expect(createObjectURL.mock.calls[0]?.[0]).toBeInstanceOf(Blob);
++    const contents = await new Promise<string>((resolve, reject) => {
++      const reader = new FileReader();
++      reader.onload = () => resolve(String(reader.result));
++      reader.onerror = reject;
++      reader.readAsText(createObjectURL.mock.calls[0]![0]);
++    });
++    expect(JSON.parse(contents)).toEqual(exported);
++    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:evidence"));
++    expect(screen.getByRole("button", { name: "Download evidence" })).toBeEnabled();
++  });
++
++  it("keeps a failed evidence export visible and retryable", async () => {
++    const user = userEvent.setup();
++    let requests = 0;
++    server.use(
++      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () => HttpResponse.json({ ...runDetail, state: "cancelled" })),
++      http.get("*/sf-api/autopilot/status", () => HttpResponse.json({ agentServer: { profiles: [] } })),
++      http.post("*/sf-api/autopilot/runs/ap-1a2b3c4d/evidence", () => {
++        requests += 1;
++        return HttpResponse.json({ error: "The audit chain is invalid." }, { status: 409 });
++      }),
++    );
++    renderWithProviders(
++      <MemoryRouter initialEntries={["/autopilot/runs/ap-1a2b3c4d"]}>
++        <Routes><Route path="/autopilot/runs/:runId" element={<AutopilotPipelineRoute />} /></Routes>
++      </MemoryRouter>,
++    );
++    await user.click(await screen.findByRole("button", { name: "Download evidence" }));
++    expect(await screen.findByRole("alert")).toHaveTextContent("The audit chain is invalid.");
++    expect(screen.getByRole("button", { name: "Download evidence" })).toBeEnabled();
++    await user.click(screen.getByRole("button", { name: "Download evidence" }));
++    await waitFor(() => expect(requests).toBe(2));
 +  });
 +});
 diff --git a/__tests__/factory/zz-debug.test.tsx b/__tests__/factory/zz-debug.test.tsx
@@ -350,10 +427,10 @@ index 0000000..9dd363b
 +  factory self-contained. Other Canvas languages fall back to English.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..20ceb19
+index 0000000..764aef1
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,446 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -689,6 +766,16 @@ index 0000000..20ceb19
 +export type RunAction = "pause" | "resume" | "cancel";
 +export type InboxFilter = "open" | "decided" | "all";
 +
++/** Versioned packet stays opaque in Canvas: download the server's full evidence. */
++export interface RunEvidence {
++  packet: { schemaVersion: 1; [key: string]: unknown };
++  digest: {
++    algorithm: "sha256";
++    canonicalization: "sf-canonical-json-v1";
++    value: string;
++  };
++}
++
 +/** Thrown when the factory API can't be reached at all (server not running). */
 +export class FactoryOfflineError extends Error {
 +  constructor() {
@@ -778,6 +865,8 @@ index 0000000..20ceb19
 +  }) => post<RunSummary>("/autopilot/runs", body),
 +  run: (id: string) =>
 +    request<RunDetail>(`/autopilot/runs/${encodeURIComponent(id)}`),
++  runEvidence: (id: string) =>
++    post<RunEvidence>(`/autopilot/runs/${encodeURIComponent(id)}/evidence`),
 +  runAction: (id: string, action: RunAction, note?: string) =>
 +    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/${action}`, {
 +      note,
@@ -1013,6 +1102,65 @@ index 0000000..5cc424a
 +        </div>
 +      </div>
 +    </ModalBackdrop>
++  );
++}
+diff --git a/src/factory/components/evidence-download.tsx b/src/factory/components/evidence-download.tsx
+new file mode 100644
+index 0000000..d1c1ebf
+--- /dev/null
++++ b/src/factory/components/evidence-download.tsx
+@@ -0,0 +1,53 @@
++import { useMutation } from "@tanstack/react-query";
++import { Download } from "lucide-react";
++import { BrandButton } from "#/components/features/settings/brand-button";
++import { FactoryApi } from "../api";
++import { useFactoryCopy } from "../copy";
++
++export function EvidenceDownload({ runId }: { runId: string }) {
++  const copy = useFactoryCopy();
++  const download = useMutation({
++    mutationFn: async () => {
++      const evidence = await FactoryApi.runEvidence(runId);
++      const blob = new Blob([`${JSON.stringify(evidence, null, 2)}\n`], {
++        type: "application/json",
++      });
++      const url = URL.createObjectURL(blob);
++      const anchor = document.createElement("a");
++      try {
++        anchor.href = url;
++        anchor.download = `${runId}-evidence.json`;
++        document.body.appendChild(anchor);
++        anchor.click();
++      } finally {
++        anchor.remove();
++        // Let the browser start consuming the download before releasing it.
++        window.setTimeout(() => URL.revokeObjectURL(url), 0);
++      }
++    },
++    retry: false,
++    meta: { disableToast: true },
++  });
++
++  return (
++    <div className="flex max-w-sm flex-col items-end gap-2">
++      <BrandButton
++        type="button"
++        variant="secondary"
++        onClick={() => download.mutate()}
++        isDisabled={download.isPending}
++        aria-busy={download.isPending}
++        startContent={<Download className="size-4" aria-hidden />}
++      >
++        {download.isPending
++          ? copy.pipeline.evidencePreparing
++          : copy.pipeline.evidenceDownload}
++      </BrandButton>
++      {download.error ? (
++        <p role="alert" className="text-sm text-feedback-error">
++          {copy.pipeline.evidenceError(download.error.message)}
++        </p>
++      ) : null}
++    </div>
 +  );
 +}
 diff --git a/src/factory/components/factory-badges.tsx b/src/factory/components/factory-badges.tsx
@@ -1727,10 +1875,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..b70d057
+index 0000000..f0a3759
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,914 @@
+@@ -0,0 +1,921 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1871,6 +2019,9 @@ index 0000000..b70d057
 +  },
 +  pipeline: {
 +    title: "Autopilot run",
++    evidenceDownload: "Download evidence",
++    evidencePreparing: "Preparing evidence…",
++    evidenceError: (message: string) => `Evidence export failed: ${message}`,
 +    back: "All runs",
 +    fullGoal: "Full goal",
 +    facts: {
@@ -2318,6 +2469,10 @@ index 0000000..b70d057
 +    },
 +  },
 +  pipeline: {
++    evidenceDownload: "Descargar evidencias",
++    evidencePreparing: "Preparando evidencias…",
++    evidenceError: (message: string) =>
++      `Error al exportar evidencias: ${message}`,
 +    title: "Ejecución del piloto automático",
 +    back: "Todas las ejecuciones",
 +    fullGoal: "Objetivo completo",
@@ -3668,10 +3823,10 @@ index 0000000..34cd2d4
 +}
 diff --git a/src/factory/routes/autopilot-pipeline.tsx b/src/factory/routes/autopilot-pipeline.tsx
 new file mode 100644
-index 0000000..9ac0444
+index 0000000..11a6099
 --- /dev/null
 +++ b/src/factory/routes/autopilot-pipeline.tsx
-@@ -0,0 +1,833 @@
+@@ -0,0 +1,834 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useParams } from "react-router";
@@ -3727,6 +3882,7 @@ index 0000000..9ac0444
 +  labelFor,
 +} from "../components/factory-badges";
 +import { ConfirmModal } from "../components/confirm-modal";
++import { EvidenceDownload } from "../components/evidence-download";
 +
 +const TITLE_MAX = 120;
 +
@@ -3773,7 +3929,7 @@ index 0000000..9ac0444
 +  const copy = useFactoryCopy();
 +  const action = useRunAction();
 +  const [confirmCancel, setConfirmCancel] = React.useState(false);
-+  if (isRunFinished(run.state)) return null;
++  if (isRunFinished(run.state)) return <EvidenceDownload runId={run.id} />;
 +  const busy = action.isPending;
 +  const act = (kind: "pause" | "resume") =>
 +    action.mutate(

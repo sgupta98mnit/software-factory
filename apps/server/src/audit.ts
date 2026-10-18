@@ -82,8 +82,7 @@ export function auditFor(subject: string): AuditEvent[] {
   return readAll().filter((e) => e.subject.toLowerCase() === key);
 }
 
-export function verifyAudit(): { ok: boolean; checked: number; brokenAt?: number; reason?: string } {
-  const all = readAll();
+function verifyEvents(all: AuditEvent[]): { ok: boolean; checked: number; brokenAt?: number; reason?: string } {
   let prev = GENESIS;
   for (const e of all) {
     const { hash, ...rest } = e;
@@ -92,4 +91,27 @@ export function verifyAudit(): { ok: boolean; checked: number; brokenAt?: number
     prev = hash;
   }
   return { ok: true, checked: all.length };
+}
+
+export function verifyAudit() {
+  return verifyEvents(readAll());
+}
+
+/** Drain prior writes, then verify and select events from the same file snapshot. */
+export function auditSnapshot(subject: string) {
+  const job = queue.then(() => {
+    const all = readAll();
+    const tail = { seq: all.at(-1)?.seq ?? 0, hash: all.at(-1)?.hash ?? GENESIS };
+    if (last && (last.seq !== tail.seq || last.hash !== tail.hash)) {
+      throw new Error("Audit log tail changed since the last append.");
+    }
+    return {
+      verification: verifyEvents(all),
+      checkpoint: tail,
+      events: all.filter((e) => e.subject.toLowerCase() === subject.toLowerCase()),
+    };
+  });
+  // Later appends also wait for this read, so it cannot see a partial append.
+  queue = job.catch(() => undefined);
+  return job;
 }

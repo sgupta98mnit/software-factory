@@ -18,6 +18,7 @@ import path from "node:path";
 import { audit, auditFor, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
+import { exportEvidence } from "./evidence.js";
 import { detectGates, gateFindings, runGates, type GateResult } from "./gates.js";
 import {
   addWorktree,
@@ -1386,6 +1387,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   return {
     ledger,
+    evidence: (runId: string, actor: string) => locked(runId, () => exportEvidence(ledger, workspace, runId, actor)),
     createRun,
     decide,
     pause,

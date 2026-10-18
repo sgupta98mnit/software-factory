@@ -1,0 +1,36 @@
+# Software Factory implementation roadmap
+
+The factory already plans changes, runs builders in worktrees, repairs failed gates, reviews work and serializes integration. Extend this control plane around OpenHands rather than replacing its agent runtime. Keep the local TypeScript API, SQLite ledger and Canvas UI.
+
+## Selected approaches
+
+| Reference | Adopt | Fit and limits |
+| --- | --- | --- |
+| [Agent Orchestrator](https://github.com/OrchestratorInc/agent-orchestrator/blob/main/docs/architecture.md) | Durable command outbox, observed execution facts, recovery reconciliation and generation fencing | Extend SQLite; do not port its Go daemon. Network timeouts require reconciliation, not blind message replay. |
+| [Paperclip](https://github.com/paperclipai/paperclip) | Scoped budgets, execution leases, identities and approval records | Extend existing budget holds and Inbox. Reported provider cost can lag; holds are not a billing guarantee. |
+| [StrongDM Attractor](https://github.com/strongdm/attractor) and [AttractorBench](https://github.com/strongdm/attractorbench) | Explicit workflow outcomes, checkpoints and independently owned acceptance scenarios | Attractor is a specification. Keep trusted tests outside builder-editable worktrees; do not treat self-written tests as independent evidence. |
+| [Gas Town](https://github.com/gastownhall/gastown) | Watchdog escalation, bounded capacity and verified merge queue recovery | Extend the current serial integrator before adding batch merge optimization. |
+| [OpenHands SDK](https://github.com/OpenHands/software-agent-sdk) | Supported sandbox/workspace lifecycle and conversation APIs | Reuse the existing engine; verify host/container path mapping, credentials and resource limits end to end. |
+| [Open SWE](https://github.com/langchain-ai/open-swe) | Investigation → implementation → validation → PR → CI feedback loop | Borrow lifecycle design; current hosted deployment requirements prevent treating it as a drop-in local service. |
+| [Trivy](https://github.com/aquasecurity/trivy) | Trusted scanner for vulnerabilities, secrets, IaC and SBOMs | Run a pinned external binary outside agent control; required scans must fail closed when unavailable. Do not include secret matches in prompts or logs. |
+| [in-toto statements](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md) | Evidence tied to immutable artifact identities, versioned predicates and digest verification | Initial factory packet is a custom unsigned JSON format, not a signed attestation. |
+| [OSCAL](https://github.com/usnistgov/OSCAL) | Structured control and assessment export | Control mappings are traceability, not proof of compliance or authorization. |
+
+[Vibe Kanban](https://github.com/BloopAI/vibe-kanban) offers useful workspace/review UX, but its company sunset makes it an optional design reference. Superset's current ELv2 license and lack of Windows support make it a reference, not a runtime dependency. Do not copy source without checking the exact license and attribution requirements.
+
+## Delivery sequence
+
+Each milestone must have a working API, operator flow, recovery behavior, focused regression coverage and documentation. Later milestones are planned, not implemented by this document.
+
+1. **Run evidence — initial feature implemented.** Export completed, failed and cancelled runs from durable records after worktree cleanup. Include artifact commit, pinned policy hash, criteria and control mappings, gate metadata, agent/cost summaries and human decisions. Exclude full goals/prompts, outputs, agent replies and decision notes. Verify the audit chain before export; compute a packet digest; provide a Canvas download with loading/error/retry states. Mark scans and independent validation as unrecorded, and historic checks as lacking commit binding. See the [implementation plan and verification results](../superpowers/plans/2026-10-18-run-evidence.md). This is the terminal packet foundation; the older C13 design's requirement/scenario graph and dedicated evidence screen remain future work. Live Canvas rendering/download compatibility is not yet verified.
+2. **Isolated execution.** Add a workspace-provider contract and preflight; implement the supported OpenHands container provider with explicit mounts, per-role credentials, limits, network policy and teardown. Test Windows host/container paths and restart recovery. Refuse execution when a required isolation policy cannot be satisfied. Local execution remains explicitly identified.
+3. **Trusted verification.** Pin verification commands from the base branch, run independent acceptance scenarios from a separate validator workspace and integrate Trivy. Record scanner/version/database freshness, commit and result digests. Findings enter repair with redacted summaries; required verification cannot be bypassed by generic merge approval. Test builder attempts to change tests/policy, scanner outages and stale reports.
+4. **Durable commands and watchdogs.** Migrate SQLite for command intent/outcome, lease owner/generation and retry state. Persist before external effects. Reconcile conversation identity and external state after timeout/restart; quarantine ambiguous sends when the engine lacks idempotency. Add bounded backoff, operator retry and failure escalation. Test crashes before/after each acknowledgement, stale workers and duplicate requests.
+5. **PR delivery and CI repair.** Add a GitHub adapter with least-privilege credentials, deterministic branch/run identifiers, draft PR creation and idempotent reconciliation. Check required CI and review feedback against the exact PR head. Reuse the merge queue, attach evidence and stop repair at policy limits. No automatic production deployment or base-branch push by agents.
+6. **Governance and release.** Add sign-in/roles, scoped budgets and reservations, explicit ISSO approvals for mapped controls, release approval and immutable evidence retention. Export a real in-toto predicate/OSCAL assessment only when its underlying facts exist. Add notifications through the existing automation boundaries, plus audit/restore and retention tests.
+
+## Completion criteria
+
+Completion of all milestones means an operator can submit a goal, inspect/approve a plan, run isolated agents, see independently verified changes, recover after service failure, review a PR and approve a release with traceable evidence. It does not imply federal certification. Avoid adding Temporal, another scheduler or another agent runtime until measurements show the local control plane cannot meet the workload.
+
+The first milestone deliberately exposes missing verification rather than painting existing runs as secure. It establishes the artifact contract that later scanners, validators and releases must populate.

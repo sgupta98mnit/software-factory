@@ -115,6 +115,16 @@ A work order merges without a person only when its gates and review passed, it a
 
 Autopilot checks reported conversation costs before starting more work and after each poll. At the run limit (the amount entered in Home, or `budget.perChangeUsd`), it pauses the run's agents and opens a budget decision in the Inbox. At a work order's limit, it pauses that order while the others continue. Continue adds the policy's base budget to the relevant limit; Skip ends that work order; Cancel ends the run. Limits and decisions persist across restarts, and a normal Resume cannot bypass a run budget decision. Spending can rise between checks or while a pause request completes; enforcement depends on the agent server reporting costs.
 
+## Run evidence
+
+On a finished, failed or cancelled run, choose **Download evidence** to save a JSON packet containing the recorded artifact commit, pinned policy hash, work order criteria/control mappings, gate metadata, agent costs and approval decisions. This works after worktrees are cleaned up. The API is `POST /sf-api/autopilot/runs/:id/evidence` with JSON `{}`; active runs return 409 and missing runs return 404. A damaged audit chain blocks export with a visible error.
+
+The response contains `packet` and its SHA-256 `digest`. Hash only `packet` using `sf-canonical-json-v1`: recursively sort object keys, preserve array order and serialize with JSON.stringify (undefined object members omitted). The existing `canonicalJson` and `sha256` exports in `apps/server/src/audit.ts` implement this format. The digest detects edits; the packet is unsigned and does not authenticate its producer. Preserve the exported file with the relevant Git objects and audit log if you need to investigate it later.
+
+Artifact identity comes from the run's terminal audit event, never the current branch tip. Missing commits are marked unavailable; older failed/cancelled runs may have no recorded artifact. Historical gate checks lack commit binding, and output hashes cover only the stored output tail, not the full command log. Raw goals/prompts, agent replies, gate output, approval notes and arbitrary audit payloads are excluded. Work order titles and criteria remain project content: review them before sharing. Security scanning and independent validation are explicitly unrecorded; control mappings do not establish compliance.
+
+The [implementation roadmap](docs/autopilot/ROADMAP.md) selects approaches from the researched projects and sequences isolation, trusted verification, durable recovery, PR delivery and governance after this evidence foundation.
+
 ## Working on the Canvas side
 
 Factory UI code lives in `canvas\src\factory\`. Canvas is its own git repo on a `factory` branch, with OpenHands as the `upstream` remote.
