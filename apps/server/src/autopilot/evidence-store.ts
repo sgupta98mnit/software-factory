@@ -1,5 +1,5 @@
-// Write-once evidence: exported packets, release approval envelopes and
-// attestations, kept as canonical JSON named by their sha256 under
+// Write-once evidence: exported packets, release approval envelopes,
+// attestations and assessment results, kept as canonical JSON named by their sha256 under
 // <dataDir>/evidence/<run>/ (or SF_EVIDENCE_DIR), made read-only and never
 // overwritten. verifyEvidence recomputes every digest; pruneEvidence removes
 // only files older than the retention period. On one machine this is best
@@ -9,9 +9,9 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, st
 import path from "node:path";
 import { canonicalJson, sha256 } from "../audit.js";
 
-export type EvidenceKind = "packet" | "release" | "attestation";
+export type EvidenceKind = "packet" | "release" | "attestation" | "oscal";
 
-const NAME = /^(packet|release|attestation)-([0-9a-f]{64})\.json$/;
+const NAME = /^(packet|release|attestation|oscal)-([0-9a-f]{64})\.json$/;
 
 export const evidenceRoot = (dataDir: string) => path.resolve(process.env.SF_EVIDENCE_DIR ?? path.join(dataDir, "evidence"));
 

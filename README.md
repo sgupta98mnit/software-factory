@@ -159,6 +159,7 @@ governance:
   controlApproval: off                               # required: an ISSO approves each verified commit of a work order with mapped controls
   releaseApproval: off                               # required: a release manager approves the commit a finished run ends with
   fourEyes: true                                     # whoever started a run can't approve its release
+  assessmentPlan: null                               # the agency's OSCAL assessment plan (a URI) that assessment results import
 ```
 
 A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` and `notify` are accepted for features still to come; `delivery` is described under [Pull request delivery](#pull-request-delivery); `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification), `governance` under [ISSO and release approvals](#isso-and-release-approvals).
@@ -233,6 +234,14 @@ The response contains `packet` and its SHA-256 `digest`. Hash only `packet` usin
 Artifact identity comes from the run's terminal audit event, never the current branch tip. Missing commits are marked unavailable; older failed/cancelled runs may have no recorded artifact. Historical gate checks lack commit binding, and output hashes cover only the stored output tail, not the full command log. Raw goals/prompts, agent replies, gate output, approval notes and arbitrary audit payloads are excluded. Work order titles and criteria remain project content: review them before sharing. Security scanning and independent validation are explicitly unrecorded; control mappings do not establish compliance.
 
 The [implementation roadmap](docs/autopilot/ROADMAP.md) selects approaches from the researched projects and sequences isolation, trusted verification, durable recovery, PR delivery and governance after this evidence foundation.
+
+## Attestations and assessment results
+
+A done run also offers **Download attestation** (`POST /sf-api/autopilot/runs/:id/attestation`). It's an in-toto Statement v1 about the run's artifact commit (subject digest `gitCommit`, predicate type `urn:software-factory:run-verification:v1`) in a DSSE envelope signed with this factory's Ed25519 key. The predicate lists each merged work order's verified commit and the checks that passed on it, the run's evidence digest, its verification settings and its release decision. The key is made on first use in `data/signing/` and never goes into a backup or a response; `GET /sf-api/autopilot/attestation-key` gives its public half and key id. The signature says the factory recorded these facts. It isn't a person's approval or a certification.
+
+**Download OSCAL assessment results** (`POST /sf-api/autopilot/runs/:id/oscal`) produces OSCAL 1.1.2 assessment results for the controls the run's merged work orders map. Each control gets one finding, marked satisfied only because an ISSO approved each implementing work order's verified commit; each work order gets an observation, and the ISSO is named as a party. The results import the agency's assessment plan from `governance.assessmentPlan`.
+
+Both are refused (409) unless their facts exist, and the response's `missing` lists each gap: the run isn't done, its artifact commit isn't recorded or is gone, or a merged work order has no verified commit. Assessment results also need an assessment plan, at least one mapped control, and an ISSO's approval of each implementing commit. Both are kept in the evidence store with the packet they came from.
 
 ## Backups
 

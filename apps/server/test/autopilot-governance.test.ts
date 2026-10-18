@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, createPublicKey } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -20,9 +21,11 @@ const { OpenHandsClient } = await import("../src/autopilot/openhands.js");
 const { git } = await import("../src/autopilot/git.js");
 const { audit, listAudit, sha256 } = await import("../src/audit.js");
 const { pruneEvidence, storeEvidence, verifyEvidence, listEvidence } = await import("../src/autopilot/evidence-store.js");
+const { MissingFacts, verifyDsse } = await import("../src/autopilot/attest.js");
 const { startFakeOpenHands } = await import("./fake-openhands.js");
 type Release = import("../src/autopilot/orchestrator.js").Release;
 
+const PLAN = "https://grc.example.gov/plans/benefits-portal-sap.json";
 const PASS = '```json\n{"verdict":"pass","findings":[]}\n```';
 
 /** Builders write a different line each round; reviewers pass. */
@@ -51,12 +54,19 @@ async function setup(governance: string) {
     app.route("/autopilot", createAutopilotRoutes(o));
     return (id: number, body: unknown) => app.request(`/autopilot/inbox/${id}/decide`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   };
+  /** POST to the API with every role. */
+  const post = (pathname: string) => {
+    const app = new Hono();
+    app.route("/autopilot", createAutopilotRoutes(o));
+    return app.request(`/autopilot${pathname}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  };
   return {
     workspace,
     dataDir,
     ledger,
     o,
     as,
+    post,
     wo: (runId: string) => ledger.getWorkOrder(`${runId}/WO-1`)!,
     open: (runId: string, kind: string) => ledger.listInbox({ runId }).find((i) => i.kind === kind)!,
     async until(done: () => boolean, max = 80) {
@@ -90,7 +100,7 @@ const audited = async (runId: string, action: string) => {
 };
 
 test("a work order with mapped controls waits for an ISSO's approval of its verified commit; an approver can't give it, and a new commit needs a new approval", async () => {
-  const t = await setup("{ controlApproval: required }");
+  const t = await setup(`{ controlApproval: required, assessmentPlan: "${PLAN}" }`);
   try {
     const run = await t.run(["SI-10"], "suggest");
     await t.until(() => t.wo(run.id).state === "awaiting_control_approval");
@@ -124,6 +134,19 @@ test("a work order with mapped controls waits for an ISSO's approval of its veri
     const [merged] = await audited(run.id, "autopilot.work_order_merged");
     assert.deepEqual([merged?.actor, merged?.data.controlsApprovedBy], ["user:approver", "user:isso"]);
     assert.equal((await audited(run.id, "autopilot.controls_approved")).length, 2);
+
+    // Now the run's control can be reported as assessed: the agency's plan, and the ISSO's approval of the verified commit.
+    const { assessmentResults: oscal, stored } = await t.o.assessment(run.id, "user:test");
+    const ar = oscal["assessment-results"];
+    assert.equal(ar["import-ap"].href, PLAN);
+    const [result] = ar.results;
+    assert.deepEqual(result!["reviewed-controls"]["control-selections"][0]!["include-controls"], [{ "control-id": "si-10" }]);
+    const [finding] = result!.findings;
+    assert.deepEqual(finding!.target, { type: "objective-id", "target-id": "si-10_obj", status: { state: "satisfied" } });
+    assert.equal(ar.metadata.parties.find((p) => p.uuid === finding!.origins[0]!.actors[0]!["actor-uuid"])?.name, "user:isso");
+    assert.match(result!.observations[0]!.description, new RegExp(`passed on commit ${rebuilt}`));
+    assert.match(ar.metadata.remarks, /not an authorization to operate/);
+    assert.ok(existsSync(path.join(t.dataDir, "evidence", stored.file)), "kept write-once");
   } finally {
     await t.close();
   }
@@ -162,6 +185,22 @@ test("release approval: a finished run waits for a release manager other than it
     assert.equal(JSON.parse(packet).artifact.commit, head);
     assert.equal((await audited(run.id, "autopilot.release_approved"))[0]?.data.envelope, release.envelope!.sha256);
 
+    // The factory's signed statement about the commit, through the API: it verifies with the factory's public key, and a changed one doesn't.
+    const res = await t.post(`/runs/${run.id}/attestation`);
+    assert.equal(res.status, 200);
+    const att = (await res.json()) as { envelope: Parameters<typeof verifyDsse>[0]; keyid: string; publicKey: string; stored: { file: string } };
+    assert.equal(att.envelope.payloadType, "application/vnd.in-toto+json");
+    const statement = verifyDsse(att.envelope, att.publicKey) as { subject: unknown; predicateType: string; predicate: { attester: { keyid: string; kind: string }; workOrders: { verifiedCommit: string }[]; release: { status: string; envelope: { sha256: string } } } };
+    assert.deepEqual(statement.subject, [{ name: run.integrationBranch, digest: { gitCommit: head } }]);
+    assert.equal(statement.predicateType, "urn:software-factory:run-verification:v1");
+    assert.deepEqual([statement.predicate.attester.kind, statement.predicate.attester.keyid], ["factory", att.keyid]);
+    assert.deepEqual([statement.predicate.release.status, statement.predicate.release.envelope.sha256], ["approved", release.envelope!.sha256]);
+    assert.equal(att.keyid, createHash("sha256").update(createPublicKey(att.publicKey).export({ type: "spki", format: "der" })).digest("hex"));
+    const forged = { ...att.envelope, payload: Buffer.from(JSON.stringify({ ...statement, subject: [{ name: "x", digest: { gitCommit: "0".repeat(40) } }] })).toString("base64") };
+    assert.equal(verifyDsse(forged, att.publicKey), null, "a changed statement doesn't verify");
+    assert.equal((await t.o.attestation(run.id, "user:test")).keyid, att.keyid, "one key per factory");
+    assert.equal(JSON.stringify(att).includes("PRIVATE KEY"), false);
+
     // Write-once: the factory refuses to replace a stored file, a changed file fails verification, and retention keeps it.
     if (process.getuid?.() !== 0) assert.throws(() => writeFileSync(envelopeFile, "{}"), "stored evidence is read-only");
     assert.deepEqual(storeEvidence(root, run.id, "release", envelope), release.envelope, "storing the same envelope again is the same file");
@@ -172,8 +211,8 @@ test("release approval: a finished run waits for a release manager other than it
     writeFileSync(envelopeFile, JSON.stringify({ ...envelope, approver: { actor: "user:someone-else", roles: [] } }));
     assert.deepEqual(verifyEvidence(root).changed, [release.envelope!.file]);
     assert.throws(() => storeEvidence(root, run.id, "release", envelope), /has changed since it was written/);
-    assert.equal(listEvidence(root).length, 2);
-    assert.equal(pruneEvidence(root, 1, Date.now() + 2 * 86_400_000).length, 2, "after the retention period, files go");
+    assert.equal(listEvidence(root).length, 6, "the release packet and envelope, and two attestations with their packets");
+    assert.equal(pruneEvidence(root, 1, Date.now() + 2 * 86_400_000).length, 6, "after the retention period, files go");
   } finally {
     await t.close();
   }
@@ -198,6 +237,22 @@ test("a rejected release records who rejected it and why, and governance off kee
     await off.until(() => off.ledger.getRun(run.id)?.state === "done");
     assert.equal(off.ledger.getRun(run.id)?.release, null);
     assert.equal(off.ledger.listInbox({ state: "all", runId: run.id }).length, 0, "no ISSO or release item without the policy asking");
+
+    // Assessment results need what this run doesn't have: refused, naming each gap (409 through the API).
+    await assert.rejects(off.o.assessment(run.id, "user:test"), (err: unknown) => {
+      assert.ok(err instanceof MissingFacts);
+      assert.deepEqual(err.missing, ["The policy names no assessment plan (governance.assessmentPlan).", "SI-10 (WO-1): no ISSO approval of its verified commit."]);
+      return true;
+    });
+    const refused = await off.post(`/runs/${run.id}/oscal`);
+    assert.equal(refused.status, 409);
+    assert.equal(((await refused.json()) as { missing: string[] }).missing.length, 2);
+    // A run whose merged work wasn't verified by the factory can't be attested.
+    const head = (await git(off.workspace, ["rev-parse", "HEAD"])).stdout.trim();
+    const legacy = off.ledger.createRun({ goal: "Old", change: "old", autonomy: "supervised", baseBranch: "main", integrationBranch: "main", createdBy: "user:test", state: "done" });
+    off.ledger.addWorkOrders(legacy.id, [{ seq: 1, title: "Old work", acceptance: ["x"], controls: [], dependsOn: [], wave: 1, risk: "low", state: "merged" }]);
+    await audit("autopilot", "autopilot.run_completed", legacy.id, { sha: head });
+    await assert.rejects(off.o.attestation(legacy.id, "user:test"), /This run can't be attested yet: WO-1 has no commit the factory verified./);
   } finally {
     await off.close();
   }

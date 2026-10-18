@@ -21,6 +21,7 @@ import { Forbidden } from "../auth.js";
 import { isolationRequired } from "../config.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
+import { assessmentGaps, assessmentResults, attestationGaps, MissingFacts, runStatement, signDsse, signingKey } from "./attest.js";
 import { exportEvidence } from "./evidence.js";
 import { evidenceRoot, pruneEvidence, retentionDays, storeEvidence } from "./evidence-store.js";
 import {
@@ -2739,6 +2740,38 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   return {
     ledger,
+    /** The factory's signed in-toto statement about a done run's artifact commit, from its evidence (kept, with the statement). */
+    attestation: (runId: string, actor: string) =>
+      locked(runId, async () => {
+        const { packet } = await exportEvidence(ledger, workspace, runId, actor);
+        const gaps = attestationGaps(packet);
+        if (gaps.length) throw new MissingFacts("This run can't be attested yet", gaps);
+        const root = evidenceRoot(deps.dataDir);
+        const evidence = storeEvidence(root, runId, "packet", packet);
+        const key = signingKey(deps.dataDir);
+        const envelope = signDsse(runStatement(packet, evidence, key.keyid, mustRun(runId).release), key);
+        const stored = storeEvidence(root, runId, "attestation", envelope);
+        record(actor, "autopilot.attestation_exported", runId, { format: "in-toto-dsse", sha256: stored.sha256, keyid: key.keyid, commit: packet.artifact.commit });
+        return { envelope, keyid: key.keyid, publicKey: key.publicKeyPem, stored };
+      }),
+    /** OSCAL assessment results for a done run's controls: needs the policy's assessment plan and an ISSO's approval of each implementing commit. */
+    assessment: (runId: string, actor: string) =>
+      locked(runId, async () => {
+        const { packet } = await exportEvidence(ledger, workspace, runId, actor);
+        const plan = pinnedPolicy(mustRun(runId)).governance.assessmentPlan;
+        const gaps = assessmentGaps(packet, plan);
+        if (gaps.length || !plan) throw new MissingFacts("This run's controls can't be reported as assessed yet", gaps);
+        const root = evidenceRoot(deps.dataDir);
+        const results = assessmentResults(packet, storeEvidence(root, runId, "packet", packet), plan);
+        const stored = storeEvidence(root, runId, "oscal", results);
+        record(actor, "autopilot.assessment_exported", runId, { format: "oscal-assessment-results", sha256: stored.sha256, commit: packet.artifact.commit });
+        return { assessmentResults: results, stored };
+      }),
+    /** The public half of the factory's signing key, for checking its attestations. */
+    attestationKey: () => {
+      const { keyid, publicKeyPem } = signingKey(deps.dataDir);
+      return { keyid, publicKey: publicKeyPem };
+    },
     /** Exports the run's evidence and keeps a write-once copy (evidence-store.ts). */
     evidence: (runId: string, actor: string) =>
       locked(runId, async () => {

@@ -46,6 +46,6 @@
 - [x] 2. Control and release approvals, envelopes, four-eyes; tests.
 - [x] 3. Reservations and the daily scope; tests.
 - [x] 4. Evidence store, retention, backup/verify/restore with a CLI; tests.
-- [ ] 5. DSSE-signed in-toto Statement and OSCAL assessment results, gated on facts; tests.
+- [x] 5. DSSE-signed in-toto Statement and OSCAL assessment results, gated on facts; tests.
 - [ ] 6. Webhook notifications and digest; tests.
 - [ ] 7. Canvas (sign-in, the signed-in user, release state, exports) and docs; full verification.

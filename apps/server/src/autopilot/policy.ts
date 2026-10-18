@@ -88,6 +88,7 @@ export interface Policy {
     controlApproval: "off" | "required";
     releaseApproval: "off" | "required";
     fourEyes: boolean; // whoever started a run can't approve its release
+    assessmentPlan: string | null; // the agency's OSCAL assessment plan (a URI), which assessment results import
   };
 }
 
@@ -131,7 +132,7 @@ export const DEFAULT_POLICY: Policy = {
     protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"],
     trivy: { mode: "off", version: null, scanners: ["vuln", "secret", "misconfig"], severities: ["critical", "high"], maxDbAgeHours: 72, timeoutSec: 600 },
   },
-  governance: { controlApproval: "off", releaseApproval: "off", fourEyes: true },
+  governance: { controlApproval: "off", releaseApproval: "off", fourEyes: true, assessmentPlan: null },
 };
 
 // ---- reading and checking policy.yml ----
@@ -240,6 +241,7 @@ const RULES: Record<string, Rule> = {
   "governance.controlApproval": oneOf(["off", "required"]),
   "governance.releaseApproval": oneOf(["off", "required"]),
   "governance.fourEyes": flag,
+  "governance.assessmentPlan": nullable(text),
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */

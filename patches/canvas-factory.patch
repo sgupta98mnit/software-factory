@@ -1,9 +1,9 @@
 diff --git a/__tests__/factory/autopilot.test.tsx b/__tests__/factory/autopilot.test.tsx
 new file mode 100644
-index 0000000..aa75637
+index 0000000..131da24
 --- /dev/null
 +++ b/__tests__/factory/autopilot.test.tsx
-@@ -0,0 +1,853 @@
+@@ -0,0 +1,902 @@
 +import { screen, waitFor, within } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
 +import { http, HttpResponse } from "msw";
@@ -352,6 +352,49 @@ index 0000000..aa75637
 +    ).toBeEnabled();
 +    await user.click(screen.getByRole("button", { name: "Download evidence" }));
 +    await waitFor(() => expect(requests).toBe(2));
++  });
++
++  it("offers a done run's attestation and assessment results, and says what's missing when one can't be made", async () => {
++    const user = userEvent.setup();
++    server.use(
++      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () =>
++        HttpResponse.json({ ...runDetail, state: "done" }),
++      ),
++      http.get("*/sf-api/autopilot/status", () =>
++        HttpResponse.json({ agentServer: { profiles: [] } }),
++      ),
++      http.post("*/sf-api/autopilot/runs/ap-1a2b3c4d/oscal", () =>
++        HttpResponse.json(
++          {
++            error:
++              "This run's controls can't be reported as assessed yet: The policy names no assessment plan (governance.assessmentPlan).",
++            missing: [
++              "The policy names no assessment plan (governance.assessmentPlan).",
++            ],
++          },
++          { status: 409 },
++        ),
++      ),
++    );
++    renderWithProviders(
++      <MemoryRouter initialEntries={["/autopilot/runs/ap-1a2b3c4d"]}>
++        <Routes>
++          <Route
++            path="/autopilot/runs/:runId"
++            element={<AutopilotPipelineRoute />}
++          />
++        </Routes>
++      </MemoryRouter>,
++    );
++    expect(
++      await screen.findByRole("button", { name: "Download attestation" }),
++    ).toBeEnabled();
++    await user.click(
++      screen.getByRole("button", { name: "Download OSCAL assessment results" }),
++    );
++    expect(await screen.findByRole("alert")).toHaveTextContent(
++      "No assessment results: This run's controls can't be reported as assessed yet: The policy names no assessment plan (governance.assessmentPlan).",
++    );
 +  });
 +});
 +
@@ -767,8 +810,14 @@ index 0000000..aa75637
 +        decidedBy: "oidc:rm-1@login.example.gov",
 +        roles: ["release_manager"],
 +        decidedAt: "2026-10-17T05:00:00.000Z",
-+        evidence: { file: "ap-1a2b3c4d/packet-aa.json", sha256: "a".repeat(64) },
-+        envelope: { file: "ap-1a2b3c4d/release-bb.json", sha256: "b".repeat(64) },
++        evidence: {
++          file: "ap-1a2b3c4d/packet-aa.json",
++          sha256: "a".repeat(64),
++        },
++        envelope: {
++          file: "ap-1a2b3c4d/release-bb.json",
++          sha256: "b".repeat(64),
++        },
 +      },
 +      workOrders: [{ ...runDetail.workOrders[0]!, state: "merged" }],
 +    };
@@ -970,10 +1019,10 @@ index 0000000..a8c56bc
 +  factory self-contained. Other Canvas languages fall back to English.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..c9ef266
+index 0000000..5a3b2fb
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,584 @@
+@@ -0,0 +1,608 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -1438,6 +1487,24 @@ index 0000000..c9ef266
 +  };
 +}
 +
++/** The factory's DSSE-signed in-toto statement about a done run's commit, with the public key that checks it. */
++export interface RunAttestation {
++  envelope: {
++    payloadType: string;
++    payload: string;
++    signatures: { keyid: string; sig: string }[];
++  };
++  keyid: string;
++  publicKey: string;
++  stored: { file: string; sha256: string };
++}
++
++/** OSCAL assessment results for a done run's controls. */
++export interface RunAssessment {
++  assessmentResults: { "assessment-results": Record<string, unknown> };
++  stored: { file: string; sha256: string };
++}
++
 +/** Who is acting: this machine's user (local mode) or the person signed in with the agency's identity provider. */
 +export interface FactoryMe {
 +  mode: "local" | "oidc";
@@ -1548,6 +1615,12 @@ index 0000000..c9ef266
 +    request<RunDetail>(`/autopilot/runs/${encodeURIComponent(id)}`),
 +  runEvidence: (id: string) =>
 +    post<RunEvidence>(`/autopilot/runs/${encodeURIComponent(id)}/evidence`),
++  runAttestation: (id: string) =>
++    post<RunAttestation>(
++      `/autopilot/runs/${encodeURIComponent(id)}/attestation`,
++    ),
++  runAssessment: (id: string) =>
++    post<RunAssessment>(`/autopilot/runs/${encodeURIComponent(id)}/oscal`),
 +  runAction: (id: string, action: RunAction, note?: string) =>
 +    post<RunSummary>(`/autopilot/runs/${encodeURIComponent(id)}/${action}`, {
 +      note,
@@ -1787,37 +1860,79 @@ index 0000000..5cc424a
 +}
 diff --git a/src/factory/components/evidence-download.tsx b/src/factory/components/evidence-download.tsx
 new file mode 100644
-index 0000000..d1c1ebf
+index 0000000..528740b
 --- /dev/null
 +++ b/src/factory/components/evidence-download.tsx
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,110 @@
 +import { useMutation } from "@tanstack/react-query";
 +import { Download } from "lucide-react";
 +import { BrandButton } from "#/components/features/settings/brand-button";
 +import { FactoryApi } from "../api";
 +import { useFactoryCopy } from "../copy";
 +
-+export function EvidenceDownload({ runId }: { runId: string }) {
++type ExportKind = "evidence" | "attestation" | "oscal";
++
++/** What each download fetches and saves: the evidence response, the attestation with its key, the OSCAL document itself. */
++const EXPORTS: Record<
++  ExportKind,
++  { fetch: (runId: string) => Promise<unknown>; file: string }
++> = {
++  evidence: { fetch: FactoryApi.runEvidence, file: "evidence.json" },
++  attestation: {
++    fetch: FactoryApi.runAttestation,
++    file: "attestation.json",
++  },
++  oscal: {
++    fetch: async (runId) =>
++      (await FactoryApi.runAssessment(runId)).assessmentResults,
++    file: "assessment-results.json",
++  },
++};
++
++function saveJson(value: unknown, filename: string) {
++  const blob = new Blob([`${JSON.stringify(value, null, 2)}\n`], {
++    type: "application/json",
++  });
++  const url = URL.createObjectURL(blob);
++  const anchor = document.createElement("a");
++  try {
++    anchor.href = url;
++    anchor.download = filename;
++    document.body.appendChild(anchor);
++    anchor.click();
++  } finally {
++    anchor.remove();
++    // Let the browser start consuming the download before releasing it.
++    window.setTimeout(() => URL.revokeObjectURL(url), 0);
++  }
++}
++
++function ExportButton({ runId, kind }: { runId: string; kind: ExportKind }) {
 +  const copy = useFactoryCopy();
++  const labels = {
++    evidence: [
++      copy.pipeline.evidenceDownload,
++      copy.pipeline.evidencePreparing,
++      copy.pipeline.evidenceError,
++    ],
++    attestation: [
++      copy.pipeline.attestationDownload,
++      copy.pipeline.attestationPreparing,
++      copy.pipeline.attestationError,
++    ],
++    oscal: [
++      copy.pipeline.oscalDownload,
++      copy.pipeline.oscalPreparing,
++      copy.pipeline.oscalError,
++    ],
++  } as const;
++  const [label, preparing, error] = labels[kind];
 +  const download = useMutation({
-+    mutationFn: async () => {
-+      const evidence = await FactoryApi.runEvidence(runId);
-+      const blob = new Blob([`${JSON.stringify(evidence, null, 2)}\n`], {
-+        type: "application/json",
-+      });
-+      const url = URL.createObjectURL(blob);
-+      const anchor = document.createElement("a");
-+      try {
-+        anchor.href = url;
-+        anchor.download = `${runId}-evidence.json`;
-+        document.body.appendChild(anchor);
-+        anchor.click();
-+      } finally {
-+        anchor.remove();
-+        // Let the browser start consuming the download before releasing it.
-+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
-+      }
-+    },
++    mutationFn: async () =>
++      saveJson(
++        await EXPORTS[kind].fetch(runId),
++        `${runId}-${EXPORTS[kind].file}`,
++      ),
 +    retry: false,
 +    meta: { disableToast: true },
 +  });
@@ -1832,15 +1947,30 @@ index 0000000..d1c1ebf
 +        aria-busy={download.isPending}
 +        startContent={<Download className="size-4" aria-hidden />}
 +      >
-+        {download.isPending
-+          ? copy.pipeline.evidencePreparing
-+          : copy.pipeline.evidenceDownload}
++        {download.isPending ? preparing : label}
 +      </BrandButton>
 +      {download.error ? (
 +        <p role="alert" className="text-sm text-feedback-error">
-+          {copy.pipeline.evidenceError(download.error.message)}
++          {error(download.error.message)}
 +        </p>
 +      ) : null}
++    </div>
++  );
++}
++
++/** A finished run's evidence; a done run's signed attestation and OSCAL assessment results too (the server says what's missing). */
++export function EvidenceDownload({
++  runId,
++  done,
++}: {
++  runId: string;
++  done: boolean;
++}) {
++  return (
++    <div className="flex flex-wrap items-start justify-end gap-2">
++      <ExportButton runId={runId} kind="evidence" />
++      {done ? <ExportButton runId={runId} kind="attestation" /> : null}
++      {done ? <ExportButton runId={runId} kind="oscal" /> : null}
 +    </div>
 +  );
 +}
@@ -2592,10 +2722,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..47c2bd8
+index 0000000..b110c65
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1156 @@
+@@ -0,0 +1,1177 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2773,6 +2903,12 @@ index 0000000..47c2bd8
 +    evidenceDownload: "Download evidence",
 +    evidencePreparing: "Preparing evidence…",
 +    evidenceError: (message: string) => `Evidence export failed: ${message}`,
++    attestationDownload: "Download attestation",
++    attestationPreparing: "Signing the attestation…",
++    attestationError: (message: string) => `No attestation: ${message}`,
++    oscalDownload: "Download OSCAL assessment results",
++    oscalPreparing: "Preparing assessment results…",
++    oscalError: (message: string) => `No assessment results: ${message}`,
 +    back: "All runs",
 +    fullGoal: "Full goal",
 +    facts: {
@@ -3165,6 +3301,10 @@ index 0000000..47c2bd8
 +        "Approved a work order's security controls",
 +      "autopilot.release_approved": "Approved a release",
 +      "autopilot.release_rejected": "Rejected a release",
++      "autopilot.attestation_exported": "Signed an attestation",
++      "autopilot.assessment_exported": "Exported OSCAL assessment results",
++      "autopilot.evidence_pruned": "Removed evidence past its retention period",
++      "factory.backup_created": "Made a backup",
 +    } as Record<string, string>,
 +  },
 +};
@@ -3340,6 +3480,12 @@ index 0000000..47c2bd8
 +    evidencePreparing: "Preparando evidencias…",
 +    evidenceError: (message: string) =>
 +      `Error al exportar evidencias: ${message}`,
++    attestationDownload: "Descargar atestación",
++    attestationPreparing: "Firmando la atestación…",
++    attestationError: (message: string) => `Sin atestación: ${message}`,
++    oscalDownload: "Descargar resultados de evaluación OSCAL",
++    oscalPreparing: "Preparando los resultados de evaluación…",
++    oscalError: (message: string) => `Sin resultados de evaluación: ${message}`,
 +    title: "Ejecución del piloto automático",
 +    back: "Todas las ejecuciones",
 +    fullGoal: "Objetivo completo",
@@ -3740,6 +3886,11 @@ index 0000000..47c2bd8
 +        "Aprobó los controles de seguridad de una orden de trabajo",
 +      "autopilot.release_approved": "Aprobó una publicación",
 +      "autopilot.release_rejected": "Rechazó una publicación",
++      "autopilot.attestation_exported": "Firmó una atestación",
++      "autopilot.assessment_exported": "Exportó resultados de evaluación OSCAL",
++      "autopilot.evidence_pruned":
++        "Eliminó evidencias tras su periodo de retención",
++      "factory.backup_created": "Hizo una copia de seguridad",
 +    },
 +  },
 +};
@@ -4997,10 +5148,10 @@ index 0000000..6672ce1
 +}
 diff --git a/src/factory/routes/autopilot-pipeline.tsx b/src/factory/routes/autopilot-pipeline.tsx
 new file mode 100644
-index 0000000..759d425
+index 0000000..9a259cd
 --- /dev/null
 +++ b/src/factory/routes/autopilot-pipeline.tsx
-@@ -0,0 +1,993 @@
+@@ -0,0 +1,994 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useParams } from "react-router";
@@ -5104,7 +5255,8 @@ index 0000000..759d425
 +  const copy = useFactoryCopy();
 +  const action = useRunAction();
 +  const [confirmCancel, setConfirmCancel] = React.useState(false);
-+  if (isRunFinished(run.state)) return <EvidenceDownload runId={run.id} />;
++  if (isRunFinished(run.state))
++    return <EvidenceDownload runId={run.id} done={run.state === "done"} />;
 +  const busy = action.isPending;
 +  const act = (kind: "pause" | "resume") =>
 +    action.mutate(

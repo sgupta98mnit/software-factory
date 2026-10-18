@@ -5,6 +5,7 @@ import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { Forbidden, principalOf, ROLES, Unauthenticated, type Principal, type Role } from "../auth.js";
 import { LOCAL_USER } from "../config.js";
+import { MissingFacts } from "./attest.js";
 import { EvidenceConflict } from "./evidence.js";
 import { StaleWorker, type Attempt, type Check, type InboxItem, type InboxKind, type Run, type WorkOrder } from "./ledger.js";
 import { Standby, type Delivery, type Orchestrator, type Release, type Verification } from "./orchestrator.js";
@@ -91,7 +92,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
   const conflict = (err: Error) => err instanceof EvidenceConflict || err instanceof Standby || err instanceof StaleWorker;
   const status = (err: Error) =>
     err instanceof HTTPException ? err.status : err instanceof Unauthenticated ? 401 : err instanceof Forbidden ? 403 : conflict(err) ? 409 : 400;
-  app.onError((err, c) => c.json({ error: err.message }, status(err)));
+  app.onError((err, c) => c.json({ error: err.message, ...(err instanceof MissingFacts ? { missing: err.missing } : {}) }, status(err)));
 
   /** The person acting; with `role`, they must hold it. */
   const who = (c: Context, role?: Role): Principal => {
@@ -235,6 +236,19 @@ export function createAutopilotRoutes(o: Orchestrator) {
     c.header("Cache-Control", "no-store");
     return c.json(await o.evidence(run.id, who(c).actor));
   });
+
+  // Exported only from recorded facts: 409 with `missing` otherwise.
+  app.post("/runs/:id/attestation", async (c) => {
+    const run = mustRun(c.req.param("id"));
+    c.header("Cache-Control", "no-store");
+    return c.json(await o.attestation(run.id, who(c).actor));
+  });
+  app.post("/runs/:id/oscal", async (c) => {
+    const run = mustRun(c.req.param("id"));
+    c.header("Cache-Control", "no-store");
+    return c.json(await o.assessment(run.id, who(c).actor));
+  });
+  app.get("/attestation-key", (c) => c.json(o.attestationKey()));
 
   for (const action of ["pause", "resume", "cancel"] as const) {
     app.post(`/runs/:id/${action}`, async (c) => {

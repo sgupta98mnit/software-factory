@@ -134,7 +134,7 @@ test("policyHash: the same rules always hash the same, however the file writes t
   assert.notEqual(policyHash(a), policyHash(parsePolicy("parallel: 2\nrepair: { fresh: 0, sameConversation: 2 }\n")));
   assert.equal(policyHash(parsePolicy("parallel: 3\n")), policyHash(DEFAULT_POLICY)); // the defaults, written out
   // Pinned: changing a default changes the actor of every new run's policy approvals. Update this on purpose.
-  assert.equal(policyHash(DEFAULT_POLICY), "d716c2b781e1"); // budget reservations and the daily limit added
+  assert.equal(policyHash(DEFAULT_POLICY), "f5876db4ddfa"); // governance.assessmentPlan added
 });
 
 test("pinnedPolicy: a run keeps what it pinned, and a setting added since (a block, or a key in a block) has its default", () => {

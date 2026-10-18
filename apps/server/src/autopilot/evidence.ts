@@ -142,6 +142,8 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
     decisions: inbox.map((item) => ({
       id: item.id, workOrderId: item.workOrderId, kind: item.kind, state: item.state,
       decision: item.decision, decidedBy: item.decidedBy, decidedAt: item.decidedAt,
+      // The commit an ISSO or release approval was bound to.
+      commit: item.ref?.startsWith("commit:") ? item.ref.slice("commit:".length) : null,
     })),
     audit: {
       verified: true as const, checked: log.verification.checked, checkpoint: log.checkpoint,
