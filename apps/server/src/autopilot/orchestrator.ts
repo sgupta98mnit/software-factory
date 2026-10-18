@@ -23,6 +23,7 @@ import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
 import { assessmentGaps, assessmentResults, attestationGaps, MissingFacts, runStatement, signDsse, signingKey } from "./attest.js";
 import { exportEvidence } from "./evidence.js";
+import { createNotifier } from "./notify.js";
 import { evidenceRoot, pruneEvidence, retentionDays, storeEvidence } from "./evidence-store.js";
 import {
   createExecution,
@@ -144,6 +145,10 @@ export interface OrchestratorDeps {
   commandRetryMs?: number;
   /** How long a message that may have arrived is given to show up in its conversation before it's sent again. Tests use 0. */
   reconcileMs?: number;
+  /** The time, for the day's budget and the digest hour. Tests set it. */
+  clock?: () => Date;
+  /** First retry delay of a failed notification (doubles, at most 30 minutes). Tests use 0. */
+  notifyRetryMs?: number;
 }
 
 /** What a run pinned to verify its work, at creation: the checks, where they came from, and the test writer's hidden tests. */
@@ -296,6 +301,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   const agents = new Map<number, OpenHandsClient>(); // container attempts' agent servers, by attempt id
   let lastPreflight: Preflight | null = null;
   const trivy = deps.trivy ?? trivyCli();
+  const clock = deps.clock ?? (() => new Date());
+  const notifier = createNotifier({
+    ledger,
+    url: (deps.env ?? process.env).SF_NOTIFY_WEBHOOK,
+    canvasUrl: ((deps.env ?? process.env).SF_CANVAS_URL ?? "http://localhost:8000").replace(/\/+$/, ""),
+    record: (action, data) => record(SYSTEM, action, "notifications", data),
+    retryMs: deps.notifyRetryMs,
+  });
   /** Null for runs from before trusted verification: they keep their old checks. */
   const verificationOf = (run: Pick<Run, "verification">) => run.verification as Verification | null;
   const validatorDir = (run: Run) => path.join(worktrees, run.id, "validator");
@@ -463,7 +476,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   const reserving = new Set<number>();
   /** Local midnight, and the key of the day's raised limit. */
   function today() {
-    const d = new Date();
+    const d = new Date(clock());
     d.setHours(0, 0, 0, 0);
     return { since: d.toISOString(), key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` };
   }
@@ -2252,6 +2265,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     for (const runId of new Set(ledger.liveRuntimes().map((a) => a.runId))) {
       if (TERMINAL.has(ledger.getRun(runId)?.state ?? "done")) launch(runId, () => releaseRetired(runId));
     }
+    await notify().catch(warn);
+  }
+
+  // The digest hour comes from the workspace's current policy, read again every 15 minutes.
+  let digestHour = { hour: DEFAULT_POLICY.notify.digestHour, readAt: -Infinity };
+  async function notify() {
+    if (!notifier.enabled) return;
+    if (Date.now() - digestHour.readAt > 15 * 60_000) digestHour = { hour: ((await currentPolicy()).policy ?? DEFAULT_POLICY).notify.digestHour, readAt: Date.now() };
+    await notifier.step(digestHour.hour, { day: today().key, hour: clock().getHours() });
   }
 
   /** Containers this factory owns that no live attempt accounts for (a crash mid-gate, say) go when it starts. */
@@ -2733,6 +2755,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       scheduler: schedulerStatus(),
       // Whether a run started now would deliver, and whether the token it needs is there (never the token).
       delivery: { mode: (policy ?? DEFAULT_POLICY).delivery.mode, repository: (policy ?? DEFAULT_POLICY).delivery.repository, tokenSet: !!process.env.SF_GITHUB_TOKEN },
+      // Whether new Inbox items are posted to a webhook (never its URL), and why posting fails, if it does.
+      notify: { webhook: notifier.enabled, failing: notifier.failing() },
       openInbox: ledger.openInboxCount(),
       activeRuns: ledger.listRuns().filter((r) => !TERMINAL.has(r.state)).length,
     };

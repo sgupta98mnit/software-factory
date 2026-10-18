@@ -103,6 +103,8 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 | `SF_TRIVY` | `trivy` | The Trivy binary Autopilot's security scan runs |
 | `SF_GITHUB_TOKEN` | none | Token for pull request delivery: fine-grained, one repository, Contents read/write, Pull requests read/write, Checks and Commit statuses read |
 | `SF_TRIVY_SHA256` | none | The Trivy binary's sha256; with it set, `SF_TRIVY` must be the binary's full path and any other binary is refused |
+| `SF_NOTIFY_WEBHOOK` | none | Where new Inbox items and the daily digest are posted (https; http only on this machine). See [Notifications](#notifications) |
+| `SF_CANVAS_URL` | `http://localhost:8000` | Canvas's address, for the links in notifications |
 
 ## Autopilot policy
 
@@ -117,6 +119,7 @@ repair: { sameConversation: 2, fresh: 1 }
 budget: { perWorkOrderUsd: 5, perChangeUsd: 30, reserveUsd: 1, perDayUsd: null }   # perDayUsd: across runs, per local day; null = none
 spec: { validateTries: 3, criticRounds: 2 }
 review: { blocking: [critical, high] }
+notify: { digestHour: 17 }                           # local hour of the daily digest (with SF_NOTIFY_WEBHOOK)
 gates: null                                          # null = npm typecheck/lint/test scripts; or [{ name, run, cwd?, timeoutSec? }]
 autoMerge:
   maxChangedLines: 400
@@ -162,7 +165,7 @@ governance:
   assessmentPlan: null                               # the agency's OSCAL assessment plan (a URI) that assessment results import
 ```
 
-A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` and `notify` are accepted for features still to come; `delivery` is described under [Pull request delivery](#pull-request-delivery); `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification), `governance` under [ISSO and release approvals](#isso-and-release-approvals).
+A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` is accepted for a feature still to come; `notify` is described under [Notifications](#notifications); `delivery` is described under [Pull request delivery](#pull-request-delivery); `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification), `governance` under [ISSO and release approvals](#isso-and-release-approvals).
 
 Autopilot checks reported conversation costs before starting more work and after each poll. At the run limit (the amount entered in Home, or `budget.perChangeUsd`), it pauses the run's agents and opens a budget decision in the Inbox. At a work order's limit, it pauses that order while the others continue. Continue adds the policy's base budget to the relevant limit; Skip ends that work order; Cancel ends the run. Limits and decisions persist across restarts, and a normal Resume cannot bypass a run budget decision. Spending can rise between checks or while a pause request completes; enforcement depends on the agent server reporting costs.
 
@@ -234,6 +237,10 @@ The response contains `packet` and its SHA-256 `digest`. Hash only `packet` usin
 Artifact identity comes from the run's terminal audit event, never the current branch tip. Missing commits are marked unavailable; older failed/cancelled runs may have no recorded artifact. Historical gate checks lack commit binding, and output hashes cover only the stored output tail, not the full command log. Raw goals/prompts, agent replies, gate output, approval notes and arbitrary audit payloads are excluded. Work order titles and criteria remain project content: review them before sharing. Security scanning and independent validation are explicitly unrecorded; control mappings do not establish compliance.
 
 The [implementation roadmap](docs/autopilot/ROADMAP.md) selects approaches from the researched projects and sequences isolation, trusted verification, durable recovery, PR delivery and governance after this evidence foundation.
+
+## Notifications
+
+With `SF_NOTIFY_WEBHOOK` set, the factory posts each new Inbox item once, and a digest of open decisions and runs in progress once a day at `notify.digestHour` (local time). Posts are JSON with a `text` line, so a Slack or Teams incoming webhook shows them as they are, and they carry item titles and kinds, run change names and states, and links into Canvas (`SF_CANVAS_URL`). They never carry goals, notes, item details or prompts. A failed post is tried again later, waiting longer each time (at most 30 minutes), and items already sent aren't sent again. Home's status (`/sf-api/autopilot/status`, `notify`) says when posts are failing. The webhook's URL is never written to the audit log.
 
 ## Attestations and assessment results
 

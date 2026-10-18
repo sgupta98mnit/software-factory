@@ -232,6 +232,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
       verification: { hiddenTests: false, protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"], scanner: { mode: "off", ok: null, version: null, dbUpdatedAt: null, problem: null } },
       scheduler: { active: true, heldBy: null },
       delivery: { mode: "none", repository: null, tokenSet: !!process.env.SF_GITHUB_TOKEN },
+      notify: { webhook: false, failing: null },
       openInbox: 0,
       activeRuns: 0,
     });

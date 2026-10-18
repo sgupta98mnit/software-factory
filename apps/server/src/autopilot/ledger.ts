@@ -659,6 +659,15 @@ export function openLedger(file: string) {
     return Number(changes);
   }
 
+  /** Items a notification went out for: never posted again. */
+  function markNotified(ids: number[]) {
+    guard();
+    const at = now();
+    transaction(() => {
+      for (const id of ids) db.prepare("UPDATE inbox SET notified_at = $at WHERE id = $id").run({ id, at });
+    });
+  }
+
   function openInboxCount(): number {
     return count("SELECT COUNT(*) AS n FROM inbox WHERE state = 'open'", {});
   }
@@ -818,6 +827,7 @@ export function openLedger(file: string) {
     decideInbox,
     dismissInbox,
     openInboxCount,
+    markNotified,
     runCost,
     costSince,
     workOrderCost,
