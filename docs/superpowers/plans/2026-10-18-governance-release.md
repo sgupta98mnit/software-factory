@@ -48,4 +48,26 @@
 - [x] 4. Evidence store, retention, backup/verify/restore with a CLI; tests.
 - [x] 5. DSSE-signed in-toto Statement and OSCAL assessment results, gated on facts; tests.
 - [x] 6. Webhook notifications and digest; tests.
-- [ ] 7. Canvas (sign-in, the signed-in user, release state, exports) and docs; full verification.
+- [x] 7. Canvas (sign-in, the signed-in user, release state, exports) and docs; full verification.
+
+## Execution results (2026-10-18)
+
+One commit per part, on `claude/roadmap-m2-m6`: sign-in and roles; ISSO and release approvals; reservations and the daily limit; evidence retention, backup and restore (and its docs); attestations and OSCAL; notifications; then Canvas and docs.
+- New server tests:
+  - `autopilot-auth.test.ts` (3): a stand-in OIDC issuer; forged, wrongly signed, expired, wrong-audience and replayed sign-ins refused.
+  - `autopilot-governance.test.ts` (3): the ISSO approval bound to a verified commit, which an approver can't give and a new commit needs again; release four-eyes, the envelope and write-once evidence; a rejected release; a signed statement that verifies and a changed one that doesn't; OSCAL results, and the refusals naming what's missing.
+  - `autopilot-backup.test.ts` (3): admin only, sessions not even in free pages, restore only into an empty folder, and tampering (a changed, extra or escaping file, a broken chain, another manifest) refused.
+  - `autopilot-notify.test.ts` (2): posted once, retried without repeats, one digest a day at its hour, no goals, bodies or URL.
+  - Reservation cases in `autopilot-safety.test.ts` (3) and `pinnedPolicy` defaults in `autopilot-policy.test.ts`.
+- Caught along the way:
+  - A drift test that the factory itself defeated: the reviewer step throws away commits the builder didn't make. The ISSO test now uses a send-back and rebuild instead.
+  - `today()` changing the Date its clock returned.
+  - A backup copy helper that would have made the ledger read-only when restoring into a folder named `evidence`.
+- Updated on purpose:
+  - The default policy hash: `governance`, then `budget.reserveUsd` and `perDayUsd`, then `governance.assessmentPlan`; now `f5876db4ddfa`.
+  - A $0.25 budget test that can't fit a $1 reservation, raised to $1.25.
+  - The run and status shapes (`release`, `notify`).
+- Verification:
+  - `pnpm typecheck`, the server source and test typecheck, and `pnpm test`: 154/154.
+  - Canvas: `tsc --noEmit` clean, `eslint src/factory` 0 errors (11 existing warnings), factory Vitest 18/18. Patch regenerated.
+- Not verified: a real identity provider (Entra ID, Okta), write-once storage, an OSCAL schema validator, and Slack or Teams webhooks themselves.

@@ -65,7 +65,7 @@ test("new Inbox items are posted once, a failed post is retried without repeats,
     assert.equal(ledger.getInbox(first.id)?.notifiedAt, null, "so the item isn't marked sent");
     assert.match((await o.status()).notify.failing ?? "", /answered 500/);
     await tick();
-    assert.deepEqual(hook.posts, [
+    assert.deepEqual(hook.posts.slice(), [
       {
         type: "software-factory.inbox",
         text: "Software Factory: a decision needs you: Approve the plan for add-x. https://factory.example.gov/inbox",

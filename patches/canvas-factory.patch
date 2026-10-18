@@ -1,9 +1,9 @@
 diff --git a/__tests__/factory/autopilot.test.tsx b/__tests__/factory/autopilot.test.tsx
 new file mode 100644
-index 0000000..131da24
+index 0000000..fbed9fa
 --- /dev/null
 +++ b/__tests__/factory/autopilot.test.tsx
-@@ -0,0 +1,902 @@
+@@ -0,0 +1,925 @@
 +import { screen, waitFor, within } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
 +import { http, HttpResponse } from "msw";
@@ -431,6 +431,7 @@ index 0000000..131da24
 +  verification,
 +  scheduler: { active: true, heldBy: null },
 +  delivery: { mode: "none", repository: null, tokenSet: false },
++  notify: { webhook: false, failing: null },
 +  openInbox: 0,
 +  activeRuns: 0,
 +});
@@ -685,6 +686,28 @@ index 0000000..131da24
 +    expect(
 +      await screen.findByText(
 +        /Another factory process \(LAPTOP:4242:ab12cd34\) is running Autopilot/,
++      ),
++    ).toBeInTheDocument();
++  });
++
++  it("says on Home when notifications aren't getting through", async () => {
++    renderHome({
++      ...statusWith({
++        provider: "local",
++        isolated: false,
++        required: false,
++        image: null,
++        network: null,
++        preflight: null,
++      }),
++      notify: {
++        webhook: true,
++        failing: "The notification webhook answered 500.",
++      },
++    });
++    expect(
++      await screen.findByText(
++        "Notifications aren't getting through: The notification webhook answered 500. The factory keeps trying.",
 +      ),
 +    ).toBeInTheDocument();
 +  });
@@ -1019,10 +1042,10 @@ index 0000000..a8c56bc
 +  factory self-contained. Other Canvas languages fall back to English.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..5a3b2fb
+index 0000000..3fc835d
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,610 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -1470,6 +1493,8 @@ index 0000000..5a3b2fb
 +    repository: string | null;
 +    tokenSet: boolean;
 +  };
++  /** Whether new Inbox items are posted to a webhook, and why posting fails while it does. */
++  notify: { webhook: boolean; failing: string | null };
 +  openInbox: number;
 +  activeRuns: number;
 +}
@@ -2722,10 +2747,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..b110c65
+index 0000000..e209fe9
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,1177 @@
+@@ -0,0 +1,1181 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -2820,6 +2845,8 @@ index 0000000..b110c65
 +    executionReady: "Isolation check passed.",
 +    executionProblems: "Runs can't start until these are fixed:",
 +    executionNotes: "Not checked:",
++    notifyFailing: (error: string) =>
++      `Notifications aren't getting through: ${error} The factory keeps trying.`,
 +    standby: (owner: string) =>
 +      `Another factory process (${owner}) is running Autopilot on this data folder. This one only shows its runs: start and decide there, or stop it.`,
 +    scannerReady: (version: string, db: string) =>
@@ -3396,6 +3423,8 @@ index 0000000..b110c65
 +    executionReady: "La comprobación de aislamiento es correcta.",
 +    executionProblems: "No se pueden iniciar ejecuciones hasta corregir esto:",
 +    executionNotes: "Sin comprobar:",
++    notifyFailing: (error) =>
++      `Las notificaciones no llegan: ${error} La fábrica sigue intentándolo.`,
 +    standby: (owner) =>
 +      `Otro proceso de la fábrica (${owner}) ejecuta Autopilot con esta carpeta de datos. Este solo muestra sus ejecuciones: inicie y decida allí, o deténgalo.`,
 +    scannerReady: (version, db) =>
@@ -4531,10 +4560,10 @@ index 0000000..aa8eaad
 +}
 diff --git a/src/factory/routes/autopilot-home.tsx b/src/factory/routes/autopilot-home.tsx
 new file mode 100644
-index 0000000..6672ce1
+index 0000000..970a05f
 --- /dev/null
 +++ b/src/factory/routes/autopilot-home.tsx
-@@ -0,0 +1,611 @@
+@@ -0,0 +1,622 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
@@ -4892,6 +4921,17 @@ index 0000000..6672ce1
 +          />
 +          <span className="min-w-0 break-words">
 +            {copy.autopilot.standby(status.data.scheduler.heldBy)}
++          </span>
++        </p>
++      ) : null}
++      {status.data?.notify?.failing ? (
++        <p role="status" className="flex items-start gap-2 text-foreground">
++          <TriangleAlert
++            className="mt-0.5 size-4 shrink-0 text-warning"
++            aria-hidden
++          />
++          <span className="min-w-0 break-words">
++            {copy.autopilot.notifyFailing(status.data.notify.failing)}
 +          </span>
 +        </p>
 +      ) : null}
