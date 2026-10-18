@@ -83,6 +83,7 @@ export interface Run {
   pausedReason: string | null;
   policyHash: string | null;
   policy: unknown; // the effective policy pinned for the run, null until set
+  verification: unknown; // Verification (orchestrator.ts): the pinned checks and hidden tests; null for runs from before it
   specConversation: string | null;
   createdBy: string;
   createdAt: string;
@@ -141,6 +142,8 @@ export interface Check {
   durationMs: number | null;
   output: string; // the tail, at most OUTPUT_LIMIT chars
   runner: "local" | "container" | null; // where the gate ran; null for checks from before isolation
+  sha: string | null; // the commit it checked; null for checks from before commit binding
+  meta: unknown; // what else a check records (a scanner's version and database, result digests); no secrets
   at: string;
 }
 
@@ -167,7 +170,7 @@ export type NewWorkOrder = Pick<WorkOrder, "seq" | "title" | "acceptance" | "con
   Partial<Omit<WorkOrder, "id" | "runId" | "updatedAt">>;
 export type NewAttempt = Pick<Attempt, "runId" | "role" | "conversationId"> & Partial<Omit<Attempt, "id">>;
 export type NewCheck = Pick<Check, "runId" | "stage" | "name" | "ok"> &
-  Partial<Pick<Check, "workOrderId" | "exitCode" | "durationMs" | "output" | "runner">>;
+  Partial<Pick<Check, "workOrderId" | "exitCode" | "durationMs" | "output" | "runner" | "sha" | "meta">>;
 export type NewInboxItem = Pick<InboxItem, "runId" | "kind" | "title" | "body" | "options"> &
   Partial<Pick<InboxItem, "workOrderId">>;
 
@@ -271,8 +274,15 @@ ALTER TABLE attempts ADD COLUMN runtime TEXT;
 ALTER TABLE checks ADD COLUMN runner TEXT;
 `;
 
+// v3: trusted verification: what each check checked, and the run's pinned checks.
+const SCHEMA_V3 = `
+ALTER TABLE checks ADD COLUMN sha TEXT;
+ALTER TABLE checks ADD COLUMN meta TEXT;
+ALTER TABLE runs ADD COLUMN verification TEXT;
+`;
+
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
-const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "runtime"]);
+const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "runtime", "meta", "verification"]);
 const FLAG_COLUMNS = new Set(["seen_running", "ok"]);
 const toColumn = (field: string) => field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toField = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -324,6 +334,7 @@ export function openLedger(file: string) {
   const { user_version: version } = db.prepare("PRAGMA user_version").get() as { user_version: number };
   if (version < 1) transaction(() => db.exec(`${SCHEMA_V1}\nPRAGMA user_version = 1;`));
   if (version < 2) transaction(() => db.exec(`${SCHEMA_V2}\nPRAGMA user_version = 2;`));
+  if (version < 3) transaction(() => db.exec(`${SCHEMA_V3}\nPRAGMA user_version = 3;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),

@@ -5,9 +5,9 @@
 // before it. Work orders whose dependencies are all done build in parallel, so
 // the dependency graph is cut into waves. Controls come from design.md's
 // Controls table (planner.ts), and a rough risk score says which need care.
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import { controlsFor, controlTable } from "../planner.js";
+import { readInside } from "./git.js";
 import type { NewWorkOrder, Risk } from "./ledger.js";
 
 export interface TaskGroup {
@@ -99,13 +99,7 @@ export function riskOf(wo: { title: string; acceptance: string[]; controls: stri
 
 /** Work orders for the change in `dir` (the run's integration worktree). Throws, saying what to fix, when tasks.md can't be planned. */
 export function planWorkOrders(dir: string, change: string): NewWorkOrder[] {
-  const read = (file: string) => {
-    try {
-      return readFileSync(path.join(dir, "openspec", "changes", change, file), "utf8");
-    } catch {
-      return null;
-    }
-  };
+  const read = (file: string) => readInside(dir, path.join("openspec", "changes", change, file));
   const tasks = read("tasks.md");
   if (tasks === null) throw new Error(`openspec/changes/${change}/tasks.md is missing.`);
   const groups = parseTasks(tasks);

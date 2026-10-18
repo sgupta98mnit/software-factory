@@ -60,7 +60,10 @@ export interface DockerResult {
 /** Runs the Docker CLI. `env` adds variables to its environment: that's how `-e NAME` gets a value without it showing in argv. */
 export type DockerRunner = (args: string[], opts?: { env?: Record<string, string>; timeoutMs?: number }) => Promise<DockerResult>;
 
-export function dockerCli(command = process.env.SF_DOCKER || "docker"): DockerRunner {
+export const dockerCli = (command = process.env.SF_DOCKER || "docker"): DockerRunner => cliRunner(command);
+
+/** Runs an external command without a shell (Docker, Trivy). `code` -1: it couldn't be started; 124: it timed out and was killed. */
+export function cliRunner(command: string): DockerRunner {
   return (args, opts = {}) =>
     new Promise((resolve) => {
       execFile(
@@ -397,7 +400,8 @@ function containerExecution(c: ContainerPolicy, deps: ExecutionDeps): Execution 
             "-w", path.posix.join(WORKDIR, (gate.cwd ?? "").replaceAll("\\", "/")),
             "-e", "CI=1", "-e", "NO_COLOR=1", "-e", "FORCE_COLOR=0",
             "--entrypoint", "sh",
-            gateImage, "-c", gate.run,
+            // A script body pinned from the base runs with node_modules/.bin on PATH, as npm would run it.
+            gateImage, "-c", gate.bin ? `PATH="$PWD/node_modules/.bin:${WORKDIR}/node_modules/.bin:$PATH"; ${gate.run}` : gate.run,
           ],
           { timeoutMs: timeoutSec * 1000 },
         );

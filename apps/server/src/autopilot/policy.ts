@@ -49,9 +49,23 @@ export interface Policy {
   gates: Gate[] | null;
   autoMerge: { maxChangedLines: number; sensitivePaths: string[]; dependencyAllowlist: string[] };
   budget: { perWorkOrderUsd: number; perChangeUsd: number };
+  /** Independent acceptance tests a validator agent writes from the spec; they run on every work order's commit. */
   hiddenTests: { enabled: boolean; run: string };
   notify: { digestHour: number };
   execution: { provider: "local" | "container"; container: ContainerPolicy };
+  verification: {
+    /** What a work order may not change; the factory puts these back as they were on its base. */
+    protectedPaths: string[];
+    /** Trivy, run by the factory: off, advisory (recorded; findings go back) or required (fails closed). */
+    trivy: {
+      mode: "off" | "advisory" | "required";
+      version: string | null; // the only version accepted, like "0.58.1"; null = any
+      scanners: ("vuln" | "secret" | "misconfig")[];
+      severities: Severity[]; // new findings of these severities send the work back
+      maxDbAgeHours: number;
+      timeoutSec: number;
+    };
+  };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -70,7 +84,7 @@ export const DEFAULT_POLICY: Policy = {
     dependencyAllowlist: [],
   },
   budget: { perWorkOrderUsd: 5, perChangeUsd: 30 },
-  hiddenTests: { enabled: true, run: "node --test" },
+  hiddenTests: { enabled: false, run: "node --test" },
   notify: { digestHour: 17 },
   execution: {
     provider: "local",
@@ -87,6 +101,10 @@ export const DEFAULT_POLICY: Policy = {
       credentials: { spec: [], critic: [], builder: [], reviewer: [], validator: [] },
       startTimeoutSec: 120,
     },
+  },
+  verification: {
+    protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"],
+    trivy: { mode: "off", version: null, scanners: ["vuln", "secret", "misconfig"], severities: ["critical", "high"], maxDbAgeHours: 72, timeoutSec: 600 },
   },
 };
 
@@ -176,6 +194,13 @@ const RULES: Record<string, Rule> = {
   "execution.container.hostPathStyle": oneOf(["native", "wsl"]),
   ...Object.fromEntries(Object.keys(DEFAULT_POLICY.agents).map((role) => [`execution.container.credentials.${role}`, listOf(credential)])),
   "execution.container.startTimeoutSec": seconds,
+  "verification.protectedPaths": listOf(text),
+  "verification.trivy.mode": oneOf(["off", "advisory", "required"]),
+  "verification.trivy.version": nullable(matching(/^\d+\.\d+\.\d+$/, 'a version like "0.58.1"')),
+  "verification.trivy.scanners": (v, key) => listOf(oneOf(["vuln", "secret", "misconfig"]))(v, key) ?? ((v as unknown[]).length ? null : `${key} must list at least one scanner`),
+  "verification.trivy.severities": listOf(oneOf(["critical", "high", "medium", "low"])),
+  "verification.trivy.maxDbAgeHours": positive,
+  "verification.trivy.timeoutSec": seconds,
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */
@@ -257,6 +282,7 @@ export interface MergeFacts {
   files: string[]; // paths the work order changes
   linesChanged: number;
   newDependencies: string[]; // package names its package.json files add
+  changedChecks?: string[]; // checks the run pinned from its base whose scripts the work changes (the next run would pin those)
 }
 
 // Case and leading dots don't matter: `**` doesn't reach into dot folders, and Windows doesn't care about case.
@@ -294,6 +320,7 @@ export function evaluateMerge(policy: Policy, facts: MergeFacts): { auto: boolea
   if (facts.hiddenTestsOk === false) reasons.push("Hidden acceptance tests failed.");
   if (!facts.reviewPassed) reasons.push(`The review didn't pass, or found something ${policy.review.blocking.join(" or ")}.`);
   if (facts.secretFindings > 0) reasons.push(`The secret scan found ${facts.secretFindings} possible secret(s) in the added lines.`);
+  if (facts.changedChecks?.length) reasons.push(`Changes the checks this run pinned from its base, which later runs would pin: ${some(facts.changedChecks)}.`);
   const unlisted = facts.newDependencies.filter((d) => !autoMerge.dependencyAllowlist.some((p) => p === d || path.posix.matchesGlob(d, p)));
   if (unlisted.length) reasons.push(`New dependencies not on the allowlist: ${some(unlisted)}.`);
   const sensitive = facts.files.flatMap((f) => {

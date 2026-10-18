@@ -90,6 +90,7 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
       budgetUsd: 12.5,
       policyHash: policyHash(DEFAULT_POLICY), // no policy.yml: the defaults, pinned
       execution: { provider: "local", isolated: false },
+      verification: { pinned: "worktree", gates: [], hiddenTests: "off", scan: "off" }, // nothing on the base to pin
       createdBy: "user:tester",
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -226,6 +227,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
       workspace: { path: workspace, isRepo: false, branch: null },
       policy: { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null },
       execution: { provider: "local", isolated: false, required: false, image: null, network: null, preflight: null },
+      verification: { hiddenTests: false, protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"], scanner: { mode: "off", ok: null, version: null, dbUpdatedAt: null, problem: null } },
       openInbox: 0,
       activeRuns: 0,
     });

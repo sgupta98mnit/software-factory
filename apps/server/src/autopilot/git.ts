@@ -3,8 +3,25 @@
 // wrote, merge work-order branches one at a time and read diffs. Agents never
 // branch or merge; the factory does, so branch names and history stay predictable.
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
+
+/**
+ * A file an agent wrote under `root`, or null. Never one that a symlink (of
+ * the file or a folder on the way) points outside `root` to: an agent in a
+ * container could otherwise make the factory read this machine's files.
+ */
+export function readInside(root: string, rel: string): string | null {
+  try {
+    const top = realpathSync.native(root);
+    const real = realpathSync.native(path.join(root, rel));
+    const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+    if (!fold(real).startsWith(fold(top + path.sep)) || !statSync(real).isFile()) return null;
+    return readFileSync(real, "utf8");
+  } catch {
+    return null;
+  }
+}
 
 export interface GitResult {
   code: number;
@@ -12,10 +29,14 @@ export interface GitResult {
   stderr: string;
 }
 
-// Same line endings and author on every machine, and paths printed as-is.
+// Same line endings and author on every machine, and paths printed as-is. The factory runs git in
+// folders agents wrote: no fsmonitor command and no look inside nested repositories, whose config an
+// agent could have written (these settings also reach the git processes git starts itself).
 const BASE_ARGS = [
   "-c", "core.autocrlf=false",
   "-c", "core.quotepath=false",
+  "-c", "core.fsmonitor=false",
+  "-c", "diff.ignoreSubmodules=all",
   "-c", "user.name=Software Factory",
   "-c", "user.email=factory@localhost",
 ];
@@ -112,6 +133,24 @@ export function addWorktree(repo: string, dir: string, branch: string, startPoin
     mkdirSync(path.dirname(dir), { recursive: true });
     await git(repo, ["worktree", "add", "-b", branch, dir, startPoint]);
   });
+}
+
+/** A throwaway checkout of `sha` at `dir`, on no branch: what the factory verifies, which no agent ever sees. */
+export function addDetachedWorktree(repo: string, dir: string, sha: string): Promise<void> {
+  return locked(repo, async () => {
+    if (existsSync(dir)) {
+      await git(repo, ["worktree", "remove", "--force", dir], { allowFail: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+    }
+    await git(repo, ["worktree", "prune"]);
+    mkdirSync(path.dirname(dir), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", dir, sha]);
+  });
+}
+
+/** Puts `paths` back as they are at `source` (deleting the ones it doesn't have), staged and in the folder. */
+export async function restorePaths(dir: string, source: string, paths: string[]): Promise<void> {
+  if (paths.length) await git(dir, ["restore", `--source=${source}`, "--staged", "--worktree", "--", ...paths]);
 }
 
 /** Removes the worktree folder; the branch stays. A missing folder is fine. */

@@ -13,7 +13,7 @@
 // One run is handled by one thing at a time: the scheduler's step for it, or
 // a person's decision, pause or cancel, which wait for that step to finish.
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { audit, auditFor, sha256 } from "../audit.js";
 import { isolationRequired } from "../config.js";
@@ -29,8 +29,9 @@ import {
   type ExecutionFacts,
   type Preflight,
 } from "./execution.js";
-import { detectGates, gateFindings, runGates, type GateResult } from "./gates.js";
+import { detectGates, gateFindings, gatesAt, hiddenSummary, installGates, packageDirs, runGates, type Gate, type GateResult } from "./gates.js";
 import {
+  addDetachedWorktree,
   addWorktree,
   commitAll,
   currentBranch,
@@ -43,8 +44,10 @@ import {
   isClean,
   isRepoRoot,
   mergeInto,
+  readInside,
   removeWorktree,
   resetHard,
+  restorePaths,
 } from "./git.js";
 import { mergeAndTest } from "./integrator.js";
 import type {
@@ -73,9 +76,25 @@ import {
   reviseFollowUp,
   specBrief,
   validateFollowUp,
+  validatorBrief,
+  validatorFollowUp,
   verdictReminder,
 } from "./prompts.js";
-import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash } from "./policy.js";
+import { DEFAULT_POLICY, evaluateMerge, loadPolicy, newDependencies, pinnedPolicy, POLICY_FILE, policyHash, sensitiveMatch } from "./policy.js";
+import {
+  counts,
+  findingKey,
+  scan,
+  scanDigest,
+  scanFindings,
+  ScannerUnavailable,
+  scannerInfo,
+  trivyCli,
+  describe as describeScan,
+  type ScanFinding,
+  type ScannerInfo,
+  type ScannerRunner,
+} from "./scanner.js";
 import { clusterFindings, parseVerdict, passed, type ReviewVerdict } from "./review.js";
 import {
   assumptionsOf,
@@ -103,7 +122,21 @@ export interface OrchestratorDeps {
   env?: NodeJS.ProcessEnv;
   /** Ports on this machine that agents in containers must not reach: the factory API and Canvas. */
   controlPorts?: number[];
+  /** The Trivy CLI, for policies that scan. Tests pass a fake. */
+  trivy?: ScannerRunner;
 }
+
+/** What a run pinned to verify its work, at creation: the checks, where they came from, and the test writer's hidden tests. */
+export interface Verification {
+  gates: Gate[] | null; // null: the base branch defines none, so the work order's own scripts run (unpinned)
+  source: "policy" | "base" | "worktree";
+  baseSha: string;
+  hiddenTests: { files: { name: string; seq: number; sha256: string }[]; digest: string } | null;
+}
+
+const HIDDEN_FILE = /^wo-(\d+)-[a-z0-9][a-z0-9-]*\.test\.mjs$/;
+const HIDDEN_MAX_BYTES = 200_000;
+const HIDDEN_MAX_FILES = 300;
 
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
 const TERMINAL = new Set<RunState>(["done", "failed", "cancelled"]);
@@ -180,6 +213,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   const executionFor = (run: Pick<Run, "policy">) => createExecution(pinnedPolicy(run), execDeps);
   const agents = new Map<number, OpenHandsClient>(); // container attempts' agent servers, by attempt id
   let lastPreflight: Preflight | null = null;
+  const trivy = deps.trivy ?? trivyCli();
+  /** Null for runs from before trusted verification: they keep their old checks. */
+  const verificationOf = (run: Pick<Run, "verification">) => run.verification as Verification | null;
+  const validatorDir = (run: Run) => path.join(worktrees, run.id, "validator");
+  const validatorBranch = (run: Run) => `${run.integrationBranch}--validator`;
+  // Outside every worktree, so no builder ever has them: the hidden tests, and the clean checkouts verified.
+  const hiddenDir = (runId: string) => path.join(deps.dataDir, "hidden-tests", runId);
+  const verifyDir = (runId: string, name: string) => path.join(deps.dataDir, "verify", runId, name);
 
   const changed = (runId: string) => broadcast({ type: "autopilot.changed", runId });
   const record = (actor: string, action: string, runId: string, data: Record<string, unknown> = {}) => {
@@ -355,7 +396,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (all.some((x) => x.id > a.id && x.role === a.role && x.workOrderId === a.workOrderId)) return true;
     const wo = a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined;
     if (wo && (DONE_WO.has(wo.state) || wo.state === "cancelled")) return true;
-    if ((a.role === "critic" || a.role === "reviewer") && handled(a)) return true;
+    if ((a.role === "critic" || a.role === "reviewer" || a.role === "validator") && handled(a)) return true;
     return a.role === "spec" && (run.state === "building" || run.resumeState === "building");
   }
 
@@ -428,8 +469,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** The first message of an attempt, rebuilt from the ledger so a restart sends the same one. */
   function briefFor(run: Run, a: Attempt, wo: WorkOrder | undefined): string {
     const isolated = executionFor(run).kind === "container";
-    if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo, isolated }) : builderBrief({ change: run.change, wo, gates: pinnedPolicy(run).gates, isolated });
+    if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo, isolated }) : builderBrief({ change: run.change, wo, gates: verificationOf(run)?.gates ?? pinnedPolicy(run).gates, isolated });
     if (a.role === "critic") return criticBrief({ change: run.change });
+    if (a.role === "validator") return validatorBrief({ change: run.change, workOrders: ledger.listWorkOrders(run.id), run: pinnedPolicy(run).hiddenTests.run });
     // A spec agent started after one that failed (or whose tasks.md couldn't be planned) hears why.
     const before = ledger.listAttempts({ runId: run.id, role: "spec" }).filter((x) => x.id < a.id).at(-1);
     const problem = (before?.result as { reason?: string } | null)?.reason ?? null;
@@ -440,7 +482,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function startConversation(a: Attempt) {
     const run = ledger.getRun(a.runId);
     const wo = a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined;
-    const dir = wo ? wo.worktree : run?.integrationDir; // builders and reviewers work in their work order's worktree
+    // Builders and reviewers work in their work order's worktree, the test writer in its own.
+    const dir = wo ? wo.worktree : a.role === "validator" && run ? validatorDir(run) : run?.integrationDir;
     if (!run || !dir || !a.agentProfile) throw new Error(`Attempt ${a.id} has no worktree or agent profile to start with`);
     const exec = executionFor(run);
     try {
@@ -715,6 +758,77 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     ].join("\n");
   }
 
+  // ---- independent acceptance tests: the test writer ----
+
+  /**
+   * With hiddenTests enabled, a test writer (another vendor than the spec
+   * agent, when there is one) writes black-box tests from the spec in its own
+   * worktree. The factory keeps them outside every worktree, with digests,
+   * and removes that worktree. Until then, finished work waits in verifying.
+   */
+  async function validatorStep(run: Run) {
+    const v = verificationOf(run);
+    if (!v || !pinnedPolicy(run).hiddenTests.enabled || v.hiddenTests) return;
+    const a = latest(run.id, "validator");
+    // None yet, or a person's retry after the last one failed.
+    if (!a || (handled(a) && (a.result as { outcome?: string } | null)?.outcome === "failed")) return startValidator(run);
+    if (ACTIVE.has(a.state) || a.state === "paused" || handled(a)) return;
+    if (a.state !== "finished") {
+      const why = await whyStopped(a, "The test writer");
+      markHandled(a, { outcome: "failed" });
+      throw new Error(`${why} Retry starts a new test writer.`);
+    }
+    const files = collectHiddenTests(run);
+    if (!files.length) {
+      if (a.turns < 2) return sendFollowUp(a, validatorFollowUp(), "no_tests");
+      markHandled(a, { outcome: "failed" });
+      throw new Error("The test writer wrote no tests named .hidden-tests/wo-<N>-<scenario>.test.mjs, even when asked again. Retry starts a new test writer.");
+    }
+    const digest = sha256(files.map((f) => `${f.name}:${f.sha256}`).join("\n"));
+    ledger.transaction(() => {
+      markHandled(a, { outcome: "written", files: files.length });
+      ledger.updateRun(run.id, { verification: { ...v, hiddenTests: { files, digest } } });
+      ledger.addCheck({ runId: run.id, stage: "spec", name: "hidden-tests-written", ok: true, output: `${files.length} hidden test(s) for ${new Set(files.map((f) => f.seq)).size} work order(s), kept outside every worktree.`, meta: { files: files.length, digest } });
+    });
+    record(SYSTEM, "autopilot.hidden_tests_recorded", run.id, { attempt: a.id, files: files.length, digest });
+    await releaseAttempt(run, ledger.getAttempt(a.id) ?? a);
+    await removeWorktree(workspace, validatorDir(run)).catch(warn);
+    await deleteBranch(workspace, validatorBranch(run)).catch(warn);
+    changed(run.id);
+  }
+
+  async function startValidator(run: Run) {
+    const profile = await checkerProfile(pinnedPolicy(run).agents.validator, latest(run.id, "spec")?.agentProfile);
+    await releaseMounted(run, null); // an earlier test writer's container has the old worktree mounted
+    await addWorktree(workspace, validatorDir(run), validatorBranch(run), await headSha(workspace, run.integrationBranch));
+    const attempt = ledger.addAttempt({ runId: run.id, role: "validator", conversationId: randomUUID(), agentProfile: profile.id });
+    record(SYSTEM, "autopilot.agent_started", run.id, { role: "validator", attempt: attempt.id, conversationId: attempt.conversationId, profile: profile.name });
+    await startConversation(attempt);
+  }
+
+  /** The test writer's files that follow the naming rule, for work orders the run has: copied out, with their digests. */
+  function collectHiddenTests(run: Run) {
+    const source = path.join(validatorDir(run), ".hidden-tests");
+    const seqs = new Set(ledger.listWorkOrders(run.id).map((w) => w.seq));
+    let names: string[] = [];
+    try {
+      // Regular files only: a symlink could point anywhere on this machine.
+      names = readdirSync(source).filter((n) => HIDDEN_FILE.test(n) && lstatSync(path.join(source, n)).isFile());
+    } catch {
+      return [];
+    }
+    const kept: { name: string; seq: number; sha256: string }[] = [];
+    mkdirSync(hiddenDir(run.id), { recursive: true });
+    for (const name of names.sort().slice(0, HIDDEN_MAX_FILES)) {
+      const seq = Number(HIDDEN_FILE.exec(name)?.[1]);
+      const text = seqs.has(seq) ? readInside(source, name) : null;
+      if (text === null || text.length > HIDDEN_MAX_BYTES) continue;
+      writeFileSync(path.join(hiddenDir(run.id), name), text);
+      kept.push({ name, seq, sha256: sha256(text) });
+    }
+    return kept;
+  }
+
   // ---- build stage: dispatch, gates, review, repair ----
 
   const builders = (wo: WorkOrder) => ledger.listAttempts({ runId: wo.runId, workOrderId: wo.id, role: "builder" });
@@ -732,6 +846,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    * that throws stops only its work order, which goes to a person.
    */
   async function buildStep(run: Run) {
+    await validatorStep(run); // builders start meanwhile; their work waits in verifying for the hidden tests
     // ponytail: one work order's gates and one merge's integration gates per step, so polling and a person's action wait for two gate runs at most; give gates their own task if suites get slow.
     let gated = false;
     for (const wo of ledger.listWorkOrders(run.id)) {
@@ -823,23 +938,207 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
   }
 
-  /** The factory's own checks on the committed work: pass -> a reviewer, fail -> a repair round. */
+  /**
+   * The checks a run runs: the policy's or the base branch's pinned at
+   * creation (with installs where needed), else the branch's own scripts.
+   * Runs from before pinning keep the policy's gates or detection.
+   */
+  function gatesFor(run: Run, dir: string): Gate[] {
+    const v = verificationOf(run);
+    if (!v) return pinnedPolicy(run).gates ?? detectGates(dir);
+    if (v.source === "policy" && v.gates) return v.gates;
+    if (v.source === "base" && v.gates) return [...installGates(dir, v.gates.map((g) => g.cwd ?? "")), ...v.gates];
+    return detectGates(dir);
+  }
+
+  /**
+   * The factory's own checks on the committed work: protected paths put back,
+   * the pinned gates, then (on a clean checkout of the commit) the security
+   * scan and the hidden tests. All pass -> `verified` for that commit and a
+   * reviewer; anything else -> a repair round.
+   */
   async function verify(run: Run, wo: WorkOrder) {
+    const v = verificationOf(run);
+    // Independent tests exist before any work is judged.
+    if (v && pinnedPolicy(run).hiddenTests.enabled && !v.hiddenTests) return;
     const dir = wo.worktree as string;
+    if (v) await restoreProtected(run, wo);
+    const sha = await headSha(dir);
     const exec = executionFor(run);
-    const { ok, results } = await runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), exec.gateRunner(dir, run.id));
-    recordGates(run, wo, "build", results);
+    const { ok, results } = await runGates(dir, gatesFor(run, dir), exec.gateRunner(dir, run.id));
+    recordGates(run, wo, "build", results, sha);
     if (!ok) return repair(run, wo, gateFindings(results));
     await discardChanges(dir); // what the gates left (build output), so anything left after the review is the reviewer's
+    if (v) {
+      const findings = await verifyCommit(run, wo, sha);
+      if (findings.length) return repair(run, wo, findings);
+    }
     await startReviewer(run, wo);
   }
 
-  /** One check per gate, and one audit record for the lot. */
-  function recordGates(run: Run, wo: WorkOrder, stage: "build" | "integrate", results: GateResult[]) {
+  /** What the work may not change (the factory's rules, the hidden tests) goes back to how its base has it, recorded. */
+  async function restoreProtected(run: Run, wo: WorkOrder) {
+    const dir = wo.worktree as string;
+    const base = wo.baseSha as string;
+    const { files } = await diffStat(dir, base, "HEAD");
+    const hits = files.map((f) => f.path).filter((p) => sensitiveMatch(p, pinnedPolicy(run).verification.protectedPaths));
+    if (!hits.length) return;
+    await restorePaths(dir, base, hits);
+    const sha = await commitAll(dir, `WO-${wo.seq}: put back paths verification protects`);
+    const list = hits.map((h) => `- ${h}`).join("\n");
+    ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: "protected-paths", ok: false, sha, output: `The work changed paths that verification protects. The factory put them back as they are on its base (${base.slice(0, 12)}):\n${list}` });
+    record(SYSTEM, "autopilot.protected_paths_restored", run.id, { workOrder: `WO-${wo.seq}`, paths: hits.slice(0, 20), sha });
+    changed(run.id);
+  }
+
+  /**
+   * The security scan and the hidden tests, on a throwaway checkout of `sha`
+   * no agent has seen. Nothing found -> a `verified` check for that commit,
+   * which is what merging asks for.
+   */
+  async function verifyCommit(run: Run, wo: WorkOrder, sha: string): Promise<Finding[]> {
+    const policy = pinnedPolicy(run);
+    const v = verificationOf(run) as Verification;
+    const scanning = policy.verification.trivy.mode !== "off";
+    const hidden = policy.hiddenTests.enabled ? (v.hiddenTests?.files ?? []).filter((f) => f.seq === wo.seq) : [];
+    const findings: Finding[] = [];
+    const facts: Record<string, unknown> = { gates: v.source, scan: scanning ? policy.verification.trivy.mode : "off", hidden: policy.hiddenTests.enabled ? (hidden.length ? hidden.length : "none for this work order") : "off" };
+    if (scanning || hidden.length) {
+      const tree = verifyDir(run.id, `wo-${wo.seq}`);
+      await addDetachedWorktree(workspace, tree, sha);
+      try {
+        // The scan first, while the checkout has nothing installed in it.
+        if (scanning) {
+          const scanned = await scanStep(run, wo, tree, sha);
+          findings.push(...scanned.findings);
+          facts.scanStatus = scanned.status;
+        }
+        if (hidden.length) {
+          const failed = await hiddenStep(run, wo, tree, hidden.map((f) => f.name), sha);
+          findings.push(...failed);
+          facts.hiddenStatus = failed.length ? "failed" : "passed";
+        }
+      } finally {
+        await removeWorktree(workspace, tree).catch(warn);
+      }
+    }
+    if (!findings.length) {
+      ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: "verified", ok: true, sha, output: `Every required check passed on ${sha.slice(0, 12)}.`, meta: facts });
+      record(SYSTEM, "autopilot.commit_verified", run.id, { workOrder: `WO-${wo.seq}`, sha, ...facts });
+      changed(run.id);
+    }
+    return findings;
+  }
+
+  /**
+   * Trivy on the commit, compared with its base: only what the work adds
+   * counts, and only the policy's severities send it back. A scanner that
+   * can't answer is recorded; in required mode the work order stops for a person.
+   */
+  async function scanStep(run: Run, wo: WorkOrder, tree: string, sha: string): Promise<{ findings: Finding[]; status: string }> {
+    const tp = pinnedPolicy(run).verification.trivy;
+    try {
+      const info = await scannerInfo(trivy, tp);
+      const found = await scan(trivy, tree, tp);
+      const baseline = await baselineKeys(run, wo.baseSha as string, info);
+      const fresh = found.filter((f) => !baseline.has(findingKey(f)));
+      const blocking = fresh.filter((f) => tp.severities.includes(f.severity));
+      const lines = blocking.slice(0, 20).map((f) => `- (${f.severity}) ${describeScan(f)}`);
+      ledger.addCheck({
+        runId: run.id,
+        workOrderId: wo.id,
+        stage: "build",
+        name: "trivy",
+        ok: !blocking.length,
+        sha,
+        output: [`Trivy ${info.version}, database ${info.dbUpdatedAt ?? "not used"}: ${found.length} finding(s), ${fresh.length} new, ${blocking.length} at the policy's severities.`, ...lines].join("\n"),
+        meta: { ...info, status: blocking.length ? "findings" : "passed", resultSha256: scanDigest(found), found: counts(found), new: counts(fresh), blocking: counts(blocking) },
+      });
+      record(SYSTEM, "autopilot.scanned", run.id, { workOrder: `WO-${wo.seq}`, sha, version: info.version, dbUpdatedAt: info.dbUpdatedAt, new: fresh.length, blocking: blocking.length });
+      return { findings: scanFindings(blocking), status: blocking.length ? "findings" : "passed" };
+    } catch (err) {
+      if (!(err instanceof ScannerUnavailable)) throw err;
+      ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage: "build", name: "trivy", ok: false, sha, output: `Not run: ${err.message}`, meta: { scanner: "trivy", status: "unavailable", mode: tp.mode } });
+      record(SYSTEM, "autopilot.scan_unavailable", run.id, { workOrder: `WO-${wo.seq}`, sha, mode: tp.mode, reason: clip(err.message) });
+      if (tp.mode === "required") throw new Error(`The required security scan can't run: ${err.message} Nothing merges without it; fix the scanner, then retry.`);
+      return { findings: [], status: "unavailable" };
+    }
+  }
+
+  /** What the base commit already has, scanned once per commit and kept as a check, so it never counts against a work order. */
+  async function baselineKeys(run: Run, base: string, info: ScannerInfo): Promise<Set<string>> {
+    const known = ledger.listChecks({ runId: run.id }).find((c) => c.name === "trivy-baseline" && c.sha === base && c.ok);
+    if (known) return new Set((known.meta as { keys?: string[] } | null)?.keys ?? []);
+    const tree = verifyDir(run.id, `base-${base.slice(0, 12)}`);
+    await addDetachedWorktree(workspace, tree, base);
+    let found: ScanFinding[];
+    try {
+      found = await scan(trivy, tree, pinnedPolicy(run).verification.trivy);
+    } finally {
+      await removeWorktree(workspace, tree).catch(warn);
+    }
+    const keys = [...new Set(found.map(findingKey))];
+    ledger.addCheck({ runId: run.id, stage: "build", name: "trivy-baseline", ok: true, sha: base, output: `Trivy ${info.version} on the base ${base.slice(0, 12)}: ${found.length} finding(s) already there.`, meta: { ...info, resultSha256: scanDigest(found), found: counts(found), keys } });
+    return new Set(keys);
+  }
+
+  /**
+   * The work order's hidden tests on the clean checkout, each file on its own,
+   * after installing what the packages need. A failure tells the builder the
+   * scenario and one line of the failure, never the test.
+   */
+  async function hiddenStep(run: Run, wo: WorkOrder, tree: string, files: string[], sha: string): Promise<Finding[]> {
+    const runGate = executionFor(run).gateRunner(tree, run.id);
+    const results: GateResult[] = [];
+    for (const gate of installGates(tree, packageDirs(tree))) {
+      const r = await runGate(gate);
+      results.push(r);
+      if (!r.ok) {
+        recordGates(run, wo, "build", results, sha);
+        return gateFindings(results);
+      }
+    }
+    results.push(...(await runHidden(run, tree, files, runGate)));
+    recordGates(run, wo, "build", results, sha);
+    return results.filter((r) => !r.ok && r.name.startsWith("hidden:")).map((r) => hiddenFinding(r));
+  }
+
+  /** Copies the hidden tests (checked against the digests recorded when they were written) into `dir`, runs each, removes them. */
+  async function runHidden(run: Run, dir: string, files: string[], runGate: (gate: Gate) => Promise<GateResult>): Promise<GateResult[]> {
+    const manifest = verificationOf(run)?.hiddenTests?.files ?? [];
+    const target = path.join(dir, ".sf-hidden");
+    rmSync(target, { recursive: true, force: true });
+    mkdirSync(target, { recursive: true });
+    try {
+      for (const name of files) {
+        const text = readInside(hiddenDir(run.id), name);
+        if (text === null || sha256(text) !== manifest.find((f) => f.name === name)?.sha256) {
+          throw new Error(`The hidden test ${name} is missing or changed since the test writer wrote it.`);
+        }
+        writeFileSync(path.join(target, name), text);
+      }
+      const results: GateResult[] = [];
+      for (const name of files) {
+        const r = await runGate({ name: `hidden:${name.replace(/\.test\.mjs$/, "")}`, run: `${pinnedPolicy(run).hiddenTests.run} .sf-hidden/${name}` });
+        results.push({ ...r, output: r.ok ? "" : hiddenSummary(r.output) });
+      }
+      return results;
+    } finally {
+      rmSync(target, { recursive: true, force: true });
+    }
+  }
+
+  const hiddenFinding = (r: GateResult): Finding => {
+    const scenario = r.name.replace(/^hidden:wo-\d+-/, "");
+    return { source: "hidden", severity: "high", title: `Hidden acceptance test for scenario "${scenario}" failed: ${r.output}`, detail: "", scenario };
+  };
+
+  /** One check per gate, and one audit record for the lot. `sha`: the commit they checked. */
+  function recordGates(run: Run, wo: WorkOrder, stage: "build" | "integrate", results: GateResult[], sha?: string) {
     const runner = executionFor(run).kind;
     ledger.transaction(() => {
       for (const r of results) {
-        ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage, name: r.name, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, output: r.output, runner });
+        ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage, name: r.name, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, output: r.output, runner, sha });
       }
     });
     record(SYSTEM, "autopilot.gates_run", run.id, {
@@ -1037,12 +1336,23 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const stat = await diffStat(workspace, base, head);
     const files = stat.files.map((f) => f.path);
     const review = reviewers(wo).at(-1)?.result as ReviewVerdict | null | undefined;
+    // What verification recorded for the branch's current head.
+    const atHead = ledger.listChecks({ runId: run.id, workOrderId: wo.id });
+    const sha = await headSha(workspace, head);
+    const verified = atHead.findLast((c) => c.name === "verified" && c.ok && c.sha === sha)?.meta as { hiddenStatus?: string } | undefined;
+    const scanned = atHead.findLast((c) => c.name === "trivy" && c.sha === sha)?.meta as { new?: { secret?: number } } | undefined;
+    // This run ignores a changed check script; once merged, the next run would pin it. A person sees that.
+    const pinned = verificationOf(run);
+    const scripts = pinned?.source === "base" && pinned.gates ? await gatesAt(workspace, sha) : [];
+    const changedChecks = pinned?.source === "base" ? (pinned.gates ?? []).filter((g) => scripts.find((s) => s.name === g.name)?.run !== g.run).map((g) => g.name) : [];
     const decision = evaluateMerge(policy, {
       autonomy: run.autonomy,
       gatesOk: true, // a work order is ready only once its gates have passed (verify)
-      hiddenTestsOk: null, // not run yet (C11)
+      hiddenTestsOk: verified?.hiddenStatus === "passed" ? true : verified?.hiddenStatus === "failed" ? false : null,
       reviewPassed: !!review?.verdict && passed(review, policy.review.blocking),
-      secretFindings: 0, // no secret scan yet (C10)
+      // New possible secrets below the scan's blocking severities still need a person.
+      secretFindings: scanned?.new?.secret ?? 0,
+      changedChecks,
       files,
       linesChanged: stat.linesChanged,
       newDependencies: await newDependencies(workspace, base, head, files),
@@ -1080,12 +1390,18 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function mergeActor(run: Run, wo: WorkOrder): Promise<{ actor: string; reasons: string[] }> {
     const { auto, reasons } = await mergeCheck(run, wo);
     if (auto) return { actor: policyActor(run), reasons };
+    // An approval counts for the commit verified before it was given, not for one verified since.
+    const since = verificationOf(run) ? (verifiedAt(run, wo, await headSha(workspace, wo.branch as string)) ?? "") : "";
     const approval = ledger
       .listInbox({ state: "decided", runId: run.id })
-      .find((i) => i.workOrderId === wo.id && i.kind === "merge_approval" && i.decision === "merge");
-    if (!approval?.decidedBy) throw new Error(`WO-${wo.seq} has no merge approval on record.`);
+      .find((i) => i.workOrderId === wo.id && i.kind === "merge_approval" && i.decision === "merge" && (i.decidedAt ?? "") >= since);
+    if (!approval?.decidedBy) throw new Error(`WO-${wo.seq} has no merge approval on record for its verified commit.`);
     return { actor: approval.decidedBy, reasons };
   }
+
+  /** When the factory recorded `sha` of the work order as verified, or undefined. Only verify() writes these. */
+  const verifiedAt = (run: Run, wo: WorkOrder, sha: string) =>
+    ledger.listChecks({ runId: run.id, workOrderId: wo.id }).findLast((c) => c.name === "verified" && c.ok && c.sha === sha)?.at;
 
   /**
    * Merge, re-test, then merged; or the integration branch goes back to where
@@ -1095,6 +1411,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
    */
   async function integrate(run: Run, wo: WorkOrder) {
     const dir = run.integrationDir as string;
+    const v = verificationOf(run);
+    // Required verification can't be bypassed: a head that wasn't verified (it moved since) is verified first.
+    if (v && !wo.preMergeSha) {
+      const head = await headSha(workspace, wo.branch as string);
+      if (!verifiedAt(run, wo, head)) {
+        moveWorkOrder(wo, "verifying", { action: "autopilot.verification_required", data: { sha: head } });
+        return;
+      }
+    }
     const { actor, reasons } = await mergeActor(run, wo);
     const key = `WO-${wo.seq}`;
     // Saved before merging, so a restart (or a failure) knows where the integration branch was.
@@ -1103,8 +1428,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       pre = await headSha(dir);
       ledger.updateWorkOrder(wo.id, { preMergeSha: pre });
     }
-    const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre, pinnedPolicy(run).gates, executionFor(run).gateRunner(dir, run.id));
-    if (r.results.length) recordGates(run, wo, "integrate", r.results);
+    const runGate = executionFor(run).gateRunner(dir, run.id);
+    // The merged work orders' hidden tests, and this one's, on the combined code.
+    const merged = new Set([wo.seq, ...ledger.listWorkOrders(run.id).filter((w) => w.state === "merged").map((w) => w.seq)]);
+    const hidden = v && pinnedPolicy(run).hiddenTests.enabled ? (v.hiddenTests?.files ?? []).filter((f) => merged.has(f.seq)).map((f) => f.name) : [];
+    const after = hidden.length ? () => runHidden(run, dir, hidden, runGate) : undefined;
+    const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre, v ? (d: string) => gatesFor(run, d) : pinnedPolicy(run).gates, runGate, after);
+    if (r.results.length) recordGates(run, wo, "integrate", r.results, r.outcome === "conflict" ? undefined : r.sha);
     if (r.outcome === "merged") {
       moveWorkOrder(wo, "merged", {
         actor,
@@ -1162,6 +1492,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const merged = wos.filter((w) => w.state === "merged").length;
     const sha = await headSha(workspace, run.integrationBranch);
     await releaseMounted(run);
+    await removeWorktree(workspace, validatorDir(run)).catch(warn);
+    await deleteBranch(workspace, validatorBranch(run)).catch(warn);
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir);
     moveRun(run, merged ? "done" : "failed", {
       patch: { integrationDir: null, resumeState: null },
@@ -1268,9 +1600,18 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const id = `ap-${randomBytes(4).toString("hex")}`;
     const integrationDir = path.join(worktrees, id, "integration");
     const integrationBranch = `autopilot/${change}`;
-    await addWorktree(workspace, integrationDir, integrationBranch, baseBranch);
+    const baseSha = await headSha(workspace, `refs/heads/${baseBranch}`);
+    await addWorktree(workspace, integrationDir, integrationBranch, baseSha);
+    // The checks every work order of this run faces, fixed now from the base: a work order can't change them.
+    const based = policy.gates ? [] : await gatesAt(workspace, baseSha);
+    const verification: Verification = {
+      gates: policy.gates ?? (based.length ? based : null),
+      source: policy.gates ? "policy" : based.length ? "base" : "worktree",
+      baseSha,
+      hiddenTests: null,
+    };
 
-    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, policy, policyHash: hash, createdBy: input.actor });
+    const run = ledger.createRun({ id, goal, change, autonomy, budgetUsd, baseBranch, integrationBranch, integrationDir, policy, policyHash: hash, verification, createdBy: input.actor });
     record(input.actor, "autopilot.run_created", id, {
       change,
       autonomy,
@@ -1281,6 +1622,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       policyHash: hash,
     });
     record(SYSTEM, "autopilot.policy_loaded", id, { hash, source, policy });
+    record(SYSTEM, "autopilot.verification_pinned", id, { source: verification.source, baseSha, gates: (verification.gates ?? []).map((g) => g.name) });
     changed(id);
     return run;
   }
@@ -1339,6 +1681,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (!DONE_WO.has(wo.state)) moveWorkOrder(wo, "cancelled", { actor, patch: { worktree: null, resumeState: null } });
     }
     // The integration branch stays: it holds whatever was committed so far.
+    await removeWorktree(workspace, validatorDir(run)).catch(warn);
+    await deleteBranch(workspace, validatorBranch(run)).catch(warn);
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir).catch(warn);
     ledger.dismissInbox({ runId: run.id });
     return moveRun(run, "cancelled", {
@@ -1531,6 +1875,19 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
   }
 
+  /** What verification a run started now would get, and whether its scanner answers as the policy requires. */
+  async function verificationStatus(policy: typeof DEFAULT_POLICY) {
+    const tp = policy.verification.trivy;
+    const scanner =
+      tp.mode === "off"
+        ? { mode: tp.mode, ok: null, version: null, dbUpdatedAt: null, problem: null }
+        : await scannerInfo(trivy, tp).then(
+            (i) => ({ mode: tp.mode, ok: true, version: i.version, dbUpdatedAt: i.dbUpdatedAt, problem: null as string | null }),
+            (err: unknown) => ({ mode: tp.mode, ok: false, version: null, dbUpdatedAt: null, problem: errorText(err) }),
+          );
+    return { hiddenTests: policy.hiddenTests.enabled, protectedPaths: policy.verification.protectedPaths, scanner };
+  }
+
   async function status() {
     const agent = await client.listProfiles().then(
       (r) => ({ reachable: true, error: null as string | null, profiles: r.profiles, activeProfileId: r.activeId }),
@@ -1553,6 +1910,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         // The last check, while it's about the same kind of execution.
         preflight: lastPreflight?.provider === provider ? lastPreflight : null,
       },
+      verification: await verificationStatus(policy ?? DEFAULT_POLICY),
       openInbox: ledger.openInboxCount(),
       activeRuns: ledger.listRuns().filter((r) => !TERMINAL.has(r.state)).length,
     };

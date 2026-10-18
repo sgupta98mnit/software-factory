@@ -106,7 +106,7 @@ test("verify: passing code -> gates pass -> a reviewer from another vendor passe
     const run = await t.buildingRun();
     await t.until(() => t.wo(run.id).state === PASSED);
     const wo = t.wo(run.id);
-    assert.deepEqual(t.checks(run.id), ["test:ok", "reviewer-edits-discarded:failed"]);
+    assert.deepEqual(t.checks(run.id), ["test:ok", "verified:ok", "reviewer-edits-discarded:failed"]);
 
     const [builder] = t.attempts(run.id, "builder");
     assert.equal(builder?.turns, 1);
@@ -153,7 +153,7 @@ test("repair: a failing test goes back to the same builder with the gate's outpu
     assert.match(followUp, /isn't done yet/);
     assert.match(followUp, /Gate test: `npm run test` failed with exit code 1/);
     assert.match(followUp, /sum adds/); // the test output
-    assert.deepEqual(t.checks(run.id), ["test:failed", "test:ok"]);
+    assert.deepEqual(t.checks(run.id), ["test:failed", "test:ok", "verified:ok"]);
     assert.equal(t.wo(run.id).findings?.[0]?.source, "gate");
     assert.deepEqual((await auditOf(run.id, "autopilot.repair_requested")).map((e) => [e.data.builder, e.data.turn]), [[1, 2]]);
   } finally {
@@ -231,7 +231,7 @@ test("repair: a reviewer's critical finding goes back to the builder, clustered 
     const reviewers = t.attempts(run.id, "reviewer");
     assert.equal(reviewers.length, 2);
     assert.notEqual(reviewers[0]?.conversationId, reviewers[1]?.conversationId); // each review starts clean
-    assert.deepEqual(t.checks(run.id), ["test:ok", "test:ok"]);
+    assert.deepEqual(t.checks(run.id), ["test:ok", "verified:ok", "test:ok", "verified:ok"]);
     assert.deepEqual((await auditOf(run.id, "autopilot.review_verdict")).map((e) => [e.data.verdict, e.data.passed]), [["fail", false], ["pass", true]]);
   } finally {
     await t.close();

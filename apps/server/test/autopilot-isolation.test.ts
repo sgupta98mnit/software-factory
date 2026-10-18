@@ -124,7 +124,7 @@ test("container execution: the builder, its gates and its reviewer run isolated,
 
     // Every gate ran in a throwaway container, in build and after the merge.
     const checks = t.ledger.listChecks({ runId: run.id });
-    assert.deepEqual(checks.map((c) => `${c.stage}:${c.name}:${c.runner}:${c.ok}`), ["build:test:container:true", "integrate:test:container:true"]);
+    assert.deepEqual(checks.map((c) => `${c.stage}:${c.name}:${c.runner}:${c.ok}`), ["build:test:container:true", "build:verified:null:true", "integrate:test:container:true"]);
     assert.equal(t.docker.callsOf("run", "--rm").filter((c) => c.args.includes("sh")).length, 2);
 
     const evidence = await t.o.evidence(run.id, "user:test");

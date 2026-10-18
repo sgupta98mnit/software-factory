@@ -5,8 +5,8 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { LOCAL_USER } from "../config.js";
 import { EvidenceConflict } from "./evidence.js";
-import type { Attempt, InboxItem, Run, WorkOrder } from "./ledger.js";
-import type { Orchestrator } from "./orchestrator.js";
+import type { Attempt, Check, InboxItem, Run, WorkOrder } from "./ledger.js";
+import type { Orchestrator, Verification } from "./orchestrator.js";
 import { pinnedPolicy } from "./policy.js";
 
 // Work-order states that count as in progress.
@@ -15,6 +15,11 @@ const FINISHED_WO = new Set<string>(["merged", "skipped", "cancelled"]);
 
 /** `execution`: where the attempt ran (ExecutionFacts); null for attempts from before isolation. */
 const attemptView = ({ seenRunning: _s, lastSentAt: _l, runtime, ...a }: Attempt) => ({ ...a, execution: runtime ?? null });
+/** A scan baseline's finding keys stay in the ledger: they can be thousands, and the page shows counts. */
+const checkView = (c: Check) => {
+  const { keys: _k, ...meta } = (c.meta ?? {}) as Record<string, unknown>;
+  return { ...c, meta: c.meta == null ? null : meta };
+};
 const inboxView = ({ notifiedAt: _n, ...item }: InboxItem) => item;
 
 /** median(dispatch -> merged) of merged work orders x the waves of work left; null until one has merged. */
@@ -32,6 +37,22 @@ function etaMs(workOrders: WorkOrder[], attempts: Attempt[], parallel: number): 
   const median = durations.length % 2 ? (durations[Math.floor(mid)] ?? 0) : ((durations[mid - 1] ?? 0) + (durations[mid] ?? 0)) / 2;
   const remaining = workOrders.filter((w) => !FINISHED_WO.has(w.state)).length;
   return median * Math.ceil(remaining / parallel);
+}
+
+/**
+ * How the run verifies work: where its checks came from (null for runs from
+ * before pinning), its hidden tests (off, pending until the test writer is
+ * done, or how many) and its scanner mode.
+ */
+function verificationView(run: Run) {
+  const v = run.verification as Verification | null;
+  const policy = pinnedPolicy(run);
+  return {
+    pinned: v?.source ?? null,
+    gates: (v?.gates ?? []).map((g) => g.name),
+    hiddenTests: !v || !policy.hiddenTests.enabled ? "off" : (v.hiddenTests?.files.length ?? "pending"),
+    scan: v ? policy.verification.trivy.mode : "off",
+  };
 }
 
 export function createAutopilotRoutes(o: Orchestrator) {
@@ -64,6 +85,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       budgetUsd: run.budgetUsd,
       policyHash: run.policyHash,
       execution: { provider: pinnedPolicy(run).execution.provider, isolated: pinnedPolicy(run).execution.provider === "container" },
+      verification: verificationView(run),
       createdBy: run.createdBy,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -131,7 +153,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       ...summary(run),
       workOrders: workOrders.map((w) => workOrderView(w, attempts)),
       attempts: attempts.map(attemptView),
-      checks: ledger.listChecks({ runId: run.id }),
+      checks: ledger.listChecks({ runId: run.id }).map(checkView),
       inbox: ledger.listInbox({ state: "all", runId: run.id }).map(inboxView),
       etaMs: etaMs(workOrders, attempts, pinnedPolicy(run).parallel),
     });

@@ -92,6 +92,8 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 | `SF_AUTONOMY_CAP` | none | Highest Autopilot autonomy anyone can pick: `suggest`, `supervised` or `autonomous` |
 | `SF_REQUIRE_ISOLATION` | none | `1` refuses to run agents or their code on this machine: runs need `execution.provider: container` and a passing isolation check, whatever the workspace policy says |
 | `SF_DOCKER` | `docker` | The Docker CLI Autopilot uses for isolated execution |
+| `SF_TRIVY` | `trivy` | The Trivy binary Autopilot's security scan runs |
+| `SF_TRIVY_SHA256` | none | The Trivy binary's sha256; with it set, `SF_TRIVY` must be the binary's full path and any other binary is refused |
 
 ## Autopilot policy
 
@@ -125,9 +127,19 @@ execution:
     hostPathStyle: native                            # native (Docker Desktop) or wsl (a WSL engine: C:\x becomes /mnt/c/x)
     credentials: { spec: [], critic: [], builder: [], reviewer: [], validator: [] }   # environment variable names each role gets
     startTimeoutSec: 120
+hiddenTests: { enabled: false, run: "node --test" }  # a test writer's independent tests run on every work order
+verification:
+  protectedPaths: [".factory/**", ".hidden-tests/**", ".sf-hidden/**"]   # put back when a work order changes them
+  trivy:
+    mode: off                                        # off, advisory (findings go back) or required (fails closed too)
+    version: null                                    # accept only this Trivy version, like "0.58.1"
+    scanners: [vuln, secret, misconfig]
+    severities: [critical, high]                     # new findings at these severities send the work back
+    maxDbAgeHours: 72
+    timeoutSec: 600
 ```
 
-A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing`, `hiddenTests` and `notify` are accepted for features still to come; `execution` is described under [Isolated execution](#isolated-execution).
+A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing` and `notify` are accepted for features still to come; `execution` is described under [Isolated execution](#isolated-execution), `hiddenTests` and `verification` under [Trusted verification](#trusted-verification).
 
 Autopilot checks reported conversation costs before starting more work and after each poll. At the run limit (the amount entered in Home, or `budget.perChangeUsd`), it pauses the run's agents and opens a budget decision in the Inbox. At a work order's limit, it pauses that order while the others continue. Continue adds the policy's base budget to the relevant limit; Skip ends that work order; Cancel ends the run. Limits and decisions persist across restarts, and a normal Resume cannot bypass a run budget decision. Spending can rise between checks or while a pause request completes; enforcement depends on the agent server reporting costs.
 
@@ -140,6 +152,17 @@ With `execution.provider: container`, the factory starts one agent-server contai
 Before a run starts, and from **Check isolation** on Home, the factory checks that Docker answers, the image and networks exist, every named credential is set, a container can read a file the factory writes through the mount (path mapping), and that a container on the network can't reach the factory API or Canvas on this machine. Docker Desktop forwards `host.docker.internal` to this machine's loopback, so an agent on a plain bridge network could call the factory as you: use a network without access to this machine. A run that fails a check doesn't start. If Docker stops mid-run, the run waits for it, as it does for an unreachable agent server.
 
 Containers are named after their attempt, so a restarted factory reconnects to running ones. A container that disappears ends its attempt, and the normal repair loop starts a fresh one. Containers are removed once their attempt can't get another message (its work order merged, a newer attempt replaced it, or the run ended); leftovers are swept at startup. Transcripts stay in `data/runtime/<run>/a<attempt>/state`, not in Canvas. The container provider has been tested against a stand-in Docker CLI, not yet against a live Docker engine and agent-server image.
+
+## Trusted verification
+
+A run fixes its checks when it starts, from the base branch: the policy's `gates`, or else the `typecheck`, `lint` and `test` scripts (with their `pre`/`post` scripts) of the base branch's package.json files, at the root and one folder down. The factory runs those script bodies itself, with `node_modules/.bin` on PATH, so a work order that rewrites a script, adds `.npmrc` settings or deletes a check doesn't change what runs. A work order that changes a pinned script needs a person's merge approval, because the next run would pin the change. When the base defines no checks, the work order's own scripts run, and evidence says the checks weren't pinned. Files under `verification.protectedPaths` that a work order changes are put back as they are on its base, and the run records it.
+
+Every check records the commit it checked. When the gates pass, the factory checks the commit out again in a folder no agent sees and runs what the policy asks for:
+
+- **Hidden tests** (`hiddenTests.enabled`). Before any work is checked, a test writer (another vendor than the spec agent, when there is one) writes one black-box `node:test` file per scenario from the spec. The factory keeps them in `data/hidden-tests/<run>/` with their digests, runs each work order's own after installing its dependencies, and runs all merged ones again on the integration branch after every merge. A builder hears the scenario and one line of the failure, never the test. With local execution agents run with your permissions and could read that folder: the tests stay hidden from builders only with isolated execution.
+- **Trivy** (`verification.trivy.mode`). The factory runs the binary in `SF_TRIVY` without updating its database (keep it current with `trivy image --download-db-only`). It refuses a version other than `version`, a database older than `maxDbAgeHours`, and a binary that doesn't match `SF_TRIVY_SHA256`. Findings the work order's base already has don't count; new ones at the policy's `severities` go back to the builder as rule, package, file and line, never a secret's text. In `required` mode a scanner that can't answer stops the work order with a Retry in the Inbox; in `advisory` mode the run goes on and the check records why the scan didn't run.
+
+When everything passes, the factory records a `verified` check for that commit. Merging needs one for the branch's current head: if the branch moved after verification it is verified again, and a merge approval given before that doesn't count. Evidence reports security scanning and independent validation as `recorded` only when every merged work order has them. The Trivy integration has been tested with a stand-in CLI, not yet with a real Trivy binary and database.
 
 ## Run evidence
 

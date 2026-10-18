@@ -6,6 +6,17 @@ import { git } from "./git.js";
 import type { Ledger } from "./ledger.js";
 import { pinnedPolicy } from "./policy.js";
 
+// What a check's record may carry into evidence: scanner identity and freshness, digests and counts, statuses.
+const META_KEYS = ["scanner", "version", "dbUpdatedAt", "dbNextUpdate", "binarySha256", "resultSha256", "status", "mode", "found", "new", "blocking", "gates", "scan", "hidden", "scanStatus", "hiddenStatus", "files", "digest"];
+const metaOf = (meta: unknown) =>
+  meta && typeof meta === "object" ? Object.fromEntries(Object.entries(meta).filter(([k]) => META_KEYS.includes(k))) : null;
+
+/** recorded: every merged work order has it; partial: some; not_recorded: none, or it wasn't asked for. */
+function coverage(merged: string[], has: (workOrderId: string) => boolean): "recorded" | "partial" | "not_recorded" {
+  const n = merged.filter(has).length;
+  return n && n === merged.length ? "recorded" : n ? "partial" : "not_recorded";
+}
+
 /** Where an attempt ran, without its container's name: images, limits, network and credential names only. */
 function executionOf(runtime: unknown) {
   const f = runtime as ExecutionFacts | null;
@@ -53,6 +64,13 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
       available = (await git(workspace, ["cat-file", "-e", `${commit}^{commit}`], { allowFail: true })).code === 0;
     } catch { /* The workspace itself may have been removed; the identity survives. */ }
   }
+  // A merged work order counts as scanned or independently validated when the check that let it merge says so.
+  const policy = pinnedPolicy(run);
+  const verification = run.verification as { source: string; baseSha: string; gates: { name: string; run: string; cwd?: string }[] | null; hiddenTests: { files: unknown[]; digest: string } | null } | null;
+  const mergedIds = workOrders.filter((wo) => wo.state === "merged").map((wo) => wo.id);
+  const verifiedMeta = (id: string) => checks.filter((c) => c.workOrderId === id && c.name === "verified" && c.ok).map((c) => (c.meta ?? {}) as { scanStatus?: string; hiddenStatus?: string });
+  const securityScan = !verification || policy.verification.trivy.mode === "off" ? "not_recorded" : coverage(mergedIds, (id) => verifiedMeta(id).some((m) => m.scanStatus === "passed"));
+  const independentValidation = !verification || !policy.hiddenTests.enabled ? "not_recorded" : coverage(mergedIds, (id) => verifiedMeta(id).some((m) => m.hiddenStatus === "passed"));
   const controls = [...new Set(workOrders.flatMap((wo) => wo.controls))].sort().map((control) => ({
     control,
     workOrderIds: workOrders.filter((wo) => wo.controls.includes(control)).map((wo) => wo.id),
@@ -80,9 +98,21 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
       id: check.id, workOrderId: check.workOrderId, stage: check.stage,
       name: check.name, ok: check.ok, exitCode: check.exitCode,
       durationMs: check.durationMs, at: check.at, outputSha256: sha256(check.output),
-      commitBinding: "not_recorded" as const,
+      commitBinding: check.sha ? ("recorded" as const) : ("not_recorded" as const),
+      commit: check.sha,
       runner: check.runner ?? "not_recorded",
+      meta: metaOf(check.meta),
     })),
+    verification: verification
+      ? {
+          pinned: verification.source, // policy, base (the base branch's scripts) or worktree (the branch's own: not pinned)
+          baseSha: verification.baseSha,
+          gates: (verification.gates ?? []).map((g) => ({ name: g.name, command: g.run, cwd: g.cwd ?? null })),
+          hiddenTests: policy.hiddenTests.enabled ? { count: verification.hiddenTests?.files.length ?? 0, digest: verification.hiddenTests?.digest ?? null } : null,
+          scan: { tool: "trivy", mode: policy.verification.trivy.mode, requiredVersion: policy.verification.trivy.version },
+          protectedPaths: policy.verification.protectedPaths,
+        }
+      : null,
     attempts: attempts.map((attempt) => {
       const result = attempt.result as { verdict?: unknown } | null;
       const verdict = result && typeof result.verdict === "string" && ["pass", "fail", "revise"].includes(result.verdict) ? result.verdict : null;
@@ -106,8 +136,8 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
       })),
     },
     assurance: {
-      securityScan: "not_recorded" as const,
-      independentValidation: "not_recorded" as const,
+      securityScan,
+      independentValidation,
       signature: "unsigned" as const,
       // Every agent and every gate ran in a container; otherwise something ran on the operator's machine (or wasn't recorded).
       isolation: attempts.length > 0 && attempts.every((a) => (a.runtime as ExecutionFacts | null)?.provider === "container") && !checks.some((c) => c.runner === "local")
@@ -117,7 +147,8 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
     limitations: [
       "This unsigned digest detects packet changes; it does not authenticate its producer.",
       "The audit checkpoint reports local verification at export time. Event payloads are omitted; this packet alone cannot reverify the audit chain or detect truncation.",
-      "Historical checks have no recorded commit binding. Failed checks are retained, including earlier repair rounds.",
+      "Checks recorded before commit binding have none (commitBinding not_recorded). Failed checks are retained, including earlier repair rounds.",
+      "A security scan records new findings against the work order's base and its scanner version and database date; it reports what that scanner and database could see, not the absence of vulnerabilities. Hidden tests are written by an agent from the spec: independent of the builder, not of the spec.",
       "Check output digests cover only the persisted output tail, not the full command log.",
       "Acceptance criteria and control mappings are traceability, not independent validation or proof of compliance.",
       "Costs are provider-reported observations and may lag actual billing. A null budget means the pinned policy default.",

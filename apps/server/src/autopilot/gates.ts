@@ -5,6 +5,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { fileAt, git } from "./git.js";
 import { OUTPUT_LIMIT, type Finding } from "./ledger.js";
 
 /** One gate, as policy.yml's `gates` list gives it. `cwd` is relative to the worktree. */
@@ -13,6 +14,8 @@ export interface Gate {
   run: string;
   cwd?: string;
   timeoutSec?: number;
+  /** A script body pinned from the base branch: run with the package's node_modules/.bin on PATH, as npm would. */
+  bin?: boolean;
 }
 
 export interface GateResult {
@@ -31,26 +34,84 @@ const CLOSE_GRACE_MS = 3000; // after the gate exits or is killed, for the rest 
 const FINDING_OUTPUT = 3000; // of a failed gate's output, in the builder's repair message
 const SCRIPTS = ["typecheck", "lint", "test"];
 
+interface Package {
+  scripts?: Record<string, unknown>;
+  dependencies?: object;
+  devDependencies?: object;
+}
+
+const parsePackage = (text: string | null): Package | null => {
+  try {
+    return text === null ? null : (JSON.parse(text.replace(/^﻿/, "")) as Package);
+  } catch {
+    return null;
+  }
+};
+const readPackage = (dir: string) => parsePackage(existsSync(path.join(dir, "package.json")) ? readFileSync(path.join(dir, "package.json"), "utf8") : null);
+const gateName = (sub: string, n: string) => (sub ? `${sub}:${n}` : n);
+
+/** `npm ci` (or install) for the package in `sub` when it has dependencies and nothing is installed yet. */
+function installGate(root: string, sub: string, pkg: Package | null = readPackage(path.join(root, sub))): Gate[] {
+  const dir = path.join(root, sub);
+  const hasDeps = Object.keys({ ...pkg?.dependencies, ...pkg?.devDependencies }).length > 0;
+  if (!hasDeps || existsSync(path.join(dir, "node_modules"))) return [];
+  const locked = existsSync(path.join(dir, "package-lock.json")) || existsSync(path.join(dir, "npm-shrinkwrap.json"));
+  return [{ name: gateName(sub, "install"), run: `npm ${locked ? "ci" : "install"} --no-audit --no-fund`, cwd: sub || undefined }];
+}
+
 /** The gates for one package.json in `sub` ("" = the root): install if needed, then its scripts. */
 function packageGates(root: string, sub: string): Gate[] {
-  const dir = path.join(root, sub);
-  let pkg: { scripts?: Record<string, unknown>; dependencies?: object; devDependencies?: object };
-  try {
-    pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
-  } catch {
-    return [];
-  }
-  const scripts = SCRIPTS.filter((s) => typeof pkg.scripts?.[s] === "string");
+  const pkg = readPackage(path.join(root, sub));
+  const scripts = SCRIPTS.filter((s) => typeof pkg?.scripts?.[s] === "string");
   if (!scripts.length) return []; // nothing to check, so nothing to install for
-  const name = (n: string) => (sub ? `${sub}:${n}` : n);
-  const cwd = sub || undefined;
-  const hasDeps = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies }).length > 0;
-  const locked = existsSync(path.join(dir, "package-lock.json")) || existsSync(path.join(dir, "npm-shrinkwrap.json"));
-  const install: Gate[] =
-    hasDeps && !existsSync(path.join(dir, "node_modules"))
-      ? [{ name: name("install"), run: `npm ${locked ? "ci" : "install"} --no-audit --no-fund`, cwd }]
-      : [];
-  return [...install, ...scripts.map((s) => ({ name: name(s), run: `npm run ${s}`, cwd }))];
+  return [...installGate(root, sub, pkg), ...scripts.map((s) => ({ name: gateName(sub, s), run: `npm run ${s}`, cwd: sub || undefined }))];
+}
+
+/** Install gates for the packages in `subs` ("" = the root) of the folder `root`. */
+export const installGates = (root: string, subs: string[]): Gate[] => [...new Set(subs)].flatMap((sub) => installGate(root, sub));
+
+/** The root and the top-level folders (not node_modules or dot folders) that have a package.json, in the folder `dir`. */
+export function packageDirs(dir: string): string[] {
+  const subs = readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name !== "node_modules" && !e.name.startsWith("."))
+    .map((e) => e.name)
+    .sort();
+  return ["", ...subs].filter((sub) => existsSync(path.join(dir, sub, "package.json")));
+}
+
+/**
+ * The typecheck, lint and test scripts the base branch's package.json files
+ * define, as commands: the script bodies themselves (with any pre- and
+ * post-scripts), run with node_modules/.bin on PATH. A work order's own
+ * package.json, scripts or .npmrc can't change what runs.
+ */
+export async function gatesAt(repo: string, ref: string): Promise<Gate[]> {
+  const top = await git(repo, ["ls-tree", "--name-only", "-d", ref], { allowFail: true });
+  const subs = ["", ...top.stdout.split("\n").map((s) => s.trim()).filter((s) => s && s !== "node_modules" && !s.startsWith(".")).sort()];
+  const gates: Gate[] = [];
+  for (const sub of subs) {
+    const scripts = parsePackage(await fileAt(repo, ref, sub ? `${sub}/package.json` : "package.json"))?.scripts ?? {};
+    const body = (s: string) => (typeof scripts[s] === "string" ? (scripts[s] as string) : null);
+    for (const s of SCRIPTS) {
+      const main = body(s);
+      if (!main) continue;
+      const run = [body(`pre${s}`), main, body(`post${s}`)].filter(Boolean).join(" && ");
+      gates.push({ name: gateName(sub, s), run, cwd: sub || undefined, bin: true });
+    }
+  }
+  return gates;
+}
+
+/**
+ * What a builder may hear about a failed hidden test: one line of the failure
+ * (the assertion), never the test's source.
+ */
+export function hiddenSummary(output: string): string {
+  const line = output
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => /assert|expected|actual|error|not ok|failed/i.test(l) && !/^at\s/.test(l) && !/^(ℹ|#)/.test(l));
+  return (line ?? "The test failed.").slice(0, 300);
 }
 
 /** npm gates for the package.json at `dir` and one folder down (not node_modules or dot folders). */
@@ -83,6 +144,12 @@ export function runGate(dir: string, gate: Gate, base: NodeJS.ProcessEnv = proce
   // Plain, non-interactive output. NODE_TEST_CONTEXT is dropped so `node --test` in a gate
   // reports normally when the factory itself runs under node --test.
   const { NODE_TEST_CONTEXT: _, ...env } = base;
+  if (gate.bin) {
+    // Windows spells it Path: change the key that's there rather than add a second one.
+    const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+    const bins = [path.join(dir, gate.cwd ?? "", "node_modules", ".bin"), path.join(dir, "node_modules", ".bin")];
+    env[key] = [...new Set(bins), env[key]].filter(Boolean).join(path.delimiter);
+  }
   return new Promise((resolve) => {
     let output = "";
     let timedOut = false;

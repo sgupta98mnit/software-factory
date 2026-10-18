@@ -142,6 +142,31 @@ export function reviewerBrief(o: {
   ].join("\n");
 }
 
+/**
+ * The test writer's first message: black-box tests from the spec alone,
+ * written before anything is built. Builders never see them.
+ */
+export function validatorBrief(o: { change: string; workOrders: Pick<WorkOrder, "seq" | "title">[]; run: string }): string {
+  return [
+    `You are the test writer in a Software Factory Autopilot run. Write independent acceptance tests for the OpenSpec change in \`openspec/changes/${o.change}/\` before anyone builds it. Builders never see these tests: the factory runs them against each work order's code and against the merged result.`,
+    "",
+    "For each scenario (`#### Scenario:`) in the change's specs/, write one file `.hidden-tests/wo-<N>-<scenario-name-in-kebab-case>.test.mjs`, where N is the work order whose work makes the scenario pass:",
+    ...o.workOrders.map((w) => `- WO-${w.seq}: ${w.title}`),
+    "",
+    "Rules for the tests:",
+    "- Use only `node:test` and `node:assert`; no other packages.",
+    "- Test behavior through the interfaces design.md and the specs describe (modules and their exports, HTTP endpoints, files). The factory copies the tests into `.sf-hidden/` at the repository root, so import code as `../<path from the root>`.",
+    "- One `test()` per scenario, named after it: WHEN is the setup and the action, THEN the assertions. Cover the error cases the scenario names.",
+    `- The factory runs each file with \`${o.run} .sf-hidden/<file>\` from the repository root.`,
+    "",
+    "Don't write application code, don't change anything outside `.hidden-tests/`, and don't commit.",
+    "Finish with the list of files you wrote.",
+  ].join("\n");
+}
+
+export const validatorFollowUp = () =>
+  "The factory found no test files named like `.hidden-tests/wo-<N>-<scenario>.test.mjs`. Write them now, one per scenario, as my first message describes.";
+
 /** Sent to the same builder conversation when its work failed a gate or the review. */
 export function repairMessage(findings: Finding[], isolated = false): string {
   return [

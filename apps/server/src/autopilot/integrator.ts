@@ -14,7 +14,7 @@ import type { Finding } from "./ledger.js";
 export type MergeResult =
   | { outcome: "merged"; sha: string; files: number; linesChanged: number; results: GateResult[] }
   | { outcome: "conflict"; conflicts: string[]; results: GateResult[]; findings: Finding[] }
-  | { outcome: "reverted"; results: GateResult[]; findings: Finding[] };
+  | { outcome: "reverted"; sha: string; results: GateResult[]; findings: Finding[] }; // sha: the merge that failed its checks
 
 // A package whose manifest or lockfile a merge changed gets a fresh install (detectGates installs where node_modules is missing).
 const MANIFEST = /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json)$/;
@@ -47,8 +47,9 @@ export async function mergeAndTest(
   branch: string,
   message: string,
   preMergeSha: string,
-  gates: Gate[] | null = null,
+  gates: Gate[] | null | ((dir: string) => Gate[]) = null, // a function is asked once the merge is in, so it sees what was installed
   run?: (gate: Gate) => Promise<GateResult>, // where gates run (execution.ts); this machine by default
+  after?: () => Promise<GateResult[]>, // more checks once the gates pass (the hidden tests)
 ): Promise<MergeResult> {
   await discardChanges(dir); // also ends a merge that a restart interrupted
   if (!(await isAncestor(dir, branch, "HEAD"))) {
@@ -60,12 +61,15 @@ export async function mergeAndTest(
   const installed = stat.files.filter((f) => MANIFEST.test(f.path)).map((f) => path.join(dir, path.posix.dirname(f.path), "node_modules"));
   const uninstall = () => installed.forEach((d) => rmSync(d, { recursive: true, force: true, maxRetries: 3 }));
   uninstall();
-  const { ok, results } = await runGates(dir, gates ?? detectGates(dir), run);
+  const list = typeof gates === "function" ? gates(dir) : (gates ?? detectGates(dir));
+  const gated = await runGates(dir, list, run);
+  const results = gated.ok && after ? [...gated.results, ...(await after())] : gated.results;
+  const ok = results.every((r) => r.ok);
   await discardChanges(dir); // what the gates left behind (build output)
   if (!ok) {
     await resetHard(dir, preMergeSha);
     uninstall(); // installed for the merge that's gone; the next merge installs from the reset manifest
-    return { outcome: "reverted", results, findings: integrationFindings(results) };
+    return { outcome: "reverted", sha, results, findings: integrationFindings(results) };
   }
   return { outcome: "merged", sha, files: stat.files.length, linesChanged: stat.linesChanged, results };
 }

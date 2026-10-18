@@ -2,10 +2,9 @@
 // running OpenSpec's strict validation, reading the critic's verdict and the
 // proposal's assumptions and open questions. The agents write the spec; the
 // factory only names, validates, reads and commits it.
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import { validateChange } from "../openspec.js";
-import { git } from "./git.js";
+import { git, readInside } from "./git.js";
 import type { Finding, Severity } from "./ledger.js";
 
 const MAX_NAME = 48;
@@ -47,12 +46,9 @@ export async function checkChange(change: string, dir: string): Promise<{ ok: bo
   return { ok: valid, output: output || (valid ? "Valid." : "Invalid, with no issues listed."), durationMs: Date.now() - started };
 }
 
+/** The change's proposal.md as the spec agent left it ("" when there is none, or a symlink points out of the worktree). */
 export function readProposal(dir: string, change: string): string {
-  try {
-    return readFileSync(path.join(dir, "openspec", "changes", change, "proposal.md"), "utf8");
-  } catch {
-    return "";
-  }
+  return readInside(dir, path.join("openspec", "changes", change, "proposal.md")) ?? "";
 }
 
 /** Bullets under a heading ("## Open questions"), up to the next heading. "None" doesn't count. */
