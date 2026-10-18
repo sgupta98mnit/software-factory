@@ -2,7 +2,7 @@
 // Each line's hash covers the previous line's hash, so editing, deleting or
 // reordering any line breaks the chain, and `verifyAudit()` finds where.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import path from "node:path";
 import { DATA_DIR } from "./config.js";
@@ -41,12 +41,15 @@ function hashOf(e: Omit<AuditEvent, "hash">): string {
   return sha256(`${prevHash}\n${canonicalJson(rest)}`);
 }
 
-function readAll(): AuditEvent[] {
-  if (!existsSync(FILE)) return [];
-  return readFileSync(FILE, "utf8")
+const parse = (text: string) =>
+  text
     .split("\n")
     .filter(Boolean)
     .map((line) => JSON.parse(line) as AuditEvent);
+
+function readAll(): AuditEvent[] {
+  if (!existsSync(FILE)) return [];
+  return parse(readFileSync(FILE, "utf8"));
 }
 
 let last: { seq: number; hash: string } | undefined;
@@ -95,6 +98,28 @@ function verifyEvents(all: AuditEvent[]): { ok: boolean; checked: number; broken
 
 export function verifyAudit() {
   return verifyEvents(readAll());
+}
+
+/** A log's chain from its text (a backup's copy, say), and where it ends. An unreadable line breaks it. */
+export function verifyAuditText(text: string) {
+  let all: AuditEvent[];
+  try {
+    all = parse(text);
+  } catch {
+    return { ok: false, checked: 0, reason: "a line isn't JSON", checkpoint: { seq: 0, hash: GENESIS } };
+  }
+  return { ...verifyEvents(all), checkpoint: { seq: all.at(-1)?.seq ?? 0, hash: all.at(-1)?.hash ?? GENESIS } };
+}
+
+/** Copies the log to `dest` between appends, and checks the copy: for backups. */
+export function copyAuditLog(dest: string) {
+  const job = queue.then(() => {
+    const text = existsSync(FILE) ? readFileSync(FILE, "utf8") : "";
+    writeFileSync(dest, text, { flag: "wx" });
+    return verifyAuditText(text);
+  });
+  queue = job.catch(() => undefined);
+  return job;
 }
 
 /** Drain prior writes, then verify and select events from the same file snapshot. */

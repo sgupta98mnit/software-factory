@@ -22,7 +22,7 @@ import { isolationRequired } from "../config.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
 import { exportEvidence } from "./evidence.js";
-import { evidenceRoot, storeEvidence } from "./evidence-store.js";
+import { evidenceRoot, pruneEvidence, retentionDays, storeEvidence } from "./evidence-store.js";
 import {
   createExecution,
   RuntimeGone,
@@ -2239,6 +2239,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** Cheap: hands each live run to advance(), skipping runs that are still busy, and removes containers no attempt needs. */
   async function tick() {
     if (!lead()) return; // another process acts on this ledger; this one stands by
+    if (Date.now() - prunedAt > 86_400_000) pruneOld();
     for (const run of ledger.listRuns()) {
       if (TERMINAL.has(run.state)) continue;
       launch(run.id, async () => {
@@ -2263,6 +2264,18 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // Starting attempts may have a container whose facts weren't recorded yet.
     for (const a of ledger.activeAttempts()) keep.add(`sf-${a.runId}-a${a.id}`);
     await sweepContainers(execDeps, keep);
+  }
+
+  // Evidence past its retention period goes, once a day at most.
+  let prunedAt = 0;
+  function pruneOld() {
+    prunedAt = Date.now();
+    try {
+      const removed = pruneEvidence(evidenceRoot(deps.dataDir));
+      if (removed.length) record(SYSTEM, "autopilot.evidence_pruned", "evidence", { files: removed.length, retentionDays: retentionDays(), first: removed[0], last: removed.at(-1) });
+    } catch (err) {
+      warn(err);
+    }
   }
 
   async function idle() {
@@ -2726,7 +2739,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   return {
     ledger,
-    evidence: (runId: string, actor: string) => locked(runId, () => exportEvidence(ledger, workspace, runId, actor)),
+    /** Exports the run's evidence and keeps a write-once copy (evidence-store.ts). */
+    evidence: (runId: string, actor: string) =>
+      locked(runId, async () => {
+        const exported = await exportEvidence(ledger, workspace, runId, actor);
+        return { ...exported, stored: storeEvidence(evidenceRoot(deps.dataDir), runId, "packet", exported.packet) };
+      }),
     createRun,
     decide,
     pause,

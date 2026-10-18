@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -126,6 +126,8 @@ test("delivery pushes the branch, opens one draft pull request (found again afte
     assert.equal(evidence.packet.delivery?.pullRequest?.number, 1);
     assert.equal(evidence.packet.artifact.commit, head);
     assert.ok(!JSON.stringify(evidence).includes(TOKEN));
+    assert.equal(evidence.stored.sha256, evidence.digest.value);
+    assert.ok(existsSync(path.join(t.dataDir, "evidence", evidence.stored.file)), "the export is kept, write-once");
   } finally {
     await t.close();
   }

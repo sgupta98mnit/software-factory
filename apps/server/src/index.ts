@@ -7,6 +7,7 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { audit, listAudit, verifyAudit } from "./audit.js";
 import { authConfigFromEnv, createAuth, Forbidden, requireRole, Unauthenticated } from "./auth.js";
+import { createAdminRoutes } from "./backup.js";
 import { openLedger } from "./autopilot/ledger.js";
 import { OpenHandsClient } from "./autopilot/openhands.js";
 import { createOrchestrator } from "./autopilot/orchestrator.js";
@@ -110,6 +111,8 @@ app.post("/workorders/:id/conversations", async (c) => {
 // ---- audit ----
 app.get("/audit", (c) => c.json(listAudit()));
 app.get("/audit/verify", (c) => c.json(verifyAudit()));
+// Backups of the ledger, the audit log and the evidence store (admins).
+app.route("/admin", createAdminRoutes({ ledger, dataDir: DATA_DIR }));
 
 // ---- autopilot: goal -> spec -> plan -> build, with agents on the OpenHands agent server ----
 const autopilot = createOrchestrator({
