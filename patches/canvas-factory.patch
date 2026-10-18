@@ -8480,10 +8480,10 @@ index 4e50cac..35afa3f 100644
      route("*", "routes/not-found.tsx"),
    ]),
 diff --git a/vite.config.ts b/vite.config.ts
-index 26241f5..3e53d2e 100644
+index 26241f5..7c1f3bb 100644
 --- a/vite.config.ts
 +++ b/vite.config.ts
-@@ -440,6 +440,11 @@ export default defineConfig(({ mode }) => {
+@@ -440,6 +440,12 @@ export default defineConfig(({ mode }) => {
            changeOrigin: true,
            secure: !INSECURE_SKIP_VERIFY,
          },
@@ -8491,6 +8491,7 @@ index 26241f5..3e53d2e 100644
 +        "/sf-api": {
 +          target: process.env.SF_API_URL || "http://127.0.0.1:4317",
 +          changeOrigin: true,
++          xfwd: true, // the factory checks the browser's Host (X-Forwarded-Host)
 +        },
          "/sockets": {
            target: WS_URL,

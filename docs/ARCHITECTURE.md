@@ -80,7 +80,8 @@ Autopilot runs the life of a work order above without a person at each step: a g
 ## Security notes
 
 - **OpenHands auto-approves every ACP permission request**, and its defaults start Claude Code in `bypassPermissions` and Codex in `agent-full-access`. Running Canvas without a sandbox (what `pnpm dev` does) means agents can run any command as you. For real agency work, run the agent server in Docker (Canvas README, Option 2) and set `SF_AGENT_WORKSPACE` to the path the container sees.
-- The factory API listens on 127.0.0.1 only, rejects other Host headers, and only accepts JSON for changes.
+- The factory API listens on 127.0.0.1 only and only accepts JSON for changes. Canvas's ingress and Vite proxy `/sf-api` and rewrite Host on the way, so the API checks the browser's own Host (`X-Forwarded-Host`, which Vite forwards with `xfwd`), and refuses any change whose `Origin` isn't this machine (`apps/server/src/guard.ts`). That stops a DNS-rebinding page from deciding, releasing or changing the policy. A page written for this API can still forge `X-Forwarded-Host` to read; sign-in closes that.
+- Don't bind Canvas to `0.0.0.0` (`--host`, `OH_BIND_HOST`, or `OH_CONVERSATION_RUNTIME=docker`) before sign-in lands: the ingress has no auth, and a client on the network that isn't a browser can claim a loopback Host.
 - Telemetry: `pnpm setup:canvas` writes `VITE_DO_NOT_TRACK=1` to `canvas/.env`, which stops Canvas's PostHog client. OpenSpec runs with `OPENSPEC_TELEMETRY=0`.
 - With telemetry off, the browser still contacts Google Fonts and the npm registry (Canvas's update check). For an offline or locked-down network, self-host the fonts and turn off the update check.
 - The agent server runs `git init` in a workspace that isn't a git repo, the first time a conversation starts there, for its Changes tab.

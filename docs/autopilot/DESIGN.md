@@ -187,7 +187,7 @@ or its work orders move.
   goes to `needs_attention`, the attempt fails and is repaired. Three such work
   orders pause the run. Only the factory's setup (a refused session key, a
   profile the policy names that doesn't exist) stops a run as a whole, once.
-- The API binds to 127.0.0.1 and rejects other Host headers.
+- The API binds to 127.0.0.1. `guard.ts` refuses a request whose browser Host (`X-Forwarded-Host` when a proxy set it, else `Host`) isn't this machine, and a change whose `Origin` isn't; signed GitHub/webhook intake keeps the plain Host check, since relays name their own public host.
 
 ## 8. Scans
 

@@ -26,6 +26,7 @@ import {
   agentServerKey,
 } from "./config.js";
 import { broadcast, eventStream } from "./events.js";
+import { localOnly } from "./guard.js";
 import { assertChange, changeDetail, openspecDir, overview, specDetail, validateAll } from "./openspec.js";
 import { createWorkOrders, planWorkOrders } from "./planner.js";
 import { tools } from "./tools.js";
@@ -35,16 +36,8 @@ const app = new Hono().basePath("/sf-api");
 // Errors come back as { error } with a 400 so the UI can show the message.
 app.onError((err, c) => c.json({ error: err.message }, 400));
 
-// Only answer requests addressed to this machine (blocks DNS-rebinding), and
-// only accept JSON for changes (a cross-site form can't send it without CORS).
-app.use("*", async (c, next) => {
-  const host = (c.req.header("host") ?? "").replace(/:\d+$/, "");
-  if (!["127.0.0.1", "localhost", "[::1]"].includes(host)) return c.json({ error: "Forbidden host" }, 403);
-  if (c.req.method !== "GET" && !(c.req.header("content-type") ?? "").includes("application/json")) {
-    return c.json({ error: "Send JSON" }, 415);
-  }
-  await next();
-});
+// Only this machine's browser: its Host and, for changes, its Origin (guard.ts).
+app.use("*", localOnly());
 
 const body = async <T>(c: { req: { json: () => Promise<unknown> } }) => (await c.req.json().catch(() => ({}))) as T;
 

@@ -23,7 +23,10 @@ importance, this is what's still open:
    the Inbox.
 2. **No sign-in or roles.** Anything that reaches 127.0.0.1 can decide,
    release or change the policy, and people are named by `SF_USER` (see
-   "Plausible" below). This comes first for any shared or production use.
+   "Plausible" below). This comes first for any shared or production use. Until
+   then, a page written for this API can still read through Canvas by forging
+   `X-Forwarded-Host` (#72), and binding Canvas to `0.0.0.0` exposes the API to
+   the network through the ingress, which has no auth.
 3. **No sandbox.** Several gaps below need agents, gates, hidden tests and the
    preview in containers instead of on the host:
    - hidden tests share a process with the builder's code;
@@ -153,6 +156,7 @@ The "Plausible, not fixed yet" section has the full list with details.
 | 69 | low | The Metrics page's per-policy cards counted every run the policy ever had, under "Runs started in the last N days". They count the window's runs. |
 | 70 | low | `GET /metrics?days=` (empty) meant one day (`Number("")` is 0), not the default 30. |
 | 71 | low | A merged work order that a re-plan reopened kept its `mergeWhy` ("The policy merged it: …") while it was built again, and for good if it was then skipped; the Pipeline showed it. It's cleared with `mergedBy`. |
+| 72 | high | Found while researching sandboxing: the API's Host check (its DNS-rebinding defense) never saw the browser's Host. Canvas's ingress and Vite proxy `/sf-api` with `changeOrigin`, so every request arrived as `127.0.0.1:4317`, and Vite runs with `allowedHosts: true`. A page on any site that rebinds its name to 127.0.0.1 could read runs, evidence and the audit log, and decide Inbox items, release runs or rewrite the policy. Reproduced against the real Vite proxy. `guard.ts` now checks the forwarded Host and refuses changes from another `Origin`, and Vite forwards the Host (`xfwd`). A page written for this API can still forge `X-Forwarded-Host` to read (not write); sign-in closes that (`guard.test.ts`). |
 
 ## Plausible, not fixed yet (tracked for later phases)
 
