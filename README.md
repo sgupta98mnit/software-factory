@@ -92,6 +92,9 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 | `SF_LOCAL_ROLES` | every role | The roles this machine's user has when nobody signs in |
 | `SF_PORT` | `4317` | Factory API port. If you change it, change `SF_API_URL` in `canvas\.env` too |
 | `SF_DATA_DIR` | `data` | Where the audit log, the Autopilot ledger (`autopilot.db`) and its worktrees are kept |
+| `SF_EVIDENCE_DIR` | `data/evidence` | The write-once evidence store (exported packets, release approvals); point it at write-once storage if you have it |
+| `SF_EVIDENCE_RETENTION_DAYS` | `2555` (7 years) | How long stored evidence is kept before the factory prunes it |
+| `SF_BACKUP_DIR` | `data/backups` | Where backups go |
 | `SF_AGENT_SERVER_URL` | `http://127.0.0.1:8000` | Where Autopilot reaches the OpenHands agent server (Canvas's address) |
 | `SF_AGENT_SERVER_KEY` | Canvas's saved key | The agent server's session key, if Canvas keeps it somewhere else |
 | `SF_AUTONOMY_CAP` | none | Highest Autopilot autonomy anyone can pick: `suggest`, `supervised` or `autonomous` |
@@ -225,11 +228,24 @@ With `governance.releaseApproval: required`, a finished run opens a **Release** 
 
 On a finished, failed or cancelled run, choose **Download evidence** to save a JSON packet containing the recorded artifact commit, pinned policy hash, work order criteria/control mappings, gate metadata, agent costs and approval decisions. This works after worktrees are cleaned up. The API is `POST /sf-api/autopilot/runs/:id/evidence` with JSON `{}`; active runs return 409 and missing runs return 404. A damaged audit chain blocks export with a visible error.
 
-The response contains `packet` and its SHA-256 `digest`. Hash only `packet` using `sf-canonical-json-v1`: recursively sort object keys, preserve array order and serialize with JSON.stringify (undefined object members omitted). The existing `canonicalJson` and `sha256` exports in `apps/server/src/audit.ts` implement this format. The digest detects edits; the packet is unsigned and does not authenticate its producer. Preserve the exported file with the relevant Git objects and audit log if you need to investigate it later.
+The response contains `packet` and its SHA-256 `digest`. Hash only `packet` using `sf-canonical-json-v1`: recursively sort object keys, preserve array order and serialize with JSON.stringify (undefined object members omitted). The existing `canonicalJson` and `sha256` exports in `apps/server/src/audit.ts` implement this format. The digest detects edits; the packet is unsigned and does not authenticate its producer. Each export is also kept write-once in the evidence store (`data/evidence/<run>/packet-<sha256>.json`, read-only, never overwritten) and pruned only after `SF_EVIDENCE_RETENTION_DAYS`. Back the store up with the relevant Git objects and audit log if you need to investigate it later.
 
 Artifact identity comes from the run's terminal audit event, never the current branch tip. Missing commits are marked unavailable; older failed/cancelled runs may have no recorded artifact. Historical gate checks lack commit binding, and output hashes cover only the stored output tail, not the full command log. Raw goals/prompts, agent replies, gate output, approval notes and arbitrary audit payloads are excluded. Work order titles and criteria remain project content: review them before sharing. Security scanning and independent validation are explicitly unrecorded; control mappings do not establish compliance.
 
 The [implementation roadmap](docs/autopilot/ROADMAP.md) selects approaches from the researched projects and sequences isolation, trusted verification, durable recovery, PR delivery and governance after this evidence foundation.
+
+## Backups
+
+`POST /sf-api/admin/backup` with `{}` (admin role) writes a backup folder to `SF_BACKUP_DIR`. It holds a consistent copy of the ledger with sign-in sessions removed, the audit log copied between appends, the evidence store, and `manifest.json` with every file's SHA-256. A backup is refused while the audit chain or a stored evidence file doesn't verify. The audit log records the manifest's digest (`factory.backup_created`). Keys (`data/runtime.key`) never go into a backup: a restored factory makes new ones. Copy backups off this machine.
+
+To check a backup, then restore it into a new, empty folder:
+
+```powershell
+pnpm --filter @sf/server restore D:\backups\2026-10-18T21-43-53-102Z --expect <manifest sha256>
+pnpm --filter @sf/server restore D:\backups\2026-10-18T21-43-53-102Z D:\factory-data --expect <manifest sha256>
+```
+
+A restore first checks every file's digest, that nothing was added, the audit chain and where it ends, the evidence names and the ledger's integrity. Only then does it copy, and only into an empty folder; point `SF_DATA_DIR` at that folder. `--expect` (the digest from the audit log) also catches a backup whose manifest was rewritten along with its files.
 
 ## Working on the Canvas side
 
