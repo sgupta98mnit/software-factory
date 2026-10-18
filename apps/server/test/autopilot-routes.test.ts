@@ -89,6 +89,7 @@ test("POST /runs checks the goal, autonomy and budget; GET /runs and /runs/:id s
       costUsd: 0,
       budgetUsd: 12.5,
       policyHash: policyHash(DEFAULT_POLICY), // no policy.yml: the defaults, pinned
+      execution: { provider: "local", isolated: false },
       createdBy: "user:tester",
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -224,6 +225,7 @@ test("GET /status reports the agent server, the workspace and the counts", async
       },
       workspace: { path: workspace, isRepo: false, branch: null },
       policy: { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null },
+      execution: { provider: "local", isolated: false, required: false, image: null, network: null, preflight: null },
       openInbox: 0,
       activeRuns: 0,
     });

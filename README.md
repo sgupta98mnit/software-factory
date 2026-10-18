@@ -90,6 +90,8 @@ Copy the "Software Factory conventions" block from `workspaces\benefits-portal\A
 | `SF_AGENT_SERVER_URL` | `http://127.0.0.1:8000` | Where Autopilot reaches the OpenHands agent server (Canvas's address) |
 | `SF_AGENT_SERVER_KEY` | Canvas's saved key | The agent server's session key, if Canvas keeps it somewhere else |
 | `SF_AUTONOMY_CAP` | none | Highest Autopilot autonomy anyone can pick: `suggest`, `supervised` or `autonomous` |
+| `SF_REQUIRE_ISOLATION` | none | `1` refuses to run agents or their code on this machine: runs need `execution.provider: container` and a passing isolation check, whatever the workspace policy says |
+| `SF_DOCKER` | `docker` | The Docker CLI Autopilot uses for isolated execution |
 
 ## Autopilot policy
 
@@ -109,11 +111,35 @@ autoMerge:
   maxChangedLines: 400
   sensitivePaths: ["**/auth/**", "**/crypto/**", "infra/**", "**/*.tf", "Dockerfile", ".github/**", ".gitlab-ci.yml", ".factory/**", "AGENTS.md", "CLAUDE.md", "**/migrations/**"]
   dependencyAllowlist: []
+execution:
+  provider: local                                    # local (agents and gates on this machine, not isolated) or container
+  container:                                         # used when provider is container
+    image: null                                      # required: agent-server image pinned by digest, already pulled
+    gateImage: null                                  # image the gates run in; null = image
+    network: null                                    # required: a Docker network you created (not host)
+    gateNetwork: null                                # null = network
+    user: null                                       # "uid:gid"; null = your ids on Linux/macOS, the image's user on Windows
+    memory: 4g
+    cpus: 2
+    pids: 512
+    hostPathStyle: native                            # native (Docker Desktop) or wsl (a WSL engine: C:\x becomes /mnt/c/x)
+    credentials: { spec: [], critic: [], builder: [], reviewer: [], validator: [] }   # environment variable names each role gets
+    startTimeoutSec: 120
 ```
 
-A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing`, `hiddenTests` and `notify` are accepted for features still to come.
+A work order merges without a person only when its gates and review passed, it adds no dependency outside `dependencyAllowlist`, it changes no file under `sensitivePaths` (any case, dot folders included; a bare name like `Dockerfile` matches in every folder), and it changes fewer than `maxChangedLines` lines. In `suggest` mode a person approves every merge. Anything else goes to the Inbox with the reasons. The audit log records policy approvals as `policy@<hash>`, where the hash identifies the exact rules. An invalid file (unknown key or bad value) stops new runs, and `/sf-api/autopilot/status` shows the error. `routing`, `hiddenTests` and `notify` are accepted for features still to come; `execution` is described under [Isolated execution](#isolated-execution).
 
 Autopilot checks reported conversation costs before starting more work and after each poll. At the run limit (the amount entered in Home, or `budget.perChangeUsd`), it pauses the run's agents and opens a budget decision in the Inbox. At a work order's limit, it pauses that order while the others continue. Continue adds the policy's base budget to the relevant limit; Skip ends that work order; Cancel ends the run. Limits and decisions persist across restarts, and a normal Resume cannot bypass a run budget decision. Spending can rise between checks or while a pause request completes; enforcement depends on the agent server reporting costs.
+
+## Isolated execution
+
+By default (`execution.provider: local`) Autopilot's agents, their tools and the gates run on this machine with your permissions, through Canvas's agent server. Nothing is isolated, and Home, the run page and evidence say so.
+
+With `execution.provider: container`, the factory starts one agent-server container per agent attempt from the digest-pinned `image`, with the same lifecycle as the agent server's own Docker runtime: all capabilities dropped, `no-new-privileges`, the memory, CPU and process limits above, the policy's `network`, and the agent server published on 127.0.0.1 only, with a session key derived from `data/runtime.key`. Only the attempt's worktree is mounted (at `/workspace`), its `.git` file hidden behind a read-only empty file, so nothing in the container can point the factory's git elsewhere. Agents there have no git: the factory commits what they leave, and a reviewer reads the diff from `/factory/changes.diff`. Each role gets only the environment variables its `credentials` list names; values never appear in arguments, the ledger, the audit log or evidence. The factory copies the role's Canvas agent profile into the container, so use ACP profiles (Claude Code, Codex) whose keys come from those variables. Gates run in throwaway containers on `gateNetwork`, without credentials.
+
+Before a run starts, and from **Check isolation** on Home, the factory checks that Docker answers, the image and networks exist, every named credential is set, a container can read a file the factory writes through the mount (path mapping), and that a container on the network can't reach the factory API or Canvas on this machine. Docker Desktop forwards `host.docker.internal` to this machine's loopback, so an agent on a plain bridge network could call the factory as you: use a network without access to this machine. A run that fails a check doesn't start. If Docker stops mid-run, the run waits for it, as it does for an unreachable agent server.
+
+Containers are named after their attempt, so a restarted factory reconnects to running ones. A container that disappears ends its attempt, and the normal repair loop starts a fresh one. Containers are removed once their attempt can't get another message (its work order merged, a newer attempt replaced it, or the run ended); leftovers are swept at startup. Transcripts stay in `data/runtime/<run>/a<attempt>/state`, not in Canvas. The container provider has been tested against a stand-in Docker CLI, not yet against a live Docker engine and agent-server image.
 
 ## Run evidence
 

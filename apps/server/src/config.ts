@@ -58,6 +58,12 @@ export function agentServerKey(): string | undefined {
   }
 }
 
+/**
+ * SF_REQUIRE_ISOLATION=1: never run agents or the code they write on this
+ * machine itself, whatever a workspace's policy says. Read on every call.
+ */
+export const isolationRequired = () => /^(1|true|yes)$/i.test(process.env.SF_REQUIRE_ISOLATION ?? "");
+
 export const PORT = Number(process.env.SF_PORT ?? 4317);
 
 /** Bind to localhost only: agents run commands on this machine, so never expose this server. */

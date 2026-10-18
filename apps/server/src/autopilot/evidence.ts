@@ -1,8 +1,18 @@
 // Operator evidence, deliberately allowlisted: no prompts, raw tool output,
 // agent replies, approval notes or arbitrary audit payloads leave this module.
 import { audit, auditSnapshot, canonicalJson, sha256 } from "../audit.js";
+import type { ExecutionFacts } from "./execution.js";
 import { git } from "./git.js";
 import type { Ledger } from "./ledger.js";
+import { pinnedPolicy } from "./policy.js";
+
+/** Where an attempt ran, without its container's name: images, limits, network and credential names only. */
+function executionOf(runtime: unknown) {
+  const f = runtime as ExecutionFacts | null;
+  if (!f) return { provider: "not_recorded" as const };
+  if (f.provider === "local") return { provider: "local" as const, isolated: false };
+  return { provider: "container" as const, isolated: true, image: f.image ?? null, imageId: f.imageId ?? null, network: f.network ?? null, user: f.user ?? null, limits: f.limits ?? null, credentials: f.credentials ?? [], mounts: f.mounts ?? [] };
+}
 
 export class EvidenceConflict extends Error {}
 
@@ -55,6 +65,7 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
       baseBranch: run.baseBranch, integrationBranch: run.integrationBranch,
       policyHash: run.policyHash, budgetUsd: run.budgetUsd, costUsd: snapshot.costUsd,
       createdBy: run.createdBy, createdAt: run.createdAt, updatedAt: run.updatedAt,
+      execution: { provider: pinnedPolicy(run).execution.provider, isolated: pinnedPolicy(run).execution.provider === "container" },
     },
     artifact: { commit, available, source: commit ? "terminal_audit" as const : "not_recorded" as const },
     workOrders: workOrders.map((wo) => ({
@@ -70,6 +81,7 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
       name: check.name, ok: check.ok, exitCode: check.exitCode,
       durationMs: check.durationMs, at: check.at, outputSha256: sha256(check.output),
       commitBinding: "not_recorded" as const,
+      runner: check.runner ?? "not_recorded",
     })),
     attempts: attempts.map((attempt) => {
       const result = attempt.result as { verdict?: unknown } | null;
@@ -79,6 +91,7 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
         conversationId: attempt.conversationId, agentProfile: attempt.agentProfile,
         state: attempt.state, turns: attempt.turns, costUsd: attempt.costUsd,
         startedAt: attempt.startedAt, finishedAt: attempt.finishedAt, verdict,
+        execution: executionOf(attempt.runtime),
       };
     }),
     decisions: inbox.map((item) => ({
@@ -92,7 +105,15 @@ export async function exportEvidence(ledger: Ledger, workspace: string, runId: s
         seq: e.seq, at: e.at, actor: e.actor, action: e.action, hash: e.hash,
       })),
     },
-    assurance: { securityScan: "not_recorded" as const, independentValidation: "not_recorded" as const, signature: "unsigned" as const },
+    assurance: {
+      securityScan: "not_recorded" as const,
+      independentValidation: "not_recorded" as const,
+      signature: "unsigned" as const,
+      // Every agent and every gate ran in a container; otherwise something ran on the operator's machine (or wasn't recorded).
+      isolation: attempts.length > 0 && attempts.every((a) => (a.runtime as ExecutionFacts | null)?.provider === "container") && !checks.some((c) => c.runner === "local")
+        ? ("container" as const)
+        : ("none" as const),
+    },
     limitations: [
       "This unsigned digest detects packet changes; it does not authenticate its producer.",
       "The audit checkpoint reports local verification at export time. Event payloads are omitted; this packet alone cannot reverify the audit chain or detect truncation.",

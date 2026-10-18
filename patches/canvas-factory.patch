@@ -1,9 +1,9 @@
 diff --git a/__tests__/factory/autopilot.test.tsx b/__tests__/factory/autopilot.test.tsx
 new file mode 100644
-index 0000000..eb982c8
+index 0000000..11b8f36
 --- /dev/null
 +++ b/__tests__/factory/autopilot.test.tsx
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,498 @@
 +import { screen, waitFor, within } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
 +import { http, HttpResponse } from "msw";
@@ -11,8 +11,9 @@ index 0000000..eb982c8
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +import { renderWithProviders, useParamsMock } from "test-utils";
 +import { server } from "#/mocks/node";
-+import type { InboxItemView, RunDetail } from "#/factory/api";
++import type { AutopilotStatus, InboxItemView, RunDetail } from "#/factory/api";
 +import { FactoryNavLinks } from "#/factory/factory-nav-links";
++import AutopilotHomeRoute from "#/factory/routes/autopilot-home";
 +import AutopilotInboxRoute from "#/factory/routes/inbox";
 +import AutopilotPipelineRoute from "#/factory/routes/autopilot-pipeline";
 +
@@ -106,6 +107,7 @@ index 0000000..eb982c8
 +  costUsd: 0.12000000000000001,
 +  budgetUsd: null,
 +  policyHash: "6a4216da9355",
++  execution: { provider: "local", isolated: false },
 +  createdBy: "user:tester",
 +  createdAt: "2026-10-17T03:00:00.000Z",
 +  updatedAt: "2026-10-17T03:05:00.000Z",
@@ -158,6 +160,7 @@ index 0000000..eb982c8
 +        ],
 +        turn: 1,
 +      },
++      execution: { provider: "local", isolated: false },
 +      startedAt: "2026-10-17T03:01:00.000Z",
 +      finishedAt: "2026-10-17T03:02:00.000Z",
 +    },
@@ -205,7 +208,9 @@ index 0000000..eb982c8
 +      </MemoryRouter>,
 +    );
 +    expect(await screen.findByText("Group 3 is big")).toBeInTheDocument();
-+    expect(screen.queryByRole("button", { name: "Download evidence" })).not.toBeInTheDocument();
++    expect(
++      screen.queryByRole("button", { name: "Download evidence" }),
++    ).not.toBeInTheDocument();
 +    expect(screen.getByText("Split it in two")).toBeInTheDocument();
 +    const stages = screen.getByRole("list", { name: /stages/i });
 +    expect(
@@ -218,12 +223,25 @@ index 0000000..eb982c8
 +  it("downloads terminal run evidence, prevents duplicate clicks and releases the object URL", async () => {
 +    const user = userEvent.setup();
 +    let release!: () => void;
-+    const pending = new Promise<void>((resolve) => { release = resolve; });
-+    const exported = { packet: { schemaVersion: 1, run: { id: runDetail.id } }, digest: { algorithm: "sha256", canonicalization: "sf-canonical-json-v1", value: "digest" } };
++    const pending = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    const exported = {
++      packet: { schemaVersion: 1, run: { id: runDetail.id } },
++      digest: {
++        algorithm: "sha256",
++        canonicalization: "sf-canonical-json-v1",
++        value: "digest",
++      },
++    };
 +    let requests = 0;
 +    server.use(
-+      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () => HttpResponse.json({ ...runDetail, state: "done" })),
-+      http.get("*/sf-api/autopilot/status", () => HttpResponse.json({ agentServer: { profiles: [] } })),
++      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () =>
++        HttpResponse.json({ ...runDetail, state: "done" }),
++      ),
++      http.get("*/sf-api/autopilot/status", () =>
++        HttpResponse.json({ agentServer: { profiles: [] } }),
++      ),
 +      http.post("*/sf-api/autopilot/runs/ap-1a2b3c4d/evidence", async () => {
 +        requests += 1;
 +        await pending;
@@ -239,20 +257,35 @@ index 0000000..eb982c8
 +    }
 +    vi.stubGlobal("URL", DownloadURL);
 +    const downloads: { href: string; filename: string }[] = [];
-+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
++    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
++      this: HTMLAnchorElement,
++    ) {
 +      downloads.push({ href: this.href, filename: this.download });
 +    });
 +    renderWithProviders(
 +      <MemoryRouter initialEntries={["/autopilot/runs/ap-1a2b3c4d"]}>
-+        <Routes><Route path="/autopilot/runs/:runId" element={<AutopilotPipelineRoute />} /></Routes>
++        <Routes>
++          <Route
++            path="/autopilot/runs/:runId"
++            element={<AutopilotPipelineRoute />}
++          />
++        </Routes>
 +      </MemoryRouter>,
 +    );
-+    await user.click(await screen.findByRole("button", { name: "Download evidence" }));
-+    const preparing = screen.getByRole("button", { name: "Preparing evidence…" });
++    await user.click(
++      await screen.findByRole("button", { name: "Download evidence" }),
++    );
++    const preparing = screen.getByRole("button", {
++      name: "Preparing evidence…",
++    });
 +    expect(preparing).toBeDisabled();
 +    await user.click(preparing);
 +    release();
-+    await waitFor(() => expect(downloads).toEqual([{ href: "blob:evidence", filename: "ap-1a2b3c4d-evidence.json" }]));
++    await waitFor(() =>
++      expect(downloads).toEqual([
++        { href: "blob:evidence", filename: "ap-1a2b3c4d-evidence.json" },
++      ]),
++    );
 +    expect(requests).toBe(1);
 +    expect(createObjectURL.mock.calls[0]?.[0]).toBeInstanceOf(Blob);
 +    const contents = await new Promise<string>((resolve, reject) => {
@@ -262,57 +295,212 @@ index 0000000..eb982c8
 +      reader.readAsText(createObjectURL.mock.calls[0]![0]);
 +    });
 +    expect(JSON.parse(contents)).toEqual(exported);
-+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:evidence"));
-+    expect(screen.getByRole("button", { name: "Download evidence" })).toBeEnabled();
++    await waitFor(() =>
++      expect(revokeObjectURL).toHaveBeenCalledWith("blob:evidence"),
++    );
++    expect(
++      screen.getByRole("button", { name: "Download evidence" }),
++    ).toBeEnabled();
 +  });
 +
 +  it("keeps a failed evidence export visible and retryable", async () => {
 +    const user = userEvent.setup();
 +    let requests = 0;
 +    server.use(
-+      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () => HttpResponse.json({ ...runDetail, state: "cancelled" })),
-+      http.get("*/sf-api/autopilot/status", () => HttpResponse.json({ agentServer: { profiles: [] } })),
++      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () =>
++        HttpResponse.json({ ...runDetail, state: "cancelled" }),
++      ),
++      http.get("*/sf-api/autopilot/status", () =>
++        HttpResponse.json({ agentServer: { profiles: [] } }),
++      ),
 +      http.post("*/sf-api/autopilot/runs/ap-1a2b3c4d/evidence", () => {
 +        requests += 1;
-+        return HttpResponse.json({ error: "The audit chain is invalid." }, { status: 409 });
++        return HttpResponse.json(
++          { error: "The audit chain is invalid." },
++          { status: 409 },
++        );
 +      }),
 +    );
 +    renderWithProviders(
 +      <MemoryRouter initialEntries={["/autopilot/runs/ap-1a2b3c4d"]}>
-+        <Routes><Route path="/autopilot/runs/:runId" element={<AutopilotPipelineRoute />} /></Routes>
++        <Routes>
++          <Route
++            path="/autopilot/runs/:runId"
++            element={<AutopilotPipelineRoute />}
++          />
++        </Routes>
 +      </MemoryRouter>,
 +    );
-+    await user.click(await screen.findByRole("button", { name: "Download evidence" }));
-+    expect(await screen.findByRole("alert")).toHaveTextContent("The audit chain is invalid.");
-+    expect(screen.getByRole("button", { name: "Download evidence" })).toBeEnabled();
++    await user.click(
++      await screen.findByRole("button", { name: "Download evidence" }),
++    );
++    expect(await screen.findByRole("alert")).toHaveTextContent(
++      "The audit chain is invalid.",
++    );
++    expect(
++      screen.getByRole("button", { name: "Download evidence" }),
++    ).toBeEnabled();
 +    await user.click(screen.getByRole("button", { name: "Download evidence" }));
 +    await waitFor(() => expect(requests).toBe(2));
 +  });
 +});
-diff --git a/__tests__/factory/zz-debug.test.tsx b/__tests__/factory/zz-debug.test.tsx
-new file mode 100644
-index 0000000..30faf7d
---- /dev/null
-+++ b/__tests__/factory/zz-debug.test.tsx
-@@ -0,0 +1,19 @@
-+import { screen } from "@testing-library/react";
-+import { http, HttpResponse } from "msw";
-+import { MemoryRouter, Route, Routes, useParams } from "react-router";
-+import { it } from "vitest";
-+import { renderWithProviders } from "test-utils";
-+import { server } from "#/mocks/node";
-+import { useAutopilotRun } from "#/factory/hooks";
 +
-+function Probe() {
-+  const { runId } = useParams();
-+  const q = useAutopilotRun(runId);
-+  return <p>{`id=${runId} status=${q.status} fetch=${q.fetchStatus} err=${String(q.error)} data=${q.data ? "yes" : "no"}`}</p>;
++const statusWith = (
++  execution: AutopilotStatus["execution"],
++): AutopilotStatus => ({
++  agentServer: {
++    url: "http://127.0.0.1:8000",
++    reachable: true,
++    error: null,
++    profiles: [],
++    activeProfileId: null,
++  },
++  workspace: { path: "/work/benefits-portal", isRepo: true, branch: "main" },
++  policy: {
++    source: ".factory/policy.yml@main",
++    hash: "abc123def456",
++    error: null,
++  },
++  execution,
++  openInbox: 0,
++  activeRuns: 0,
++});
++
++function renderHome(status: AutopilotStatus) {
++  server.use(
++    http.get("*/sf-api/autopilot/status", () => HttpResponse.json(status)),
++    http.get("*/sf-api/autopilot/runs", () => HttpResponse.json([])),
++    http.get("*/sf-api/health", () =>
++      HttpResponse.json({
++        workspace: {
++          name: "benefits-portal",
++          path: status.workspace.path,
++          agentPath: status.workspace.path,
++          exists: true,
++        },
++        user: "user:tester",
++        versions: { openspec: "1.14.0", backlog: "1.53.0" },
++      }),
++    ),
++  );
++  renderWithProviders(
++    <MemoryRouter initialEntries={["/autopilot"]}>
++      <AutopilotHomeRoute />
++    </MemoryRouter>,
++  );
 +}
-+it("debug", async () => {
-+  server.use(http.get("*/sf-api/autopilot/runs/ap-1", () => HttpResponse.json({ id: "ap-1", state: "building" })));
-+  renderWithProviders(<MemoryRouter initialEntries={["/autopilot/runs/ap-1"]}><Routes><Route path="/autopilot/runs/:runId" element={<Probe />} /></Routes></MemoryRouter>);
-+  await new Promise((r) => setTimeout(r, 1500));
-+  console.log("DEBUG", screen.getByText(/id=/).textContent);
++
++describe("Autopilot execution", () => {
++  it("says plainly when agents run on this machine without isolation", async () => {
++    renderHome(
++      statusWith({
++        provider: "local",
++        isolated: false,
++        required: false,
++        image: null,
++        network: null,
++        preflight: null,
++      }),
++    );
++    const line = await screen.findByTestId("autopilot-execution");
++    expect(line).toHaveTextContent("Nothing is isolated.");
++    expect(within(line).queryByRole("button")).not.toBeInTheDocument();
++  });
++
++  it("checks container isolation on request and lists what stops runs", async () => {
++    const user = userEvent.setup();
++    let checks = 0;
++    renderHome(
++      statusWith({
++        provider: "container",
++        isolated: true,
++        required: true,
++        image: "agent-server@sha256:abc",
++        network: "sf-agents",
++        preflight: null,
++      }),
++    );
++    server.use(
++      http.post("*/sf-api/autopilot/execution/preflight", () => {
++        checks += 1;
++        return HttpResponse.json({
++          provider: "container",
++          isolated: true,
++          required: true,
++          ok: false,
++          problems: ["Docker isn't reachable: no answer"],
++          notes: [],
++          facts: { provider: "container", isolated: true },
++          checkedAt: "2026-10-18T10:00:00.000Z",
++        });
++      }),
++    );
++    const line = await screen.findByTestId("autopilot-execution");
++    expect(line).toHaveTextContent(
++      "Isolated: each agent and each check runs in its own container (agent-server@sha256:abc, network sf-agents).",
++    );
++    await user.click(
++      within(line).getByRole("button", { name: "Check isolation" }),
++    );
++    expect(
++      await within(line).findByText("Docker isn't reachable: no answer"),
++    ).toBeInTheDocument();
++    expect(line).toHaveTextContent("Runs can't start until these are fixed:");
++    expect(checks).toBe(1);
++  });
++
++  it("shows an isolated run's execution and keeps container conversations out of Canvas links", async () => {
++    const useRouter =
++      await vi.importActual<typeof import("react-router")>("react-router");
++    useParamsMock.mockImplementation(() => ({
++      conversationId: "test-conversation-id",
++      ...useRouter.useParams(),
++    }));
++    const isolated: RunDetail = {
++      ...runDetail,
++      execution: { provider: "container", isolated: true },
++      attempts: [
++        {
++          ...runDetail.attempts[0]!,
++          execution: {
++            provider: "container",
++            isolated: true,
++            container: "sf-ap-1a2b3c4d-a2",
++          },
++        },
++      ],
++    };
++    server.use(
++      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () =>
++        HttpResponse.json(isolated),
++      ),
++      http.get("*/sf-api/autopilot/status", () =>
++        HttpResponse.json({ agentServer: { profiles: [] } }),
++      ),
++    );
++    renderWithProviders(
++      <MemoryRouter initialEntries={["/autopilot/runs/ap-1a2b3c4d"]}>
++        <Routes>
++          <Route
++            path="/autopilot/runs/:runId"
++            element={<AutopilotPipelineRoute />}
++          />
++        </Routes>
++      </MemoryRouter>,
++    );
++    expect(
++      await screen.findByText("Isolated in containers"),
++    ).toBeInTheDocument();
++    const spec = screen.getByRole("region", { name: "Spec" });
++    expect(within(spec).getByText("Isolated")).toBeInTheDocument();
++    expect(
++      within(spec).queryByRole("link", { name: "Open conversation" }),
++    ).not.toBeInTheDocument();
++    expect(
++      within(spec).getByText(/transcript is kept in the factory's data folder/),
++    ).toBeInTheDocument();
++    useParamsMock.mockReset();
++  });
 +});
 diff --git a/src/components/features/sidebar/sidebar-nav-link.tsx b/src/components/features/sidebar/sidebar-nav-link.tsx
 index 5c8f24d..bf98e67 100644
@@ -365,7 +553,7 @@ index 821b542..1ec6a3c 100644
              key={`${page.extension.name}:${page.contribution.id}`}
 diff --git a/src/factory/README.md b/src/factory/README.md
 new file mode 100644
-index 0000000..9dd363b
+index 0000000..a8c56bc
 --- /dev/null
 +++ b/src/factory/README.md
 @@ -0,0 +1,56 @@
@@ -373,14 +561,14 @@ index 0000000..9dd363b
 +
 +This folder adds pages to Agent Canvas for spec-driven, governed delivery:
 +
-+| Page | Route | Reads |
-+| --- | --- | --- |
-+| Autopilot | `/autopilot` | Start a run from a goal (autonomy, budget); agent server and policy status; recent runs |
-+| Autopilot run | `/autopilot/runs/:runId` | One run: stage lanes, spec and critic, work orders by wave with their attempts, gate checks and findings; pause, resume, cancel |
-+| Inbox | `/inbox` | Decisions Autopilot needs from a person (approvals, questions, stuck work), and the history of decisions |
-+| Requirements | `/requirements/:changeId?` | OpenSpec changes: proposal, specs with scenarios, design, tasks |
-+| Work orders | `/work-orders/:workOrderId?` | Backlog.md tasks, as a board with a detail panel |
-+| Audit log | `/audit-log` | The factory's hash-chained audit log |
++| Page          | Route                        | Reads                                                                                                                           |
++| ------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
++| Autopilot     | `/autopilot`                 | Start a run from a goal (autonomy, budget); agent server and policy status; recent runs                                         |
++| Autopilot run | `/autopilot/runs/:runId`     | One run: stage lanes, spec and critic, work orders by wave with their attempts, gate checks and findings; pause, resume, cancel |
++| Inbox         | `/inbox`                     | Decisions Autopilot needs from a person (approvals, questions, stuck work), and the history of decisions                        |
++| Requirements  | `/requirements/:changeId?`   | OpenSpec changes: proposal, specs with scenarios, design, tasks                                                                 |
++| Work orders   | `/work-orders/:workOrderId?` | Backlog.md tasks, as a board with a detail panel                                                                                |
++| Audit log     | `/audit-log`                 | The factory's hash-chained audit log                                                                                            |
 +
 +The data comes from the Software Factory API (`apps/server` in the software-factory
 +repo), not from the OpenHands agent server. Vite proxies `/sf-api` to it
@@ -427,10 +615,10 @@ index 0000000..9dd363b
 +  factory self-contained. Other Canvas languages fall back to English.
 diff --git a/src/factory/api.ts b/src/factory/api.ts
 new file mode 100644
-index 0000000..764aef1
+index 0000000..0840600
 --- /dev/null
 +++ b/src/factory/api.ts
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,492 @@
 +/**
 + * Client for the Software Factory API (apps/server in the software-factory
 + * repo). It is not part of the OpenHands agent server: Vite proxies `/sf-api`
@@ -639,6 +827,35 @@ index 0000000..764aef1
 +  scenario?: string | null;
 +}
 +
++export type ExecutionProvider = "local" | "container";
++
++/** Where an attempt ran (apps/server/src/autopilot/execution.ts). No secrets: credentials are names. */
++export interface ExecutionFacts {
++  provider: ExecutionProvider;
++  isolated: boolean;
++  container?: string;
++  image?: string;
++  imageId?: string | null;
++  network?: string;
++  user?: string | null;
++  limits?: { memory: string; cpus: number; pids: number };
++  credentials?: string[];
++  mounts?: string[];
++  released?: boolean;
++}
++
++/** What stops a run from executing the way the policy asks; `problems` refuse it. */
++export interface ExecutionPreflight {
++  provider: ExecutionProvider;
++  isolated: boolean;
++  required: boolean;
++  ok: boolean;
++  problems: string[];
++  notes: string[];
++  facts: ExecutionFacts;
++  checkedAt: string;
++}
++
 +export interface RunCounts {
 +  total: number;
 +  merged: number;
@@ -659,6 +876,8 @@ index 0000000..764aef1
 +  costUsd: number;
 +  budgetUsd: number | null;
 +  policyHash: string | null;
++  /** How the run's pinned policy executes agents and gates. */
++  execution: { provider: ExecutionProvider; isolated: boolean };
 +  createdBy: string;
 +  createdAt: string;
 +  updatedAt: string;
@@ -703,6 +922,8 @@ index 0000000..764aef1
 +  turns: number;
 +  costUsd: number;
 +  result: unknown;
++  /** Null for attempts from before isolated execution. */
++  execution: ExecutionFacts | null;
 +  startedAt: string;
 +  finishedAt: string | null;
 +}
@@ -717,6 +938,8 @@ index 0000000..764aef1
 +  exitCode: number | null;
 +  durationMs: number | null;
 +  output: string;
++  /** Where a gate ran; null for the factory's own checks and older ones. */
++  runner: ExecutionProvider | null;
 +  at: string;
 +}
 +
@@ -759,6 +982,15 @@ index 0000000..764aef1
 +  };
 +  workspace: { path: string; isRepo: boolean; branch: string | null };
 +  policy: { source: string; hash: string; error: string | null };
++  /** How a run started now would execute; `required` is SF_REQUIRE_ISOLATION. */
++  execution: {
++    provider: ExecutionProvider;
++    isolated: boolean;
++    required: boolean;
++    image: string | null;
++    network: string | null;
++    preflight: ExecutionPreflight | null;
++  };
 +  openInbox: number;
 +  activeRuns: number;
 +}
@@ -857,6 +1089,8 @@ index 0000000..764aef1
 +  verifyAudit: () => request<AuditVerification>("/audit/verify"),
 +
 +  autopilotStatus: () => request<AutopilotStatus>("/autopilot/status"),
++  checkExecution: () =>
++    post<ExecutionPreflight>("/autopilot/execution/preflight"),
 +  runs: () => request<RunSummary[]>("/autopilot/runs"),
 +  createRun: (body: {
 +    goal: string;
@@ -1875,10 +2109,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..f0a3759
+index 0000000..4466311
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,921 @@
+@@ -0,0 +1,955 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1951,6 +2185,17 @@ index 0000000..f0a3759
 +      "To start it, run pnpm dev in the software-factory folder. It starts Canvas and its agent server.",
 +    policy: (source: string, hash: string) => `Policy: ${source} (${hash})`,
 +    policyError: (error: string) => `The policy file has a problem: ${error}`,
++    executionLocal:
++      "Agents, their tools and the checks run on this machine with your permissions. Nothing is isolated.",
++    executionContainer: (image: string, network: string) =>
++      `Isolated: each agent and each check runs in its own container (${image}, network ${network}).`,
++    executionRequired:
++      "This factory requires isolated execution, so runs with this policy are refused.",
++    checkExecution: "Check isolation",
++    checkingExecution: "Checking…",
++    executionReady: "Isolation check passed.",
++    executionProblems: "Runs can't start until these are fixed:",
++    executionNotes: "Not checked:",
 +    start: "Start",
 +    starting: "Starting…",
 +    startShortcut: "Ctrl+Enter starts the run.",
@@ -2031,7 +2276,13 @@ index 0000000..f0a3759
 +      eta: "Time left",
 +      branch: "Integration branch",
 +      started: "Started",
++      execution: "Execution",
 +    },
++    executionLocal: "On this machine, not isolated",
++    executionContainer: "Isolated in containers",
++    isolatedAttempt: "Isolated",
++    isolatedTranscript:
++      "Ran in its own container; its transcript is kept in the factory's data folder, not in Canvas.",
 +    fromBase: (base: string) => `from ${base}`,
 +    etaUnknown: "Known after the first merge",
 +    etaDone: "None",
@@ -2401,6 +2652,17 @@ index 0000000..f0a3759
 +    policy: (source, hash) => `Política: ${source} (${hash})`,
 +    policyError: (error) =>
 +      `El archivo de política tiene un problema: ${error}`,
++    executionLocal:
++      "Los agentes, sus herramientas y las comprobaciones se ejecutan en este equipo con sus permisos. Nada está aislado.",
++    executionContainer: (image, network) =>
++      `Aislado: cada agente y cada comprobación se ejecutan en su propio contenedor (${image}, red ${network}).`,
++    executionRequired:
++      "Esta fábrica exige ejecución aislada, así que se rechazan las ejecuciones con esta política.",
++    checkExecution: "Comprobar el aislamiento",
++    checkingExecution: "Comprobando…",
++    executionReady: "La comprobación de aislamiento es correcta.",
++    executionProblems: "No se pueden iniciar ejecuciones hasta corregir esto:",
++    executionNotes: "Sin comprobar:",
 +    start: "Iniciar",
 +    starting: "Iniciando…",
 +    startShortcut: "Ctrl+Intro inicia la ejecución.",
@@ -2483,7 +2745,13 @@ index 0000000..f0a3759
 +      eta: "Tiempo restante",
 +      branch: "Rama de integración",
 +      started: "Inicio",
++      execution: "Ejecución",
 +    },
++    executionLocal: "En este equipo, sin aislamiento",
++    executionContainer: "Aislada en contenedores",
++    isolatedAttempt: "Aislado",
++    isolatedTranscript:
++      "Se ejecutó en su propio contenedor; su transcripción se guarda en la carpeta de datos de la fábrica, no en Canvas.",
 +    fromBase: (base) => `desde ${base}`,
 +    etaUnknown: "Se sabrá tras la primera integración",
 +    etaDone: "Ninguno",
@@ -2882,10 +3150,10 @@ index 0000000..a6d27d9
 +}
 diff --git a/src/factory/hooks.ts b/src/factory/hooks.ts
 new file mode 100644
-index 0000000..f34cb80
+index 0000000..332b6c0
 --- /dev/null
 +++ b/src/factory/hooks.ts
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,272 @@
 +import React from "react";
 +import {
 +  useMutation,
@@ -3081,6 +3349,19 @@ index 0000000..f34cb80
 +      budgetUsd?: number;
 +    }) => FactoryApi.createRun(body),
 +    onSettled: () => invalidateAutopilot(queryClient),
++    meta: { disableToast: true },
++  });
++}
++
++/** Runs the execution checks a new run would face (a probe container when isolated). */
++export function useCheckExecution() {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: FactoryApi.checkExecution,
++    onSettled: () =>
++      queryClient.invalidateQueries({
++        queryKey: FACTORY_QUERY_KEYS.autopilotStatus,
++      }),
 +    meta: { disableToast: true },
 +  });
 +}
@@ -3403,10 +3684,10 @@ index 0000000..aa8eaad
 +}
 diff --git a/src/factory/routes/autopilot-home.tsx b/src/factory/routes/autopilot-home.tsx
 new file mode 100644
-index 0000000..34cd2d4
+index 0000000..bffd13c
 --- /dev/null
 +++ b/src/factory/routes/autopilot-home.tsx
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,513 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useNavigate } from "react-router";
@@ -3415,15 +3696,23 @@ index 0000000..34cd2d4
 +  FileCheck2,
 +  FolderGit2,
 +  Play,
++  ShieldAlert,
++  ShieldCheck,
 +  TriangleAlert,
 +} from "lucide-react";
 +import { BrandButton } from "#/components/features/settings/brand-button";
 +import { cn } from "#/utils/utils";
-+import type { Autonomy, RunSummary } from "../api";
++import type {
++  AutopilotStatus,
++  Autonomy,
++  ExecutionPreflight,
++  RunSummary,
++} from "../api";
 +import { useFactoryCopy } from "../copy";
 +import {
 +  useAutopilotRuns,
 +  useAutopilotStatus,
++  useCheckExecution,
 +  useCreateRun,
 +  useFactoryHealth,
 +} from "../hooks";
@@ -3737,6 +4026,97 @@ index 0000000..34cd2d4
 +          </span>
 +        </p>
 +      ) : null}
++
++      {status.data?.execution ? (
++        <ExecutionLine execution={status.data.execution} />
++      ) : null}
++    </div>
++  );
++}
++
++/** Whether agents and checks run isolated, and what would stop a run from starting. */
++function ExecutionLine({
++  execution,
++}: {
++  execution: AutopilotStatus["execution"];
++}) {
++  const copy = useFactoryCopy();
++  const check = useCheckExecution();
++  const preflight = check.data ?? execution.preflight;
++  const refused = execution.required && !execution.isolated;
++  const Icon = execution.isolated && !refused ? ShieldCheck : ShieldAlert;
++  return (
++    <div data-testid="autopilot-execution" className="flex items-start gap-2">
++      <Icon
++        className={cn(
++          "mt-0.5 size-4 shrink-0",
++          execution.isolated ? "text-success" : "text-warning",
++        )}
++        aria-hidden
++      />
++      <div className="flex min-w-0 flex-col gap-1.5 break-words">
++        <p className="text-foreground">
++          {execution.isolated
++            ? copy.autopilot.executionContainer(
++                execution.image ?? "",
++                execution.network ?? "",
++              )
++            : copy.autopilot.executionLocal}
++        </p>
++        {refused ? (
++          <p className="text-xs text-feedback-error">
++            {copy.autopilot.executionRequired}
++          </p>
++        ) : null}
++        {execution.isolated ? (
++          <>
++            <BrandButton
++              testId="autopilot-check-execution"
++              type="button"
++              variant="secondary"
++              className="self-start"
++              onClick={() => check.mutate()}
++              isDisabled={check.isPending}
++              aria-busy={check.isPending}
++            >
++              {check.isPending
++                ? copy.autopilot.checkingExecution
++                : copy.autopilot.checkExecution}
++            </BrandButton>
++            <FactoryError error={check.error} />
++            <div aria-live="polite">
++              {preflight ? <PreflightResult preflight={preflight} /> : null}
++            </div>
++          </>
++        ) : null}
++      </div>
++    </div>
++  );
++}
++
++function PreflightResult({ preflight }: { preflight: ExecutionPreflight }) {
++  const copy = useFactoryCopy();
++  return (
++    <div className="flex flex-col gap-1 text-xs">
++      {preflight.ok ? (
++        <p className="text-foreground">{copy.autopilot.executionReady}</p>
++      ) : (
++        <>
++          <p className="font-medium text-feedback-error">
++            {copy.autopilot.executionProblems}
++          </p>
++          <ul className="list-disc pl-5 text-foreground">
++            {preflight.problems.map((problem) => (
++              <li key={problem}>{problem}</li>
++            ))}
++          </ul>
++        </>
++      )}
++      {preflight.notes.length ? (
++        <p className="text-muted">
++          {`${copy.autopilot.executionNotes} ${preflight.notes.join(" ")}`}
++        </p>
++      ) : null}
 +    </div>
 +  );
 +}
@@ -3823,10 +4203,10 @@ index 0000000..34cd2d4
 +}
 diff --git a/src/factory/routes/autopilot-pipeline.tsx b/src/factory/routes/autopilot-pipeline.tsx
 new file mode 100644
-index 0000000..11a6099
+index 0000000..a724376
 --- /dev/null
 +++ b/src/factory/routes/autopilot-pipeline.tsx
-@@ -0,0 +1,834 @@
+@@ -0,0 +1,867 @@
 +import React from "react";
 +import { useTranslation } from "react-i18next";
 +import { Link, useParams } from "react-router";
@@ -3844,6 +4224,7 @@ index 0000000..11a6099
 +  Play,
 +  Shield,
 +  ShieldAlert,
++  ShieldCheck,
 +} from "lucide-react";
 +import { BrandButton } from "#/components/features/settings/brand-button";
 +import { displayErrorToast } from "#/utils/custom-toast-handlers";
@@ -4092,6 +4473,21 @@ index 0000000..11a6099
 +      ),
 +    },
 +    { label: copy.pipeline.facts.eta, value: eta },
++    {
++      label: copy.pipeline.facts.execution,
++      value: (
++        <span className="inline-flex items-center gap-1">
++          {run.execution.isolated ? (
++            <ShieldCheck className="size-4 text-success" aria-hidden />
++          ) : (
++            <ShieldAlert className="size-4 text-warning" aria-hidden />
++          )}
++          {run.execution.isolated
++            ? copy.pipeline.executionContainer
++            : copy.pipeline.executionLocal}
++        </span>
++      ),
++    },
 +    {
 +      label: copy.pipeline.facts.branch,
 +      value: (
@@ -4351,6 +4747,11 @@ index 0000000..11a6099
 +    run.workOrders.find((w) => w.seq === seq)?.key ?? `WO-${seq}`;
 +  const titleId = `autopilot-wo-${wo.seq}`;
 +  const attention = WORK_ORDER_TONE[wo.state] === "attention";
++  // An isolated builder's conversation lives in its container, not on Canvas's agent server.
++  const canvasConversation =
++    wo.conversationId &&
++    attempts.find((a) => a.conversationId === wo.conversationId)?.execution
++      ?.provider !== "container";
 +
 +  return (
 +    <article
@@ -4415,7 +4816,7 @@ index 0000000..11a6099
 +          ))}
 +        </ul>
 +      ) : null}
-+      {wo.conversationId ? (
++      {canvasConversation ? (
 +        <Link
 +          to={`/conversations/${wo.conversationId}`}
 +          className="inline-flex items-center gap-1.5 self-start rounded-md text-sm text-link hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-focus"
@@ -4497,6 +4898,7 @@ index 0000000..11a6099
 +  const profile = useAutopilotStatus().data?.agentServer.profiles.find(
 +    (p) => p.id === attempt.agentProfile,
 +  );
++  const isolated = attempt.execution?.provider === "container";
 +  return (
 +    <li className="flex min-w-0 flex-col gap-1 text-xs">
 +      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -4507,6 +4909,12 @@ index 0000000..11a6099
 +          tone={ATTEMPT_TONE[attempt.state]}
 +          label={labelFor(copy.autopilot.attemptState, attempt.state)}
 +        />
++        {isolated ? (
++          <span className="inline-flex items-center gap-1 rounded-md bg-surface-raised px-1.5 py-0.5 text-xs text-muted">
++            <ShieldCheck className="size-3 text-success" aria-hidden />
++            {copy.pipeline.isolatedAttempt}
++          </span>
++        ) : null}
 +      </div>
 +      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted">
 +        {profile ? <span>{profile.name}</span> : null}
@@ -4517,14 +4925,19 @@ index 0000000..11a6099
 +        <time dateTime={attempt.startedAt}>
 +          {formatWhen(attempt.startedAt, i18n.language)}
 +        </time>
-+        <Link
-+          to={`/conversations/${attempt.conversationId}`}
-+          className="inline-flex items-center gap-1 rounded-md text-link hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-+        >
-+          <MessageSquare className="size-3.5" aria-hidden />
-+          {copy.pipeline.openConversation}
-+        </Link>
++        {isolated ? null : (
++          <Link
++            to={`/conversations/${attempt.conversationId}`}
++            className="inline-flex items-center gap-1 rounded-md text-link hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-focus"
++          >
++            <MessageSquare className="size-3.5" aria-hidden />
++            {copy.pipeline.openConversation}
++          </Link>
++        )}
 +      </div>
++      {isolated ? (
++        <p className="text-muted">{copy.pipeline.isolatedTranscript}</p>
++      ) : null}
 +      {verdict ? (
 +        <div className="mt-1 rounded-lg border border-border-subtle bg-base-secondary px-2.5 py-2">
 +          <p className="font-medium text-foreground">

@@ -42,7 +42,14 @@ export const integrationFindings = (results: GateResult[]): Finding[] =>
  * the gates. A conflict leaves `dir` as it was; failing gates reset it to
  * `preMergeSha`.
  */
-export async function mergeAndTest(dir: string, branch: string, message: string, preMergeSha: string, gates: Gate[] | null = null): Promise<MergeResult> {
+export async function mergeAndTest(
+  dir: string,
+  branch: string,
+  message: string,
+  preMergeSha: string,
+  gates: Gate[] | null = null,
+  run?: (gate: Gate) => Promise<GateResult>, // where gates run (execution.ts); this machine by default
+): Promise<MergeResult> {
   await discardChanges(dir); // also ends a merge that a restart interrupted
   if (!(await isAncestor(dir, branch, "HEAD"))) {
     const merged = await merge(dir, branch, message);
@@ -53,7 +60,7 @@ export async function mergeAndTest(dir: string, branch: string, message: string,
   const installed = stat.files.filter((f) => MANIFEST.test(f.path)).map((f) => path.join(dir, path.posix.dirname(f.path), "node_modules"));
   const uninstall = () => installed.forEach((d) => rmSync(d, { recursive: true, force: true, maxRetries: 3 }));
   uninstall();
-  const { ok, results } = await runGates(dir, gates ?? detectGates(dir));
+  const { ok, results } = await runGates(dir, gates ?? detectGates(dir), run);
   await discardChanges(dir); // what the gates left behind (build output)
   if (!ok) {
     await resetHard(dir, preMergeSha);

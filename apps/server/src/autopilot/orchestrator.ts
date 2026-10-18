@@ -16,9 +16,19 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { audit, auditFor, sha256 } from "../audit.js";
+import { isolationRequired } from "../config.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
 import { exportEvidence } from "./evidence.js";
+import {
+  createExecution,
+  RuntimeGone,
+  RuntimeUnavailable,
+  sweepContainers,
+  type DockerRunner,
+  type ExecutionFacts,
+  type Preflight,
+} from "./execution.js";
 import { detectGates, gateFindings, runGates, type GateResult } from "./gates.js";
 import {
   addWorktree,
@@ -87,6 +97,12 @@ export interface OrchestratorDeps {
   dataDir: string; // worktrees go in <dataDir>/worktrees/<runId>/
   /** How long an end state right after a message is distrusted (see classify). Tests use 0. */
   graceMs?: number;
+  /** The Docker CLI, for runs whose policy isolates execution in containers. Tests pass a fake. */
+  docker?: DockerRunner;
+  /** Where container credentials come from; defaults to the factory's environment. */
+  env?: NodeJS.ProcessEnv;
+  /** Ports on this machine that agents in containers must not reach: the factory API and Canvas. */
+  controlPorts?: number[];
 }
 
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
@@ -144,8 +160,8 @@ const WO_BUDGET: InboxOption[] = [
 
 const now = () => new Date().toISOString();
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
-/** The agent server is down or slow: leave everything as it is and try again on a later tick. */
-const unreachable = (err: unknown) => err instanceof OpenHandsError && err.status === 0;
+/** The agent server or the container engine is down or slow: leave everything as it is and try again on a later tick. */
+const unreachable = (err: unknown) => (err instanceof OpenHandsError && err.status === 0) || err instanceof RuntimeUnavailable;
 /** One line, at most `max` chars: for audit data, which never holds full goals, notes or prompts. */
 const clip = (text: string, max = 120) => {
   const line = text.replace(/\s+/g, " ").trim();
@@ -159,6 +175,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   const worktrees = path.join(deps.dataDir, "worktrees");
   const inflight = new Map<string, Promise<void>>(); // runId -> what's being done for it
   let timer: NodeJS.Timeout | undefined;
+  const execDeps = { dataDir: deps.dataDir, hostClient: client, docker: deps.docker, env: deps.env, controlPorts: deps.controlPorts };
+  /** How the run's pinned policy executes agents and gates (execution.ts). */
+  const executionFor = (run: Pick<Run, "policy">) => createExecution(pinnedPolicy(run), execDeps);
+  const agents = new Map<number, OpenHandsClient>(); // container attempts' agent servers, by attempt id
+  let lastPreflight: Preflight | null = null;
 
   const changed = (runId: string) => broadcast({ type: "autopilot.changed", runId });
   const record = (actor: string, action: string, runId: string, data: Record<string, unknown> = {}) => {
@@ -248,9 +269,11 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const held = a.workOrderId && ledger.getWorkOrder(a.workOrderId)?.state === "needs_attention";
       if (run.state !== "paused" && !held) continue;
       try {
+        const agent = await remote(a);
+        if (!agent) continue; // its container is gone: nothing left to pause
         // A write-ahead attempt may not exist remotely yet. Never start it just to pause it.
-        if (a.state === "starting" && !(await client.get(a.conversationId))) continue;
-        await client.pause(a.conversationId);
+        if (a.state === "starting" && !(await agent.get(a.conversationId))) continue;
+        await agent.pause(a.conversationId);
         ledger.updateAttempt(a.id, { state: "paused" });
         record(SYSTEM, "autopilot.agent_paused", runId, { attempt: a.id, role: a.role, conversationId: a.conversationId });
         changed(runId);
@@ -299,12 +322,76 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** The orchestrator has acted on the attempt's latest turn: its result records that turn. */
   const handled = (a: Attempt) => (a.result as { turn?: number } | null)?.turn === a.turns;
   const markHandled = (a: Attempt, result: object) => ledger.updateAttempt(a.id, { result: { ...result, turn: a.turns } });
+  const isContainer = (a: Attempt) => (a.runtime as ExecutionFacts | null)?.provider === "container";
+
+  /** The agent server an attempt's conversation lives on: Canvas's, or the attempt's own container's. */
+  async function agentFor(a: Attempt): Promise<OpenHandsClient> {
+    if (!isContainer(a)) return client;
+    const known = agents.get(a.id);
+    if (known) return known;
+    const found = await executionFor(mustRun(a.runId)).clientFor(a);
+    agents.set(a.id, found);
+    return found;
+  }
+
+  /** Like agentFor, but a container that's gone ends its attempt (with the reason) and gives null. */
+  async function remote(a: Attempt): Promise<OpenHandsClient | null> {
+    try {
+      return await agentFor(a);
+    } catch (err) {
+      if (!(err instanceof RuntimeGone)) throw err;
+      if (ACTIVE.has(a.state) || a.state === "paused") {
+        ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { ...(a.result as object | null), error: err.message } });
+        record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state: "error", error: clip(err.message) });
+        changed(a.runId);
+      }
+      return null;
+    }
+  }
+
+  /** An attempt that can't get another message: superseded, its work order finished, its verdict used, or its run over. */
+  function retired(run: Run, a: Attempt, all: Attempt[]): boolean {
+    if (TERMINAL.has(run.state)) return true;
+    if (all.some((x) => x.id > a.id && x.role === a.role && x.workOrderId === a.workOrderId)) return true;
+    const wo = a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined;
+    if (wo && (DONE_WO.has(wo.state) || wo.state === "cancelled")) return true;
+    if ((a.role === "critic" || a.role === "reviewer") && handled(a)) return true;
+    return a.role === "spec" && (run.state === "building" || run.resumeState === "building");
+  }
+
+  /** Removes an attempt's container (its state folder, the transcript, stays). A failure is tried again later. */
+  async function releaseAttempt(run: Run, a: Attempt) {
+    const facts = a.runtime as ExecutionFacts | null;
+    if (facts?.provider !== "container" || facts.released) return;
+    try {
+      await executionFor(run).release(a);
+    } catch (err) {
+      return warn(err);
+    }
+    agents.delete(a.id);
+    ledger.updateAttempt(a.id, { runtime: { ...facts, released: true } });
+    record(SYSTEM, "autopilot.runtime_removed", run.id, { attempt: a.id, role: a.role, container: facts.container });
+  }
+
+  async function releaseRetired(runId: string) {
+    const run = ledger.getRun(runId);
+    if (!run) return;
+    const all = ledger.listAttempts({ runId });
+    for (const a of all) if (retired(run, a, all)) await releaseAttempt(run, a);
+  }
+
+  /** Before a worktree folder goes: the containers that have it mounted (a work order's, or with null the run's spec and critic; all with undefined). */
+  async function releaseMounted(run: Run, workOrderId?: string | null) {
+    for (const a of ledger.listAttempts({ runId: run.id })) {
+      if (workOrderId === undefined || a.workOrderId === workOrderId) await releaseAttempt(run, a);
+    }
+  }
 
   /** Why an agent stopped, for a person: the start error, or its status and last message. */
   async function whyStopped(a: Attempt, who: string): Promise<string> {
     const error = (a.result as { error?: string } | null)?.error;
     if (error) return error;
-    const last = await client.finalResponse(a.conversationId).catch(() => "");
+    const last = await agentFor(a).then((c) => c.finalResponse(a.conversationId)).catch(() => "");
     return `${who} stopped with status "${a.state}".${last ? ` Its last message: ${clip(last, 500)}` : ""}`;
   }
 
@@ -340,7 +427,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** The first message of an attempt, rebuilt from the ledger so a restart sends the same one. */
   function briefFor(run: Run, a: Attempt, wo: WorkOrder | undefined): string {
-    if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo }) : builderBrief({ change: run.change, wo, gates: pinnedPolicy(run).gates });
+    const isolated = executionFor(run).kind === "container";
+    if (wo) return a.role === "reviewer" ? reviewerBrief({ change: run.change, wo, isolated }) : builderBrief({ change: run.change, wo, gates: pinnedPolicy(run).gates, isolated });
     if (a.role === "critic") return criticBrief({ change: run.change });
     // A spec agent started after one that failed (or whose tasks.md couldn't be planned) hears why.
     const before = ledger.listAttempts({ runId: run.id, role: "spec" }).filter((x) => x.id < a.id).at(-1);
@@ -354,11 +442,19 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const wo = a.workOrderId ? ledger.getWorkOrder(a.workOrderId) : undefined;
     const dir = wo ? wo.worktree : run?.integrationDir; // builders and reviewers work in their work order's worktree
     if (!run || !dir || !a.agentProfile) throw new Error(`Attempt ${a.id} has no worktree or agent profile to start with`);
+    const exec = executionFor(run);
     try {
-      const snap = await client.start({
+      // A container's agent server needs the profile's definition, found by name on Canvas's server.
+      const profile = exec.kind === "container" ? await client.resolveProfile(a.agentProfile) : { id: a.agentProfile, name: a.agentProfile, kind: "", server: null };
+      // An isolated reviewer has no git: the diff it reviews comes in as a read-only file.
+      const inputs = exec.kind === "container" && a.role === "reviewer" && wo ? { "changes.diff": (await git(dir, ["diff", "--no-color", `${wo.baseSha ?? "HEAD~1"}...HEAD`])).stdout } : undefined;
+      const ready = await exec.prepare(a, dir, profile, inputs);
+      if (exec.kind === "container") agents.set(a.id, ready.client);
+      ledger.updateAttempt(a.id, { runtime: ready.facts });
+      const snap = await ready.client.start({
         conversationId: a.conversationId,
-        profileId: a.agentProfile,
-        workingDir: dir,
+        profileId: ready.profileId,
+        workingDir: ready.workingDir,
         text: briefFor(run, a, wo),
         runId: run.id,
         role: a.role,
@@ -375,7 +471,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   }
 
   async function poll(a: Attempt) {
-    const snap = await client.get(a.conversationId);
+    const agent = await remote(a);
+    if (!agent) return;
+    const snap = await agent.get(a.conversationId).catch((err: unknown) => {
+      if (unreachable(err)) agents.delete(a.id); // look its container up again next time
+      throw err;
+    });
     if (!snap) {
       ledger.updateAttempt(a.id, { state: "error", finishedAt: now(), result: { error: "The conversation is gone from the agent server." } });
       record(SYSTEM, "autopilot.agent_finished", a.runId, { role: a.role, attempt: a.id, state: "error" });
@@ -392,12 +493,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** A follow-up message to an existing conversation; the agent starts on it right away. */
   async function sendFollowUp(a: Attempt, text: string, reason: string) {
+    const agent = await agentFor(a);
     try {
-      await client.send(a.conversationId, text);
+      await agent.send(a.conversationId, text);
     } catch (err) {
       // 429: the message is saved but the agent didn't start on it; nudge it.
       if (!(err instanceof OpenHandsError && err.status === 429)) throw err;
-      await client.resume(a.conversationId).catch(warn);
+      await agent.resume(a.conversationId).catch(warn);
     }
     ledger.updateAttempt(a.id, { state: "running", turns: a.turns + 1, seenRunning: false, lastSentAt: now(), finishedAt: null });
     record(SYSTEM, "autopilot.followup_sent", a.runId, { role: a.role, attempt: a.id, conversationId: a.conversationId, turn: a.turns + 1, reason });
@@ -471,7 +573,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
 
     const dir = run.integrationDir as string;
-    const verdict = parseCriticVerdict(await client.finalResponse(c.conversationId));
+    const verdict = parseCriticVerdict(await (await agentFor(c)).finalResponse(c.conversationId));
     // Older persisted runs could omit the SHA when revalidation made no new commit.
     const specSha = (specAttempt(run).result as { sha?: string } | null)?.sha
       ?? auditFor(run.id).findLast((e) => e.action === "autopilot.spec_committed")?.data.sha;
@@ -678,6 +780,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     // Not autopilot/<change>/wo-N: git can't have that next to the branch autopilot/<change>.
     const branch = `${run.integrationBranch}--wo-${wo.seq}`;
     const baseSha = await headSha(workspace, run.integrationBranch);
+    await releaseMounted(run, wo.id); // a previous attempt's container has the old worktree mounted
     await addWorktree(workspace, dir, branch, baseSha);
     const round = builders(wo).length + 1;
     const attempt = ledger.transaction(() => {
@@ -723,7 +826,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** The factory's own checks on the committed work: pass -> a reviewer, fail -> a repair round. */
   async function verify(run: Run, wo: WorkOrder) {
     const dir = wo.worktree as string;
-    const { ok, results } = await runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir));
+    const exec = executionFor(run);
+    const { ok, results } = await runGates(dir, pinnedPolicy(run).gates ?? detectGates(dir), exec.gateRunner(dir, run.id));
     recordGates(run, wo, "build", results);
     if (!ok) return repair(run, wo, gateFindings(results));
     await discardChanges(dir); // what the gates left (build output), so anything left after the review is the reviewer's
@@ -732,9 +836,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** One check per gate, and one audit record for the lot. */
   function recordGates(run: Run, wo: WorkOrder, stage: "build" | "integrate", results: GateResult[]) {
+    const runner = executionFor(run).kind;
     ledger.transaction(() => {
       for (const r of results) {
-        ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage, name: r.name, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, output: r.output });
+        ledger.addCheck({ runId: run.id, workOrderId: wo.id, stage, name: r.name, ok: r.ok, exitCode: r.exitCode, durationMs: r.durationMs, output: r.output, runner });
       }
     });
     record(SYSTEM, "autopilot.gates_run", run.id, {
@@ -770,7 +875,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
 
     const dir = wo.worktree as string;
-    const verdict = parseVerdict(await client.finalResponse(r.conversationId));
+    const verdict = parseVerdict(await (await agentFor(r)).finalResponse(r.conversationId));
     // The reviewer only reads: whatever it changed or committed is thrown away.
     const builtSha = (builders(wo).at(-1)?.result as { sha?: string } | null)?.sha;
     const onBranch = (await currentBranch(dir)) === wo.branch;
@@ -822,7 +927,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const limits = pinnedPolicy(run).repair;
     // A conversation that never started, or is gone from the agent server, can't take a follow-up.
     if (last && !(last.result as { error?: string } | null)?.error && last.turns < 1 + limits.sameConversation) {
-      await sendFollowUp(last, repairMessage(findings), "repair");
+      await sendFollowUp(last, repairMessage(findings, executionFor(run).kind === "container"), "repair");
       moveWorkOrder(wo, "building", { patch: { findings }, action: "autopilot.repair_requested", data: { ...data, builder: all.length, turn: last.turns + 1 } });
       return;
     }
@@ -998,7 +1103,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       pre = await headSha(dir);
       ledger.updateWorkOrder(wo.id, { preMergeSha: pre });
     }
-    const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre, pinnedPolicy(run).gates);
+    const r = await mergeAndTest(dir, wo.branch as string, `Merge ${key}: ${clip(wo.title, 72)}`, pre, pinnedPolicy(run).gates, executionFor(run).gateRunner(dir, run.id));
     if (r.results.length) recordGates(run, wo, "integrate", r.results);
     if (r.outcome === "merged") {
       moveWorkOrder(wo, "merged", {
@@ -1036,6 +1141,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** A merged work order's worktree and branch go; its commits live on in the integration branch. A failure is tried again next step. */
   async function cleanUp(run: Run, wo: WorkOrder) {
     try {
+      await releaseMounted(run, wo.id);
       await removeWorktree(workspace, wo.worktree as string);
       if (wo.branch) await deleteBranch(workspace, wo.branch);
     } catch (err) {
@@ -1055,6 +1161,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const wos = ledger.listWorkOrders(run.id);
     const merged = wos.filter((w) => w.state === "merged").length;
     const sha = await headSha(workspace, run.integrationBranch);
+    await releaseMounted(run);
     if (run.integrationDir) await removeWorktree(workspace, run.integrationDir);
     moveRun(run, merged ? "done" : "failed", {
       patch: { integrationDir: null, resumeState: null },
@@ -1068,6 +1175,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** Starts or polls the run's agents, then takes its next step. */
   async function advance(runId: string) {
     await reconcilePauses(runId);
+    // Set after the run started: its local agents stop here rather than run unisolated.
+    if (isolationRequired() && executionFor(mustRun(runId)).kind === "local") {
+      throw new Error("This factory now requires isolated execution (SF_REQUIRE_ISOLATION), but this run's pinned policy runs agents on this machine. Cancel it and start a new run with execution.provider: container.");
+    }
     if (!enforceBudgets(mustRun(runId))) return;
     for (const a of ledger.listAttempts({ runId }).filter((x) => ACTIVE.has(x.state))) {
       if (a.workOrderId && ledger.getWorkOrder(a.workOrderId)?.state === "needs_attention") continue;
@@ -1081,11 +1192,32 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     else if (run?.state === "building") await buildStep(run);
   }
 
-  /** Cheap: hands each live run to advance(), skipping runs that are still busy. */
+  /** Cheap: hands each live run to advance(), skipping runs that are still busy, and removes containers no attempt needs. */
   async function tick() {
     for (const run of ledger.listRuns()) {
-      if (!TERMINAL.has(run.state)) launch(run.id, () => run.state === "paused" ? Promise.resolve() : advance(run.id));
+      if (TERMINAL.has(run.state)) continue;
+      launch(run.id, async () => {
+        if (run.state !== "paused") await advance(run.id);
+        await releaseRetired(run.id);
+      });
     }
+    // A finished run whose containers couldn't be removed when it ended.
+    for (const runId of new Set(ledger.liveRuntimes().map((a) => a.runId))) {
+      if (TERMINAL.has(ledger.getRun(runId)?.state ?? "done")) launch(runId, () => releaseRetired(runId));
+    }
+  }
+
+  /** Containers this factory owns that no live attempt accounts for (a crash mid-gate, say) go when it starts. */
+  async function sweepOrphans() {
+    if (!ledger.usedContainers()) return; // nothing ever ran in a container: don't call Docker at all
+    const keep = new Set<string>();
+    for (const a of ledger.liveRuntimes()) {
+      const run = ledger.getRun(a.runId);
+      if (run && !TERMINAL.has(run.state)) keep.add((a.runtime as ExecutionFacts).container ?? "");
+    }
+    // Starting attempts may have a container whose facts weren't recorded yet.
+    for (const a of ledger.activeAttempts()) keep.add(`sf-${a.runId}-a${a.id}`);
+    await sweepContainers(execDeps, keep);
   }
 
   async function idle() {
@@ -1125,6 +1257,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     const baseBranch = (await currentBranch(workspace)) ?? "main";
     // The rules this run keeps to the end, from the base branch: an invalid policy.yml stops it here.
     const { policy, hash, source } = await loadPolicy(workspace, baseBranch);
+    // Execution the policy (or SF_REQUIRE_ISOLATION) asks for and this machine can't give is refused now.
+    const preflight = await checked(createExecution(policy, execDeps).preflight({ probe: true }), input.actor);
+    if (!preflight.ok) throw new Error(`Autopilot can't run agents the way the policy requires: ${preflight.problems.join(" ")}`);
     const requested = input.autonomy ?? policy.autonomy.default;
     const autonomy = clampAutonomy(requested, policy.autonomy.max);
     const taken = await takenChangeNames(workspace, baseBranch);
@@ -1150,6 +1285,37 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return run;
   }
 
+  /** Keeps and audits a preflight's outcome (no secrets: credential names at most). */
+  async function checked(pending: Promise<Preflight>, actor: string): Promise<Preflight> {
+    const result = await pending;
+    lastPreflight = result;
+    record(actor, "autopilot.execution_checked", path.basename(workspace), {
+      provider: result.provider,
+      ok: result.ok,
+      required: result.required,
+      problems: result.problems.map((p) => clip(p)),
+    });
+    return result;
+  }
+
+  /** The policy on the workspace's current branch, for what a run started now would pin. */
+  async function currentPolicy() {
+    const isRepo = await isRepoRoot(workspace).catch(() => false);
+    const branch = isRepo ? await currentBranch(workspace) : null;
+    if (!branch) return { isRepo, branch, policy: DEFAULT_POLICY, source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null as string | null };
+    return loadPolicy(workspace, branch).then(
+      (p) => ({ isRepo, branch, ...p, error: null as string | null }),
+      (err: unknown) => ({ isRepo, branch, policy: null, source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err) }),
+    );
+  }
+
+  /** Runs the execution checks a new run would face, including the container probe, for the Home page's button. */
+  async function checkExecution(actor: string): Promise<Preflight> {
+    const current = await currentPolicy();
+    if (!current.policy) throw new Error(`The policy has a problem: ${current.error}`);
+    return checked(createExecution(current.policy, execDeps).preflight({ probe: true }), actor);
+  }
+
   function mustRun(runId: string): Run {
     const run = ledger.getRun(runId);
     if (!run) throw new Error(`No run ${runId}`);
@@ -1160,9 +1326,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     if (TERMINAL.has(run.state)) throw new Error(`The run is already ${run.state}.`);
     for (const a of ledger.listAttempts({ runId: run.id })) {
       if (!ACTIVE.has(a.state) && a.state !== "paused") continue;
-      await client.pause(a.conversationId).catch(warn);
+      await remote(a).then((agent) => agent?.pause(a.conversationId)).catch(warn);
       ledger.updateAttempt(a.id, { state: "cancelled", finishedAt: now() });
     }
+    await releaseMounted(run); // before the worktrees they mount go; one that fails is removed by a later tick
     // A merge a restart interrupted before its gates ran doesn't stay on the deliverable.
     const merging = ledger.listWorkOrders(run.id).find((w) => w.state === "merging" && w.preMergeSha);
     if (merging?.preMergeSha && run.integrationDir) await resetIntegration(run, merging, merging.preMergeSha, actor).catch(warn);
@@ -1188,10 +1355,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (a.state !== "paused" && !ACTIVE.has(a.state)) continue;
       if (workOrderId && a.workOrderId !== workOrderId) continue;
       if (!workOrderId && a.workOrderId && ledger.getWorkOrder(a.workOrderId)?.state === "needs_attention") continue;
-      if (a.state === "starting" && !(await client.get(a.conversationId))) continue;
+      const agent = await remote(a);
+      if (!agent) continue; // its container is gone; the attempt now says so and the run's next step deals with it
+      if (a.state === "starting" && !(await agent.get(a.conversationId))) continue;
       ledger.updateAttempt(a.id, { state: "running", seenRunning: false, lastSentAt: now() });
       record(actor, "autopilot.agent_resume_requested", run.id, { attempt: a.id, role: a.role, conversationId: a.conversationId });
-      await client.resume(a.conversationId);
+      await agent.resume(a.conversationId);
       record(actor, "autopilot.agent_resumed", run.id, { attempt: a.id, role: a.role, conversationId: a.conversationId });
     }
   }
@@ -1315,7 +1484,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       case "work_order_failed:skip": {
         const wo = workOrderOf(item);
         for (const a of ledger.listAttempts({ runId: run.id, workOrderId: wo.id }).filter((x) => ACTIVE.has(x.state) || x.state === "paused")) {
-          await client.pause(a.conversationId);
+          await (await remote(a))?.pause(a.conversationId);
           ledger.updateAttempt(a.id, { state: "cancelled", finishedAt: now() });
           record(actor, "autopilot.agent_cancelled", run.id, { attempt: a.id, role: a.role, conversationId: a.conversationId });
         }
@@ -1367,19 +1536,23 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       (r) => ({ reachable: true, error: null as string | null, profiles: r.profiles, activeProfileId: r.activeId }),
       (err: unknown) => ({ reachable: false, error: errorText(err), profiles: [], activeProfileId: null }),
     );
-    const isRepo = await isRepoRoot(workspace).catch(() => false);
-    const branch = isRepo ? await currentBranch(workspace) : null;
     // The policy a run started now would pin; an invalid policy.yml shows here before anyone starts one.
-    const policy = branch
-      ? await loadPolicy(workspace, branch).then(
-          (p) => ({ source: p.source, hash: p.hash, error: null as string | null }),
-          (err: unknown) => ({ source: `${POLICY_FILE}@${branch}`, hash: "", error: errorText(err) }),
-        )
-      : { source: "defaults", hash: policyHash(DEFAULT_POLICY), error: null };
+    const { isRepo, branch, policy, source, hash, error } = await currentPolicy();
+    const provider = (policy ?? DEFAULT_POLICY).execution.provider;
+    const container = (policy ?? DEFAULT_POLICY).execution.container;
     return {
       agentServer: { url: client.baseUrl, ...agent },
       workspace: { path: workspace, isRepo, branch },
-      policy,
+      policy: { source, hash, error },
+      execution: {
+        provider,
+        isolated: provider === "container",
+        required: isolationRequired(),
+        image: provider === "container" ? container.image : null,
+        network: provider === "container" ? container.network : null,
+        // The last check, while it's about the same kind of execution.
+        preflight: lastPreflight?.provider === provider ? lastPreflight : null,
+      },
       openInbox: ledger.openInboxCount(),
       activeRuns: ledger.listRuns().filter((r) => !TERMINAL.has(r.state)).length,
     };
@@ -1396,12 +1569,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     tick,
     idle,
     status,
-    /** Runs tick() every `intervalMs` (index.ts uses 3 s). */
+    checkExecution,
+    sweepOrphans,
+    /** Runs tick() every `intervalMs` (index.ts uses 3 s), after removing orphaned containers. */
     start(intervalMs = 3000) {
       if (timer) return;
       timer = setInterval(() => void tick(), intervalMs);
       timer.unref();
-      void tick();
+      void sweepOrphans().catch(warn).finally(() => void tick());
     },
     stop() {
       clearInterval(timer);

@@ -107,6 +107,8 @@ const autopilot = createOrchestrator({
   client: new OpenHandsClient({ baseUrl: AGENT_SERVER_URL, apiKey: agentServerKey }),
   workspace: WORKSPACE,
   dataDir: DATA_DIR,
+  // Agents in containers must not reach this API or Canvas on this machine.
+  controlPorts: [PORT, Number(new URL(AGENT_SERVER_URL).port) || 80],
 });
 app.route("/autopilot", createAutopilotRoutes(autopilot));
 

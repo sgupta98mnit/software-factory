@@ -125,6 +125,7 @@ export interface Attempt {
   lastSentAt: string;
   costUsd: number; // the conversation's latest accumulated cost
   result: unknown;
+  runtime: unknown; // ExecutionFacts (execution.ts): where it ran; null for attempts from before isolation
   startedAt: string;
   finishedAt: string | null;
 }
@@ -139,6 +140,7 @@ export interface Check {
   exitCode: number | null;
   durationMs: number | null;
   output: string; // the tail, at most OUTPUT_LIMIT chars
+  runner: "local" | "container" | null; // where the gate ran; null for checks from before isolation
   at: string;
 }
 
@@ -165,7 +167,7 @@ export type NewWorkOrder = Pick<WorkOrder, "seq" | "title" | "acceptance" | "con
   Partial<Omit<WorkOrder, "id" | "runId" | "updatedAt">>;
 export type NewAttempt = Pick<Attempt, "runId" | "role" | "conversationId"> & Partial<Omit<Attempt, "id">>;
 export type NewCheck = Pick<Check, "runId" | "stage" | "name" | "ok"> &
-  Partial<Pick<Check, "workOrderId" | "exitCode" | "durationMs" | "output">>;
+  Partial<Pick<Check, "workOrderId" | "exitCode" | "durationMs" | "output" | "runner">>;
 export type NewInboxItem = Pick<InboxItem, "runId" | "kind" | "title" | "body" | "options"> &
   Partial<Pick<InboxItem, "workOrderId">>;
 
@@ -263,8 +265,14 @@ CREATE TABLE inbox (
 type Table = "runs" | "work_orders" | "attempts" | "checks" | "inbox";
 const TABLES: Table[] = ["runs", "work_orders", "attempts", "checks", "inbox"];
 
+// v2: where each attempt and gate ran (isolated execution).
+const SCHEMA_V2 = `
+ALTER TABLE attempts ADD COLUMN runtime TEXT;
+ALTER TABLE checks ADD COLUMN runner TEXT;
+`;
+
 // Fields are the columns in camelCase. JSON columns are parsed; 0/1 flags become booleans.
-const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options"]);
+const JSON_COLUMNS = new Set(["policy", "acceptance", "controls", "depends_on", "findings", "result", "options", "runtime"]);
 const FLAG_COLUMNS = new Set(["seen_running", "ok"]);
 const toColumn = (field: string) => field.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toField = (column: string) => column.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -315,6 +323,7 @@ export function openLedger(file: string) {
   // Schema version in PRAGMA user_version. A later change adds `if (version < 2)` with ALTER TABLE.
   const { user_version: version } = db.prepare("PRAGMA user_version").get() as { user_version: number };
   if (version < 1) transaction(() => db.exec(`${SCHEMA_V1}\nPRAGMA user_version = 1;`));
+  if (version < 2) transaction(() => db.exec(`${SCHEMA_V2}\nPRAGMA user_version = 2;`));
 
   const columns = new Map(
     TABLES.map((t) => [t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map((c) => String(c.name)))]),
@@ -450,6 +459,18 @@ export function openLedger(file: string) {
     return all<Attempt>("SELECT * FROM attempts WHERE state IN ('starting', 'running') ORDER BY id");
   }
 
+  /** Attempts whose container hasn't been removed yet. */
+  function liveRuntimes(): Attempt[] {
+    return all<Attempt>(
+      "SELECT * FROM attempts WHERE json_extract(runtime, '$.provider') = 'container' AND json_extract(runtime, '$.released') IS NOT 1 ORDER BY id",
+    );
+  }
+
+  /** Whether any attempt ever ran in a container (so there can be containers to sweep). */
+  function usedContainers(): boolean {
+    return count("SELECT COUNT(*) AS n FROM attempts WHERE json_extract(runtime, '$.provider') = 'container'", {}) > 0;
+  }
+
   // Checks (gate results)
 
   function addCheck(check: NewCheck): Check {
@@ -542,6 +563,8 @@ export function openLedger(file: string) {
     updateAttempt,
     listAttempts,
     activeAttempts,
+    liveRuntimes,
+    usedContainers,
     addCheck,
     listChecks,
     openInbox,

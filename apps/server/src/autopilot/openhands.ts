@@ -188,6 +188,16 @@ export class OpenHandsClient {
     return profiles.find((p) => p.server !== avoid) ?? active;
   }
 
+  /** A stored profile's definition (profiles are secret-free at rest). */
+  getProfile(name: string): Promise<{ name: string; profile: Record<string, unknown> }> {
+    return this.request("GET", `/agent-profiles/${encodeURIComponent(name)}`);
+  }
+
+  /** Saves a profile under `name`; the server keeps its own id for it. */
+  async saveProfile(name: string, profile: Record<string, unknown>): Promise<void> {
+    await this.request("POST", `/agent-profiles/${encodeURIComponent(name)}`, profile);
+  }
+
   start(input: StartInput): Promise<ConversationSnapshot> {
     return this.request<RawConversation>("POST", "/conversations", {
       conversation_id: input.conversationId,

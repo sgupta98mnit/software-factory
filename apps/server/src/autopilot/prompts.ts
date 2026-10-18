@@ -68,11 +68,15 @@ export function criticBrief(o: { change: string }): string {
   ].join("\n");
 }
 
-/** A builder's first message: one work order, built and tested in its own worktree. `gates`: the policy's, when it lists them. */
+/**
+ * A builder's first message: one work order, built and tested in its own worktree. `gates`: the policy's, when it lists them.
+ * `isolated`: it runs in a container without git, and the factory commits what it leaves.
+ */
 export function builderBrief(o: {
   change: string;
   wo: Pick<WorkOrder, "seq" | "title" | "acceptance" | "controls" | "branch" | "findings">;
   gates?: Gate[] | null;
+  isolated?: boolean;
 }): string {
   const { wo } = o;
   const checks = o.gates?.length
@@ -91,9 +95,16 @@ export function builderBrief(o: {
     `${checks} Then a reviewer reads your diff against the acceptance criteria and the scenarios.`,
     "",
     "Rules:",
-    "- This folder is a git worktree made for this work order. Work only here.",
-    `- Commit your work on the current branch${wo.branch ? ` (\`${wo.branch}\`)` : ""} when you're done.`,
-    "- Don't create or switch branches, merge or rebase. The factory merges.",
+    ...(o.isolated
+      ? [
+          "- This folder is the work order's own copy of the code, in an isolated container. Work only here.",
+          "- git isn't available here. Leave your finished work in this folder: the factory commits it.",
+        ]
+      : [
+          "- This folder is a git worktree made for this work order. Work only here.",
+          `- Commit your work on the current branch${wo.branch ? ` (\`${wo.branch}\`)` : ""} when you're done.`,
+          "- Don't create or switch branches, merge or rebase. The factory merges.",
+        ]),
     "- Don't change `openspec/`, `.factory/` or `backlog/`. This is an Autopilot work order: don't use Backlog.md for it.",
     "",
     "Finish with a short summary of what you changed and how you tested it.",
@@ -104,12 +115,16 @@ export function builderBrief(o: {
 export function reviewerBrief(o: {
   change: string;
   wo: Pick<WorkOrder, "seq" | "title" | "acceptance" | "controls" | "branch" | "baseSha">;
+  isolated?: boolean; // in a container without git: the diff is a read-only file
 }): string {
   const { wo } = o;
+  const where = o.isolated
+    ? "A builder's work is in this folder. git isn't available here: read the changes in `/factory/changes.diff`."
+    : `A builder's work is committed in this folder${wo.branch ? ` on \`${wo.branch}\`` : ""}. Read it with \`git diff ${wo.baseSha ?? "HEAD~1"}...HEAD\`.`;
   return [
     `You are the reviewer in a Software Factory Autopilot run. Review work order WO-${wo.seq}: ${wo.title}.`,
     "",
-    `A builder's work is committed in this folder${wo.branch ? ` on \`${wo.branch}\`` : ""}. Read it with \`git diff ${wo.baseSha ?? "HEAD~1"}...HEAD\`. It comes from the OpenSpec change in \`openspec/changes/${o.change}/\`: the scenarios are in specs/, and this is task group ${wo.seq} in tasks.md.`,
+    `${where} It comes from the OpenSpec change in \`openspec/changes/${o.change}/\`: the scenarios are in specs/, and this is task group ${wo.seq} in tasks.md.`,
     "",
     "Acceptance criteria:",
     ...wo.acceptance.map((a, i) => `${i + 1}. ${a}`),
@@ -128,13 +143,13 @@ export function reviewerBrief(o: {
 }
 
 /** Sent to the same builder conversation when its work failed a gate or the review. */
-export function repairMessage(findings: Finding[]): string {
+export function repairMessage(findings: Finding[], isolated = false): string {
   return [
     "The factory checked your work on this work order. It isn't done yet:",
     "",
     clusterFindings(findings),
     "",
-    "Fix these here, keep every check passing, and commit on the current branch. Finish with a short summary of what you changed.",
+    `Fix these here, keep every check passing, and ${isolated ? "leave the work in this folder (the factory commits it)" : "commit on the current branch"}. Finish with a short summary of what you changed.`,
   ].join("\n");
 }
 

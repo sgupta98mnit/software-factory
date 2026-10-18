@@ -11,6 +11,8 @@ import type { AddressInfo } from "node:net";
 export interface FakeConversation {
   id: string;
   workingDir: string;
+  /** workingDir on this machine: the same, unless the server plays a container (mapDir). */
+  hostDir: string;
   profileId: string;
   tags: Record<string, string>;
   status: string;
@@ -34,9 +36,16 @@ const DEFAULT_PROFILE: FakeProfile = { id: "00000000-0000-4000-8000-000000000001
 const done: FakeHandler = () => ({ response: "Done.", cost: 0.01 });
 
 export async function startFakeOpenHands(
-  opts: { apiKey?: string; profiles?: FakeProfile[]; activeProfileId?: string | null; onMessage?: FakeHandler } = {},
+  opts: {
+    apiKey?: string;
+    profiles?: FakeProfile[];
+    activeProfileId?: string | null;
+    onMessage?: FakeHandler;
+    /** For a server playing a container: where a working dir it's given is on this machine. */
+    mapDir?: (dir: string) => string;
+  } = {},
 ) {
-  const profiles = opts.profiles ?? [DEFAULT_PROFILE];
+  const profiles = [...(opts.profiles ?? [DEFAULT_PROFILE])];
   const activeId = opts.activeProfileId === undefined ? (profiles[0]?.id ?? null) : opts.activeProfileId;
   const conversations = new Map<string, FakeConversation>();
   const turns = new Set<Promise<void>>();
@@ -74,9 +83,10 @@ export async function startFakeOpenHands(
   }
 
   async function route(req: IncomingMessage, url: URL): Promise<[number, unknown]> {
-    if (opts.apiKey && req.headers["x-session-api-key"] !== opts.apiKey) return [401, { detail: "Unauthorized" }];
     const path = url.pathname;
     const method = req.method ?? "GET";
+    if (method === "GET" && path === "/health") return [200, "OK"]; // unauthenticated, like the real one
+    if (opts.apiKey && req.headers["x-session-api-key"] !== opts.apiKey) return [401, { detail: "Unauthorized" }];
 
     if (method === "GET" && path === "/api/agent-profiles") {
       const summaries = profiles.map((p) => ({ id: p.id, name: p.name, agent_kind: p.agent_kind, revision: 0, llm_profile_ref: null, mcp_server_refs: null }));
@@ -86,6 +96,16 @@ export async function startFakeOpenHands(
     if (method === "GET" && profile) {
       const p = profiles.find((x) => x.name === decodeURIComponent(profile[1]!));
       return p ? [200, { name: p.name, profile: p }] : [404, { detail: `Agent profile '${profile[1]}' not found` }];
+    }
+    if (method === "POST" && profile) {
+      // Like the real server: the path names it, and the id is the server's own.
+      const name = decodeURIComponent(profile[1]!);
+      const body = (await readJson(req)) as Partial<FakeProfile>;
+      const existing = profiles.findIndex((x) => x.name === name);
+      const saved: FakeProfile = { agent_kind: "openhands", ...body, name, id: existing >= 0 ? profiles[existing]!.id : randomUUID() };
+      if (existing >= 0) profiles[existing] = saved;
+      else profiles.push(saved);
+      return [201, { name, message: `Agent profile '${name}' saved` }];
     }
 
     if (method === "POST" && path === "/api/conversations") {
@@ -103,6 +123,7 @@ export async function startFakeOpenHands(
       const conv: FakeConversation = {
         id: body.conversation_id ?? randomUUID(),
         workingDir: body.workspace.working_dir,
+        hostDir: opts.mapDir?.(body.workspace.working_dir) ?? body.workspace.working_dir,
         profileId: body.agent_profile_id!,
         tags: body.tags ?? {},
         status: "idle",

@@ -13,7 +13,8 @@ import { pinnedPolicy } from "./policy.js";
 const ACTIVE_WO = new Set<string>(["building", "verifying", "reviewing", "ready", "awaiting_merge_approval", "merging"]);
 const FINISHED_WO = new Set<string>(["merged", "skipped", "cancelled"]);
 
-const attemptView = ({ seenRunning: _s, lastSentAt: _l, ...a }: Attempt) => a;
+/** `execution`: where the attempt ran (ExecutionFacts); null for attempts from before isolation. */
+const attemptView = ({ seenRunning: _s, lastSentAt: _l, runtime, ...a }: Attempt) => ({ ...a, execution: runtime ?? null });
 const inboxView = ({ notifiedAt: _n, ...item }: InboxItem) => item;
 
 /** median(dispatch -> merged) of merged work orders x the waves of work left; null until one has merged. */
@@ -62,6 +63,7 @@ export function createAutopilotRoutes(o: Orchestrator) {
       costUsd: ledger.runCost(run.id),
       budgetUsd: run.budgetUsd,
       policyHash: run.policyHash,
+      execution: { provider: pinnedPolicy(run).execution.provider, isolated: pinnedPolicy(run).execution.provider === "container" },
       createdBy: run.createdBy,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -103,6 +105,9 @@ export function createAutopilotRoutes(o: Orchestrator) {
   }
 
   app.get("/status", async (c) => c.json(await o.status()));
+
+  // The checks a run started now would face, including a probe container when the policy isolates execution.
+  app.post("/execution/preflight", async (c) => c.json(await o.checkExecution(LOCAL_USER)));
 
   app.get("/runs", (c) => c.json(ledger.listRuns().map(summary)));
 

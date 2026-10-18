@@ -76,12 +76,13 @@ function killTree(child: ChildProcess) {
   }
 }
 
-function runGate(dir: string, gate: Gate): Promise<GateResult> {
+/** Runs one gate on this machine, in `dir` (or its cwd under it), with `base` as its environment. */
+export function runGate(dir: string, gate: Gate, base: NodeJS.ProcessEnv = process.env): Promise<GateResult> {
   const started = Date.now();
   const timeoutSec = gate.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
   // Plain, non-interactive output. NODE_TEST_CONTEXT is dropped so `node --test` in a gate
   // reports normally when the factory itself runs under node --test.
-  const { NODE_TEST_CONTEXT: _, ...env } = process.env;
+  const { NODE_TEST_CONTEXT: _, ...env } = base;
   return new Promise((resolve) => {
     let output = "";
     let timedOut = false;
@@ -129,16 +130,21 @@ function runGate(dir: string, gate: Gate): Promise<GateResult> {
 }
 
 /**
- * Runs the gates one after another in `dir`. A failing install stops the
+ * Runs the gates one after another in `dir`, on this machine unless `run`
+ * says otherwise (a container, execution.ts). A failing install stops the
  * rest, since nothing after it can pass. No gates at all is a failure too.
  */
-export async function runGates(dir: string, gates: Gate[]): Promise<{ ok: boolean; results: GateResult[] }> {
+export async function runGates(
+  dir: string,
+  gates: Gate[],
+  run: (gate: Gate) => Promise<GateResult> = (gate) => runGate(dir, gate),
+): Promise<{ ok: boolean; results: GateResult[] }> {
   if (!gates.length) {
     return { ok: false, results: [{ name: "gates", run: "", ok: false, exitCode: null, durationMs: 0, output: NO_GATES, timedOut: false }] };
   }
   const results: GateResult[] = [];
   for (const gate of gates) {
-    const result = await runGate(dir, gate);
+    const result = await run(gate);
     results.push(result);
     if (!result.ok && /(^|:)install$/.test(gate.name)) break;
   }

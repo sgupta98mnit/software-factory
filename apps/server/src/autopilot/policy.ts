@@ -16,6 +16,21 @@ import { BLOCKING } from "./review.js";
 
 export const POLICY_FILE = ".factory/policy.yml";
 
+/** How agents and the gates that run their code are isolated (execution.ts). */
+export interface ContainerPolicy {
+  image: string | null; // agent-server image, pinned by digest
+  gateImage: string | null; // null = image
+  network: string | null; // Docker network the agents use
+  gateNetwork: string | null; // null = network
+  user: string | null; // "uid[:gid]"; null = this user's ids on Linux/macOS, the image's user on Windows
+  memory: string;
+  cpus: number;
+  pids: number;
+  hostPathStyle: "native" | "wsl"; // how the Docker CLI spells this machine's paths
+  credentials: Record<AttemptRole, string[]>; // environment variable names each role's container gets
+  startTimeoutSec: number;
+}
+
 export interface Policy {
   version: 1;
   autonomy: { default: Autonomy; max: Autonomy };
@@ -36,6 +51,7 @@ export interface Policy {
   budget: { perWorkOrderUsd: number; perChangeUsd: number };
   hiddenTests: { enabled: boolean; run: string };
   notify: { digestHour: number };
+  execution: { provider: "local" | "container"; container: ContainerPolicy };
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -56,6 +72,22 @@ export const DEFAULT_POLICY: Policy = {
   budget: { perWorkOrderUsd: 5, perChangeUsd: 30 },
   hiddenTests: { enabled: true, run: "node --test" },
   notify: { digestHour: 17 },
+  execution: {
+    provider: "local",
+    container: {
+      image: null,
+      gateImage: null,
+      network: null,
+      gateNetwork: null,
+      user: null,
+      memory: "4g",
+      cpus: 2,
+      pids: 512,
+      hostPathStyle: "native",
+      credentials: { spec: [], critic: [], builder: [], reviewer: [], validator: [] },
+      startTimeoutSec: 120,
+    },
+  },
 };
 
 // ---- reading and checking policy.yml ----
@@ -93,6 +125,23 @@ const gate: Rule = (v, key) => {
   return text(v.name, `${key}.name`) ?? text(v.run, `${key}.run`) ?? (v.cwd === undefined ? null : text(v.cwd, `${key}.cwd`)) ?? (v.timeoutSec === undefined ? null : seconds(v.timeoutSec, `${key}.timeoutSec`));
 };
 
+const nullable =
+  (rule: Rule): Rule =>
+  (v, key) =>
+    v === null ? null : rule(v, key);
+const matching =
+  (pattern: RegExp, what: string): Rule =>
+  (v, key) =>
+    typeof v === "string" && pattern.test(v) ? null : `${key} must be ${what}`;
+// Digest-pinned, so the image a run records is the image that ran.
+const pinnedImage = matching(/^[^\s@]+@sha256:[a-f0-9]{64}$/, "an image pinned by digest (name@sha256:<64 hex>)");
+const network: Rule = (v, key) =>
+  matching(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/, "a Docker network name")(v, key) ?? (v === "host" ? `${key} can't be host: containers would share this machine's network` : null);
+// The factory's own settings and Docker's never go into an agent's container.
+const credential: Rule = (v, key) =>
+  matching(/^[A-Z_][A-Z0-9_]*$/, "an environment variable name")(v, key) ??
+  (/^(SF_|OH_|DOCKER_)/.test(v as string) || ["PATH", "HOME"].includes(v as string) ? `${key} can't pass ${v as string} to an agent` : null);
+
 const AUTONOMY: Autonomy[] = ["suggest", "supervised", "autonomous"];
 const RULES: Record<string, Rule> = {
   version: (v, key) => (v === 1 ? null : `${key} must be 1`),
@@ -115,6 +164,18 @@ const RULES: Record<string, Rule> = {
   "hiddenTests.enabled": flag,
   "hiddenTests.run": text,
   "notify.digestHour": whole(0, 23),
+  "execution.provider": oneOf(["local", "container"]),
+  "execution.container.image": nullable(pinnedImage),
+  "execution.container.gateImage": nullable(pinnedImage),
+  "execution.container.network": nullable(network),
+  "execution.container.gateNetwork": nullable(network),
+  "execution.container.user": nullable(matching(/^\d+(:\d+)?$/, 'a numeric "uid" or "uid:gid"')),
+  "execution.container.memory": matching(/^\d+(\.\d+)?[bkmg]$/i, 'a size with a unit, like "4g"'),
+  "execution.container.cpus": positive,
+  "execution.container.pids": whole(16),
+  "execution.container.hostPathStyle": oneOf(["native", "wsl"]),
+  ...Object.fromEntries(Object.keys(DEFAULT_POLICY.agents).map((role) => [`execution.container.credentials.${role}`, listOf(credential)])),
+  "execution.container.startTimeoutSec": seconds,
 };
 
 /** `over` on top of `base`: mappings merge key by key, anything else (lists too) replaces. A key the defaults don't have is an error, so a typo can't go unnoticed. */
@@ -152,6 +213,11 @@ export function parsePolicy(yaml: string): Policy {
     const problem = rule(value, key);
     if (problem) throw new Error(problem);
   }
+  const { execution } = policy as unknown as Policy;
+  if (execution.provider === "container") {
+    if (!execution.container.image) throw new Error("execution.container.image is required when execution.provider is container");
+    if (!execution.container.network) throw new Error("execution.container.network is required when execution.provider is container");
+  }
   return policy as unknown as Policy;
 }
 
@@ -176,8 +242,8 @@ export async function loadPolicy(workspace: string, baseBranch: string): Promise
   }
 }
 
-/** The policy a run pinned when it was created; runs from before policies get the defaults. */
-export const pinnedPolicy = (run: { policy: unknown }): Policy => (run.policy as Policy | null) ?? DEFAULT_POLICY;
+/** The policy a run pinned when it was created; settings added since it was pinned keep their defaults. */
+export const pinnedPolicy = (run: { policy: unknown }): Policy => ({ ...DEFAULT_POLICY, ...(run.policy as Policy | null) });
 
 // ---- the merge decision ----
 
