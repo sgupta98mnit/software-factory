@@ -2,6 +2,11 @@
 
 Verify each against the CURRENT code before acting — later commits may already have fixed it.
 
+Hardening update: critic commits/branch changes and failed resume acknowledgements listed below are fixed.
+Automatic run pauses now reach live agents and retry failed pause requests after restart. Run and work-order
+budgets are enforced through Inbox decisions; startup dispatch and lost resume responses have regression coverage.
+Historical reviewer notes remain below for context.
+
 ## review:C1-ledger
 - [low] Schema-creation race: openLedger reads PRAGMA user_version outside the BEGIN IMMEDIATE transaction. If two processes open a brand-new DB file at the same moment, both see version 0, and the second fails with 'table runs already exists'. This only matters when two servers start together against a fresh data dir, and the second would fail to bind the port anyway. Not fixed. If it ever matters, re-read user_version inside the transaction.
 - [low] transaction() calls ROLLBACK unconditionally in its catch. If SQLite has already rolled back the transaction itself (for example on SQLITE_FULL or an I/O error), ROLLBACK throws 'no transaction is active' and hides the original error. I could not reproduce it cheaply, so it is not fixed. The fix would be to guard it with `if (db.isTransaction)`.
@@ -28,7 +33,7 @@ Reviewer notes: - OpenHandsError status 0 now covers a refused connection, a tim
 
 ## review:C3-spec
 - [low] If the spec conversation is gone from the agent server (404), a critic 'revise' or a person's revise/answer can never be delivered. sendFollowUp throws, the run pauses with an error item, and Retry hits the same 404 again, so the only way out is cancel. Not fixed: this is a design gap (it would need 'start a new spec agent when its conversation is gone'). Left for a later commit.
-- [low] A critic that commits instead of editing (against its brief) isn't caught: discardChanges only resets uncommitted edits, so the commit stays on the integration branch. The design only asks for a dirty-worktree check. Comparing HEAD with the spec commit sha (stored in the spec attempt's result.sha) would catch it. Not fixed.
+- [fixed] Critic commits and branch changes are reset to the validated spec SHA before planning or follow-ups. Spec validations retain the SHA even without a new commit.
 - [low] When the critic's finalResponse keeps failing with a non-network error (for example a 404), criticStep throws before marking the attempt handled. Retry therefore re-reads the same critic instead of starting a new one, as the deviation note claims it does. It still loops back to the inbox. Not fixed.
 
 Reviewer notes: - Work-order branches can't be autopilot/<change>/wo-<n>, because autopilot/<change> already exists as a branch and a git ref can't be both a file and a folder. Use a name that isn't nested under it, e.g. autopilot-wo/<change>/wo-<n>, as the git tests already do. takenChangeNames only scans refs/heads/autopilot/, so add the WO prefix there if it matters.
@@ -40,7 +45,7 @@ Reviewer notes: - Work-order branches can't be autopilot/<change>/wo-<n>, becaus
 
 ## review:C4-waves
 - [medium] Not implemented: design §6 says a step exception for a work order should put that WO in needs_attention and open an `error` item (retry/skip/cancel). Instead, any exception in buildStep (built()/commitAll, or addWorktree in dispatch) goes through failed() and pauses the whole run, with only retry or cancel. A failure that repeats for one WO (for example its worktree is broken) leaves no way to skip it, and one bad WO stops dispatch for the others. Left for C5, which adds more per-WO steps (gates, reviewer) that need the same per-WO wrapper. If an `error` item gets a workOrderId, resume() must stop auto-deciding it, because today it decides every `error` item.
-- [low] Existing problem from C3, not introduced here: unpause() sets paused attempts to 'running' even when client.resume fails, only logging a warning. poll() treats a server-side 'paused' as running, so the factory then polls a conversation that stays paused forever.
+- [fixed] Failed resume requests leave the run paused and are reconciled back to paused remotely, including requests that succeeded but lost their response. Retrying resumes the same conversation.
 - [low] In approval bodies, a work-order title containing '|' breaks the markdown table. Titles are not escaped.
 - [low] Audit `inbox_opened` puts the full WO id ('ap-xxxx/WO-1') in data.workOrder, while every other WO event uses 'WO-N' as design §10 specifies.
 - [low] built() moves a WO to verifying even when the builder changed nothing (sha == base_sha) or committed on a different branch than wo.branch. C5 should check that HEAD is on wo.branch and that the diff against base_sha is not empty.

@@ -15,7 +15,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { audit, sha256 } from "../audit.js";
+import { audit, auditFor, sha256 } from "../audit.js";
 import { broadcast } from "../events.js";
 import { tools } from "../tools.js";
 import { detectGates, gateFindings, runGates, type GateResult } from "./gates.js";
@@ -131,6 +131,15 @@ const RUN_PAUSED: InboxOption[] = [
   { id: "resume", label: "Resume", tone: "primary" },
   { id: "cancel", label: "Cancel run", tone: "danger" },
 ];
+const RUN_BUDGET: InboxOption[] = [
+  { id: "continue", label: "Increase budget and continue", tone: "primary" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
+const WO_BUDGET: InboxOption[] = [
+  { id: "continue", label: "Increase budget and continue", tone: "primary" },
+  { id: "skip", label: "Skip this work order", tone: "danger" },
+  { id: "cancel", label: "Cancel run", tone: "danger" },
+];
 
 const now = () => new Date().toISOString();
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -169,13 +178,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** The scheduler's step for a run, skipped while something else is being done for it. */
   function launch(runId: string, fn: () => Promise<void>) {
     if (inflight.has(runId)) return;
-    track(runId, fn().catch((err) => failed(runId, err)));
+    track(runId, fn().catch((err) => failed(runId, err)).finally(() => reconcilePauses(runId)));
   }
 
   /** A person's action: waits for the run's current step, then holds the run until it's done. */
   async function locked<T>(runId: string, fn: () => Promise<T>): Promise<T> {
     for (let busy = inflight.get(runId); busy; busy = inflight.get(runId)) await busy;
-    const result = fn();
+    const result = fn().finally(() => reconcilePauses(runId));
     track(runId, result);
     return result;
   }
@@ -227,6 +236,60 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         data: { error: clip(message) },
       });
     });
+  }
+
+  /** Pause intent lives in run/WO state; retry failed acknowledgements on later ticks, including after restart. */
+  async function reconcilePauses(runId: string) {
+    const run = ledger.getRun(runId);
+    if (!run || TERMINAL.has(run.state)) return;
+    for (const a of ledger.listAttempts({ runId })) {
+      if (!ACTIVE.has(a.state)) continue;
+      const held = a.workOrderId && ledger.getWorkOrder(a.workOrderId)?.state === "needs_attention";
+      if (run.state !== "paused" && !held) continue;
+      try {
+        // A write-ahead attempt may not exist remotely yet. Never start it just to pause it.
+        if (a.state === "starting" && !(await client.get(a.conversationId))) continue;
+        await client.pause(a.conversationId);
+        ledger.updateAttempt(a.id, { state: "paused" });
+        record(SYSTEM, "autopilot.agent_paused", runId, { attempt: a.id, role: a.role, conversationId: a.conversationId });
+        changed(runId);
+      } catch (err) {
+        warn(err); // retain the active state so the pause is retried
+      }
+    }
+  }
+
+  const runBudget = (run: Run) => run.budgetUsd ?? pinnedPolicy(run).budget.perChangeUsd;
+
+  /** Check reported costs before starting more work and after each conversation update. */
+  function enforceBudgets(run: Run): boolean {
+    if (run.state === "paused" || TERMINAL.has(run.state)) return false;
+    const cost = ledger.runCost(run.id);
+    const limit = runBudget(run);
+    if (cost >= limit) {
+      ledger.transaction(() => {
+        openItem(run, "budget_reached", `Budget reached for ${run.change}`,
+          `Reported spending is $${cost.toFixed(2)} against a $${limit.toFixed(2)} limit. Continue adds $${pinnedPolicy(run).budget.perChangeUsd.toFixed(2)} to this run's limit.`, RUN_BUDGET);
+        moveRun(run, "paused", {
+          patch: { resumeState: run.state, pausedReason: "Run budget reached" },
+          action: "autopilot.budget_reached", data: { costUsd: cost, limitUsd: limit },
+        });
+      });
+      return false;
+    }
+    const base = pinnedPolicy(run).budget.perWorkOrderUsd;
+    for (const wo of ledger.listWorkOrders(run.id)) {
+      if (DONE_WO.has(wo.state) || wo.state === "cancelled" || wo.state === "needs_attention") continue;
+      const woCost = ledger.workOrderCost(wo.id);
+      const woLimit = base + wo.budgetExtraUsd;
+      if (woCost < woLimit) continue;
+      ledger.transaction(() => {
+        moveWorkOrder(wo, "needs_attention", { patch: { resumeState: wo.state }, action: "autopilot.budget_reached", data: { costUsd: woCost, limitUsd: woLimit } });
+        openItem(run, "budget_reached", `Budget reached for WO-${wo.seq} of ${run.change}`,
+          `Reported spending is $${woCost.toFixed(2)} against a $${woLimit.toFixed(2)} limit. Continue adds $${base.toFixed(2)} to this work order's limit. Other work orders may continue.`, WO_BUDGET, wo.id);
+      });
+    }
+    return true;
   }
 
   // ---- attempts (one agent conversation each) ----
@@ -307,6 +370,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       record(SYSTEM, "autopilot.agent_finished", run.id, { role: a.role, attempt: a.id, state: "error", error: clip(errorText(err)) });
     }
     changed(run.id);
+    enforceBudgets(ledger.getRun(run.id) ?? run);
   }
 
   async function poll(a: Attempt) {
@@ -386,8 +450,9 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     }
 
     const title = proposalTitle(readProposal(dir, run.change)) ?? run.goal;
-    const sha = await commitAll(dir, `spec(${run.change}): ${clip(title, 72)}`);
-    if (sha) record(SYSTEM, "autopilot.spec_committed", run.id, { change: run.change, branch: run.integrationBranch, sha });
+    const committed = await commitAll(dir, `spec(${run.change}): ${clip(title, 72)}`);
+    const sha = committed ?? await headSha(dir);
+    if (committed) record(SYSTEM, "autopilot.spec_committed", run.id, { change: run.change, branch: run.integrationBranch, sha });
     ledger.transaction(() => {
       markHandled(a, { outcome: "valid", sha });
       moveRun(run, "critic");
@@ -406,10 +471,20 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
     const dir = run.integrationDir as string;
     const verdict = parseCriticVerdict(await client.finalResponse(c.conversationId));
-    if (!(await isClean(dir))) {
+    // Older persisted runs could omit the SHA when revalidation made no new commit.
+    const specSha = (specAttempt(run).result as { sha?: string } | null)?.sha
+      ?? auditFor(run.id).findLast((e) => e.action === "autopilot.spec_committed")?.data.sha;
+    if (typeof specSha !== "string" || !/^[a-f0-9]{40,64}$/i.test(specSha)) {
+      throw new Error("The critic has no recorded validated spec commit. Restore the spec attempt's SHA before retrying, or cancel this run.");
+    }
+    const onBranch = (await currentBranch(dir)) === run.integrationBranch;
+    if (!onBranch) await git(dir, ["checkout", "-f", run.integrationBranch]);
+    const committed = (await headSha(dir)) !== specSha;
+    if (!onBranch || committed || !(await isClean(dir))) {
+      await resetHard(dir, specSha);
       await discardChanges(dir);
-      ledger.addCheck({ runId: run.id, stage: "spec", name: "critic-edits-discarded", ok: false, output: "The critic edited files. Its edits were thrown away." });
-      record(SYSTEM, "autopilot.edits_discarded", run.id, { role: "critic", attempt: c.id });
+      ledger.addCheck({ runId: run.id, stage: "spec", name: "critic-edits-discarded", ok: false, output: "The critic changed the worktree. Its edits and commits were thrown away." });
+      record(SYSTEM, "autopilot.edits_discarded", run.id, { role: "critic", attempt: c.id, committed, switchedBranch: !onBranch });
     }
     record(SYSTEM, "autopilot.critic_verdict", run.id, { verdict: verdict.verdict, findings: verdict.findings.length, unreadable: verdict.unreadable });
     // No verdict to act on: ask the critic once more, then a person.
@@ -580,6 +655,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       if (wo.state !== "pending" || !wo.dependsOn.every((d) => DONE_WO.has(stateOf.get(d) ?? "pending"))) continue;
       try {
         await dispatch(run, wo);
+        if (ledger.getRun(run.id)?.state !== "building") return;
         room--;
       } catch (err) {
         if (unreachable(err)) return;
@@ -990,8 +1066,13 @@ export function createOrchestrator(deps: OrchestratorDeps) {
 
   /** Starts or polls the run's agents, then takes its next step. */
   async function advance(runId: string) {
+    await reconcilePauses(runId);
+    if (!enforceBudgets(mustRun(runId))) return;
     for (const a of ledger.listAttempts({ runId }).filter((x) => ACTIVE.has(x.state))) {
+      if (a.workOrderId && ledger.getWorkOrder(a.workOrderId)?.state === "needs_attention") continue;
       await (a.state === "starting" ? startConversation(a) : poll(a));
+      const run = mustRun(runId);
+      if (run.state === "paused" || !enforceBudgets(run)) return;
     }
     const run = ledger.getRun(runId);
     if (run?.state === "spec") await specStep(run);
@@ -1002,7 +1083,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   /** Cheap: hands each live run to advance(), skipping runs that are still busy. */
   async function tick() {
     for (const run of ledger.listRuns()) {
-      if (!TERMINAL.has(run.state) && run.state !== "paused") launch(run.id, () => advance(run.id));
+      if (!TERMINAL.has(run.state)) launch(run.id, () => run.state === "paused" ? Promise.resolve() : advance(run.id));
     }
   }
 
@@ -1100,12 +1181,22 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     });
   }
 
-  async function unpause(run: Run, actor: string) {
+  /** Include uncertain active attempts: a previous resume and its compensating pause may both have lost their response. */
+  async function resumeAgents(run: Run, actor: string, workOrderId?: string) {
     for (const a of ledger.listAttempts({ runId: run.id })) {
-      if (a.state !== "paused") continue;
-      await client.resume(a.conversationId).catch(warn);
+      if (a.state !== "paused" && !ACTIVE.has(a.state)) continue;
+      if (workOrderId && a.workOrderId !== workOrderId) continue;
+      if (!workOrderId && a.workOrderId && ledger.getWorkOrder(a.workOrderId)?.state === "needs_attention") continue;
+      if (a.state === "starting" && !(await client.get(a.conversationId))) continue;
       ledger.updateAttempt(a.id, { state: "running", seenRunning: false, lastSentAt: now() });
+      record(actor, "autopilot.agent_resume_requested", run.id, { attempt: a.id, role: a.role, conversationId: a.conversationId });
+      await client.resume(a.conversationId);
+      record(actor, "autopilot.agent_resumed", run.id, { attempt: a.id, role: a.role, conversationId: a.conversationId });
     }
+  }
+
+  async function unpause(run: Run, actor: string) {
+    await resumeAgents(run, actor);
     return moveRun(run, run.resumeState ?? "spec", {
       patch: { resumeState: null, pausedReason: null },
       actor,
@@ -1117,18 +1208,15 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return locked(runId, async () => {
       const run = mustRun(runId);
       if (TERMINAL.has(run.state) || run.state === "paused") throw new Error(`The run is already ${run.state}.`);
-      for (const a of ledger.listAttempts({ runId })) {
-        if (a.state !== "running") continue;
-        await client.pause(a.conversationId).catch(warn);
-        ledger.updateAttempt(a.id, { state: "paused" });
-      }
       const note = opts.note?.trim();
-      return moveRun(run, "paused", {
+      const paused = moveRun(run, "paused", {
         patch: { resumeState: run.state, pausedReason: note || `Paused by ${opts.actor}` },
         actor: opts.actor,
         action: "autopilot.run_paused",
         data: { note: note ? clip(note) : null },
       });
+      await reconcilePauses(runId);
+      return paused;
     });
   }
 
@@ -1136,17 +1224,28 @@ export function createOrchestrator(deps: OrchestratorDeps) {
     return locked(runId, async () => {
       const run = mustRun(runId);
       if (run.state !== "paused") throw new Error(`The run isn't paused (it's ${run.state}).`);
+      requireBudgetDecision(run);
+      const resumed = await unpause(run, opts.actor);
       // Resuming answers the item the pause came with. A work order's own error item stays for its work order.
       for (const item of ledger.listInbox({ runId })) {
         const decision = item.kind === "run_paused" ? "resume" : item.kind === "error" && !item.workOrderId ? "retry" : null;
-        if (decision) ledger.decideInbox(item.id, { decision, note: "Resumed from the pipeline", by: opts.actor });
+        if (decision) {
+          ledger.decideInbox(item.id, { decision, note: "Resumed from the pipeline", by: opts.actor });
+          record(opts.actor, "autopilot.inbox_decided", run.id, { item: item.id, kind: item.kind, choice: decision });
+        }
       }
-      return unpause(run, opts.actor);
+      return resumed;
     });
   }
 
   async function cancel(runId: string, opts: { note?: string | null; actor: string }): Promise<Run> {
     return locked(runId, async () => cancelRun(mustRun(runId), opts.actor, opts.note?.trim() || null));
+  }
+
+  function requireBudgetDecision(run: Run) {
+    if (ledger.listInbox({ runId: run.id }).some((i) => i.kind === "budget_reached" && !i.workOrderId)) {
+      throw new Error("The run reached its budget. Increase the budget using its Inbox item before resuming.");
+    }
   }
 
   /** Carries out a person's choice on an inbox item (already validated). */
@@ -1179,11 +1278,25 @@ export function createOrchestrator(deps: OrchestratorDeps) {
           // The work order picks up where its step threw (a reviewer that failed is started again).
           const wo = workOrderOf(item);
           moveWorkOrder(wo, wo.resumeState ?? "pending", { actor, patch: { resumeState: null } });
-        } else if (run.state === "paused") await unpause(run, actor);
+        } else if (run.state === "paused") { requireBudgetDecision(run); await unpause(run, actor); }
         return;
       case "run_paused:resume":
-        if (run.state === "paused") await unpause(run, actor);
+        if (run.state === "paused") { requireBudgetDecision(run); await unpause(run, actor); }
         return;
+      case "budget_reached:continue": {
+        if (item.workOrderId) {
+          const wo = workOrderOf(item);
+          const extra = wo.budgetExtraUsd + pinnedPolicy(run).budget.perWorkOrderUsd;
+          await resumeAgents(run, actor, wo.id);
+          moveWorkOrder(wo, wo.resumeState ?? "building", { actor, patch: { budgetExtraUsd: extra, resumeState: null }, action: "autopilot.budget_increased", data: { limitUsd: pinnedPolicy(run).budget.perWorkOrderUsd + extra } });
+        } else {
+          const limit = runBudget(run) + pinnedPolicy(run).budget.perChangeUsd;
+          await unpause(run, actor);
+          ledger.updateRun(run.id, { budgetUsd: limit });
+          record(actor, "autopilot.budget_increased", run.id, { limitUsd: limit });
+        }
+        return;
+      }
       case "work_order_failed:retry":
         // Back in the queue: dispatch gives it a fresh worktree, and wo.findings go into the new brief.
         moveWorkOrder(workOrderOf(item), "pending", { actor, patch: { resumeState: null } });
@@ -1197,8 +1310,14 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         return;
       case "merge_approval:skip":
       case "error:skip":
+      case "budget_reached:skip":
       case "work_order_failed:skip": {
         const wo = workOrderOf(item);
+        for (const a of ledger.listAttempts({ runId: run.id, workOrderId: wo.id }).filter((x) => ACTIVE.has(x.state) || x.state === "paused")) {
+          await client.pause(a.conversationId);
+          ledger.updateAttempt(a.id, { state: "cancelled", finishedAt: now() });
+          record(actor, "autopilot.agent_cancelled", run.id, { attempt: a.id, role: a.role, conversationId: a.conversationId });
+        }
         if (wo.worktree) await removeWorktree(workspace, wo.worktree).catch(warn); // the branch keeps what it did
         moveWorkOrder(wo, "skipped", { actor, patch: { worktree: null, resumeState: null } });
         return;
@@ -1220,7 +1339,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       const note = input.note?.trim() || null;
       if (option.needsNote && !note) throw new Error(`"${option.label}" needs a note.`);
       const run = mustRun(item.runId);
-      if (run.state === "paused" && item.kind !== "error" && item.kind !== "run_paused" && input.choice !== "cancel") {
+      if (run.state === "paused" && item.kind !== "error" && item.kind !== "run_paused" && !(item.kind === "budget_reached" && !item.workOrderId) && input.choice !== "cancel") {
         throw new Error("The run is paused. Resume it first.");
       }
 
@@ -1237,6 +1356,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         return ledger.getInbox(id) as InboxItem;
       }
       await act(run, item, input.choice, note, actor); // throws -> the item stays open
+      await reconcilePauses(run.id);
       return close();
     });
   }

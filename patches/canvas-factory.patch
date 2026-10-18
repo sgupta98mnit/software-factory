@@ -1,15 +1,15 @@
 diff --git a/__tests__/factory/autopilot.test.tsx b/__tests__/factory/autopilot.test.tsx
 new file mode 100644
-index 0000000..3d9565f
+index 0000000..42287db
 --- /dev/null
 +++ b/__tests__/factory/autopilot.test.tsx
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,208 @@
 +import { screen, waitFor, within } from "@testing-library/react";
 +import userEvent from "@testing-library/user-event";
 +import { http, HttpResponse } from "msw";
 +import { MemoryRouter, Route, Routes } from "react-router";
-+import { describe, expect, it } from "vitest";
-+import { renderWithProviders } from "test-utils";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { renderWithProviders, useParamsMock } from "test-utils";
 +import { server } from "#/mocks/node";
 +import type { InboxItemView, RunDetail } from "#/factory/api";
 +import { FactoryNavLinks } from "#/factory/factory-nav-links";
@@ -168,6 +168,21 @@ index 0000000..3d9565f
 +};
 +
 +describe("Autopilot run page", () => {
++  beforeEach(async () => {
++    // test-utils defaults useParams to a conversation ID. This route needs the
++    // real runId from MemoryRouter so its API query is enabled.
++    const router =
++      await vi.importActual<typeof import("react-router")>("react-router");
++    useParamsMock.mockImplementation(() => ({
++      conversationId: "test-conversation-id",
++      ...router.useParams(),
++    }));
++  });
++
++  afterEach(() => {
++    useParamsMock.mockReset();
++  });
++
 +  it("shows the critic's findings with their fix, and keeps a stuck run in Build", async () => {
 +    server.use(
 +      http.get("*/sf-api/autopilot/runs/ap-1a2b3c4d", () =>
@@ -1712,10 +1727,10 @@ index 0000000..3b39060
 +}
 diff --git a/src/factory/copy.ts b/src/factory/copy.ts
 new file mode 100644
-index 0000000..f06a748
+index 0000000..b70d057
 --- /dev/null
 +++ b/src/factory/copy.ts
-@@ -0,0 +1,902 @@
+@@ -0,0 +1,914 @@
 +import { useTranslation } from "react-i18next";
 +
 +/**
@@ -1773,7 +1788,7 @@ index 0000000..f06a748
 +    autonomyDefault: "Default",
 +    budgetLabel: "Budget in US dollars (optional)",
 +    budgetHelp:
-+      "The most agents may spend on this change. Leave it empty to use the policy's limit.",
++      "Agents pause when reported spending reaches this limit. Spending can rise between checks. Leave it empty to use the policy's limit.",
 +    budgetInvalid: "Enter an amount above zero, or leave it empty.",
 +    workspaceLabel: "Workspace",
 +    onBranch: (branch: string) => `on ${branch}`,
@@ -2150,6 +2165,12 @@ index 0000000..f06a748
 +      "autopilot.work_order_state_changed": "Work order moved to a new state",
 +      "autopilot.agent_started": "Started an agent",
 +      "autopilot.agent_finished": "An agent stopped",
++      "autopilot.agent_paused": "Paused an agent",
++      "autopilot.agent_resumed": "Resumed an agent",
++      "autopilot.agent_resume_requested": "Requested that an agent resume",
++      "autopilot.agent_cancelled": "Cancelled an agent",
++      "autopilot.budget_reached": "Reached a spending limit",
++      "autopilot.budget_increased": "Increased a spending limit",
 +      "autopilot.followup_sent": "Sent an agent a follow-up",
 +      "autopilot.edits_discarded":
 +        "Threw away edits an agent shouldn't have made",
@@ -2213,7 +2234,7 @@ index 0000000..f06a748
 +    autonomyDefault: "Predeterminado",
 +    budgetLabel: "Presupuesto en dólares (opcional)",
 +    budgetHelp:
-+      "Lo máximo que pueden gastar los agentes en este cambio. Déjelo vacío para usar el límite de la política.",
++      "Los agentes se pausan cuando el gasto informado alcanza este límite. El gasto puede aumentar entre comprobaciones. Déjelo vacío para usar el límite de la política.",
 +    budgetInvalid: "Escriba un importe mayor que cero o déjelo vacío.",
 +    workspaceLabel: "Espacio de trabajo",
 +    onBranch: (branch) => `en ${branch}`,
@@ -2597,6 +2618,12 @@ index 0000000..f06a748
 +        "La orden de trabajo cambió de estado",
 +      "autopilot.agent_started": "Inició un agente",
 +      "autopilot.agent_finished": "Un agente se detuvo",
++      "autopilot.agent_paused": "Pausó un agente",
++      "autopilot.agent_resumed": "Reanudó un agente",
++      "autopilot.agent_resume_requested": "Solicitó reanudar un agente",
++      "autopilot.agent_cancelled": "Canceló un agente",
++      "autopilot.budget_reached": "Alcanzó un límite de gasto",
++      "autopilot.budget_increased": "Aumentó un límite de gasto",
 +      "autopilot.followup_sent": "Envió un seguimiento a un agente",
 +      "autopilot.edits_discarded":
 +        "Descartó cambios que un agente no debía hacer",

@@ -125,7 +125,7 @@ function withGovernance(wo: WorkOrder, events: AuditEvent[] = auditFor(wo.id)): 
     ...wo,
     conversations,
     approval: approved ? { by: lastApproval.actor, at: lastApproval.at } : undefined,
-    doneWithoutApproval: Boolean(lastUnapproved && !approved),
+    doneWithoutApproval: !approved,
   };
 }
 
@@ -188,8 +188,8 @@ export async function setStatus(id: string, status: string, actor: string, opts:
   const before = getWorkOrder(id);
   const isApproval = status === finalStatus();
   if (isApproval && !opts.approve) throw new Error(`Moving a work order to "${status}" is an approval. Use "Approve" instead.`);
-  if (before.status === status) return;
-  expectedStatus.set(before.id.toLowerCase(), status);
+  if (before.status === status && (!isApproval || before.approval)) return;
+  if (before.status !== status) expectedStatus.set(before.id.toLowerCase(), status);
   const args = ["task", "edit", before.id, "--status", status, "--plain"];
   if (opts.note) args.push("--comment", opts.note, "--comment-author", actor.replace(/^user:/, ""));
   await runBacklog(args);

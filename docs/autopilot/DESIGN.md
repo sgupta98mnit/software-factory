@@ -586,7 +586,7 @@ Upstream files: add routes in `src/routes.ts` only (one line each). Sidebar entr
 
 ## 9. v1 (after the MVP, as time allows; one commit each)
 
-- **C9 Budgets + model routing**: per-WO budget (`budget.perWorkOrderUsd` + `budget_extra_usd`) and per-run budget
+- **C9 Budgets + model routing** (budgets implemented in the hardening pass; model routing remains future work): per-WO budget (`budget.perWorkOrderUsd` + `budget_extra_usd`) and per-run budget
   (`runs.budget_usd` ?? `budget.perChangeUsd`) enforced on each poll: over limit → `pause` the conversation(s);
   WO → `needs_attention` + inbox `budget_reached` (continue[raises by the base amount]/skip); run → `paused` +
   inbox `budget_reached` (continue/cancel). Builder profile = `routing[risk]` ?? `agents.builder`.
@@ -628,7 +628,17 @@ Upstream files: add routes in `src/routes.ts` only (one line each). Sidebar entr
   edits_discarded, spec_approved, run_paused, run_resumed, workspace_initialized, work_orders_planned,
   work_order_dispatched, work_order_state_changed, work_order_failed). All `autopilot.*`, subject = runId,
   `data.workOrder = "WO-N"` for WO events.
-- Known gaps from reviews (for the hardening pass): a spec conversation gone from the agent server (404)
-  deadlocks revise/answer/critic follow-ups (should start a new spec attempt); a critic/reviewer that
-  *commits* isn't caught (compare HEAD with the expected sha as well as isClean); criticStep throws before
+- Known gaps from reviews: a spec conversation gone from the agent server (404)
+  deadlocks revise/answer/critic follow-ups (should start a new spec attempt); criticStep throws before
   marking handled when finalResponse keeps failing with a non-network error.
+- Hardening: critics, like reviewers, restore the expected branch and validated commit before their verdict
+  is used. Every successful spec validation retains its SHA, even when no new commit is needed.
+- Paused runs keep reconciling their active conversations until pause requests succeed, including after a
+  restart. Resume requests write intent before contacting the agent server, so a lost response is reconciled
+  back to paused rather than leaving an untracked running agent. Work orders awaiting a budget decision
+  stay paused when the rest of their run resumes.
+- Budget checks run before scheduling and after conversation costs update. Run exhaustion pauses the run;
+  work-order exhaustion holds just that order. Inbox Continue increases the limit by the pinned policy's
+  base amount (run: `budget.perChangeUsd`; WO: `budget.perWorkOrderUsd`), with an audit record. Normal Resume
+  cannot bypass a run's budget item. Starting an agent that reaches a limit stops further dispatch that tick.
+  Enforcement uses reported costs: spending can rise between polls and while a pause request completes.
