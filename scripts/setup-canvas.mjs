@@ -3,8 +3,10 @@
 //
 //   pnpm setup:canvas
 //
-// Safe to run again: it skips whatever is already done. It never deletes
-// anything; if canvas/ exists but isn't what it expects, it stops and says why.
+// Safe to run again: it skips whatever is already done, and brings the factory
+// pages up to date when the patch has changed since they were applied. It never
+// loses anything: the canvas/ it replaces stays on a backup branch, and it stops
+// (saying why) rather than touch uncommitted changes or a canvas/ it doesn't know.
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -45,20 +47,41 @@ if (!existsSync(canvas)) {
   fail("canvas/ exists but isn't a git repository. Move it out of the way and run this again.");
 }
 
-// 3. Apply our changes once
-const hasFactory = existsSync(path.join(canvas, "src", "factory", "factory-nav-links.tsx"));
-if (!hasFactory) {
+// 3. Our changes: applied once, and again whenever the patch has changed
+function applyPatch(message) {
   const check = tryGit(["apply", "--check", patch]);
   if (check.status !== 0) {
     fail(`The patch doesn't apply cleanly to canvas/:\n${check.stderr}\nIs canvas/ at ${lock.commit.slice(0, 7)} with no other changes?`);
   }
   git(["apply", patch]);
   git(["add", "-A"]);
-  const commit = tryGit(["commit", "--quiet", "-m", "Add Software Factory pages (requirements, work orders, audit log)"]);
+  const commit = tryGit(["commit", "--quiet", "-m", message]);
   if (commit.status === 0) log(`Applied ${lock.patch} as a commit on branch "${lock.branch}".`);
   else log(`Applied ${lock.patch}. It isn't committed yet (set git user.name and user.email, then commit in canvas/).`);
+}
+
+let reinstall = false;
+const hasFactory = existsSync(path.join(canvas, "src", "factory", "factory-nav-links.tsx"));
+if (!hasFactory) {
+  applyPatch("Add Software Factory pages");
+} else if (tryGit(["apply", "--reverse", "--check", patch]).status === 0) {
+  log("Factory pages are already in canvas/ and up to date.");
 } else {
-  log("Factory pages are already in canvas/.");
+  // An older version of the patch (or edits to it). Start again from the pinned commit; the old canvas/ stays on a branch.
+  if (git(["status", "--porcelain"])) {
+    fail("canvas/ has factory pages from an older patch, and changes that aren't committed. Commit or stash them in canvas/, then run this again.");
+  }
+  if (tryGit(["cat-file", "-e", `${lock.commit}^{commit}`]).status !== 0) {
+    execFileSync("git", ["-C", canvas, "fetch", "--depth", "1", "upstream", lock.commit], { stdio: "inherit" });
+  }
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  const backup = `${lock.branch}-before-${stamp}`;
+  const before = git(["rev-parse", "HEAD"]);
+  git(["branch", backup, before]);
+  git(["checkout", "--quiet", "-B", lock.branch, lock.commit]);
+  applyPatch("Update Software Factory pages");
+  reinstall = tryGit(["diff", "--quiet", before, "HEAD", "--", "package.json", "package-lock.json"]).status !== 0;
+  log(`Updated the factory pages to the current patch. Your previous canvas/ is on branch "${backup}".`);
 }
 
 // 4. Local settings: no telemetry, and where the factory API listens
@@ -80,7 +103,7 @@ if (!existsSync(envFile)) {
 }
 
 // 5. Packages
-if (!existsSync(path.join(canvas, "node_modules"))) {
+if (reinstall || !existsSync(path.join(canvas, "node_modules"))) {
   log("Installing Canvas packages (npm ci). This takes a few minutes the first time…");
   const npm = spawnSync("npm ci --no-audit --no-fund", {
     cwd: canvas,
@@ -91,4 +114,4 @@ if (!existsSync(path.join(canvas, "node_modules"))) {
   if (npm.status !== 0) fail("npm ci failed. Fix the error above, then run this again.");
 }
 
-log("Done. Start everything with: pnpm dev");
+log("Done. Start everything with: pnpm start <your project folder> (or pnpm dev, or pnpm demo).");

@@ -10,6 +10,7 @@
     "setup:canvas": "node scripts/setup-canvas.mjs",
     "dev": "node scripts/dev.mjs",
     "demo": "node scripts/demo.mjs",
+    "start": "node scripts/start.mjs",
     "dev:api": "node scripts/setup-workspace.mjs && pnpm --filter @sf/server dev",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",

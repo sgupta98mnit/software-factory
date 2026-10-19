@@ -33,7 +33,7 @@ canvas/                      Your OpenHands Canvas clone (created by pnpm setup:
 patches/canvas-factory.patch Our changes to Canvas: src/factory/ plus three small edits
 canvas.lock.json             The OpenHands commit the patch is built on
 workspaces/benefits-portal/  Demo workspace the agents work in (OpenSpec + Backlog.md set up)
-scripts/                     setup-canvas, dev, demo, export-canvas-patch, setup-workspace
+scripts/                     setup-canvas, start, dev, demo, export-canvas-patch, setup-workspace
 docs/AUTOPILOT.md            Autopilot for the team using it: how a run goes, who decides, the pages
 docs/ARCHITECTURE.md         How it fits together, and where to extend it
 docs/autopilot/              DESIGN.md (the contract as built), CONTRACT.md (the original) and OPEN-ISSUES.md (known gaps)
@@ -59,7 +59,7 @@ pnpm install
 pnpm setup:canvas        # fetches OpenHands Canvas into canvas\, applies our patch, runs npm ci
 ```
 
-`pnpm setup:canvas` takes a few minutes the first time. Run it again any time; it skips what's done.
+`pnpm setup:canvas` takes a few minutes the first time. Run it again any time: it skips what's done, and after a `git pull` it brings the factory pages in `canvas\` up to date, keeping your previous `canvas\` on a `factory-before-…` branch. (It stops, without touching anything, if `canvas\` has uncommitted changes.)
 
 ## See it first: `pnpm demo`
 
@@ -104,7 +104,30 @@ Home's **Setup** panel checks what a workspace needs before (or for better) runs
 
 The fixes that add a file commit it to the base branch in your name, only if the branch hasn't moved and the checkout has no uncommitted changes, and the audit log records them.
 
-## Use your own project
+## Build a feature in your own project: `pnpm start`
+
+```powershell
+pnpm start C:\path\to\your-repo
+```
+
+One command, like an app. It sets up or updates `canvas\`, starts the factory API and Agent Canvas with your folder as the workspace, waits until they answer, and opens **http://localhost:8000/autopilot**. The first start downloads the OpenHands agent server, so give it a minute or two. `--no-open` skips the browser; Ctrl+C stops everything.
+
+1. **First time only:** Canvas asks you to choose an agent. Pick **Claude Code** or **Codex**; it uses the login from `claude` or `codex login`, so leave the key fields empty.
+2. **Setup panel on Home:**
+   - Make the folder a git repo, if it isn't one.
+   - Add the recommended policy.
+   - Add a starter `AGENTS.md`.
+   - Check that it found your gates. By default these are the `typecheck`, `lint` and `test` scripts in `package.json`. For anything else, set `gates:` in `.factory/policy.yml`.
+3. **Commit or stash your own work first.** The factory builds from your committed base branch, in its own worktrees, and moves your checkout only when you release and the checkout is clean.
+4. **Start a run:**
+   - Type the feature as a goal, for example: *Add a page where applicants can check a claim's status*.
+   - Keep autonomy at **supervised**, and set a budget.
+5. **Approve the plan** in the Inbox, then watch the Pipeline: work orders build, the gates run, and merges the policy can't make wait for you.
+6. **Release:** read the run's Evidence, then click **Release into main** when you're satisfied.
+
+Agents run with full permissions on your machine: stay nearby while a run works, and keep it supervised until you trust it.
+
+## Use your own project, step by step
 
 ```powershell
 cd C:\path\to\your-repo
